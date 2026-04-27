@@ -1,0 +1,29 @@
+vault:
+  path: /mnt/external/obsidian-vault
+  ignore_dirs:
+    - inbox/processed
+    - wiki
+
+data_dir: ./data
+
+ollama:
+  base_url: http://localhost:11434
+  embed_model: nomic-embed-text
+  llm_model: mistral:latest
+
+surveyor:
+  hdbscan_min_cluster_size: 3
+  embed_dims: 768
+
+janitor:
+  sweep_interval_s: 3600
+  deep_interval_h: 24
+  max_bytes_per_call: 8000
+
+query:
+  top_k: 8
+  hopfield_beta: 2.0
+
+synthesis:
+  anthropic_model: claude-sonnet-4-6
+  openrouter_model: x-ai/grok-4.1-fast

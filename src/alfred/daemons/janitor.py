@@ -1,0 +1,321 @@
+"""JanitorDaemon — structural scan + deterministic autofix + per-file LLM enrichment.
+
+Architecture:
+  Stage 1: Structural scan (pure Python, deterministic) — finds all issues
+  Stage 2: Autofix (pure Python) — fixes FM001/FM002/FM003/FM004 without LLM
+  Stage 3: LLM enrichment (one call per file, one reference template per call)
+            — prompt capped at janitor_max_bytes_per_call
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+from datetime import date, datetime, timezone
+from enum import Enum
+from pathlib import Path
+
+import frontmatter
+import structlog
+
+from alfred.core.schema import (
+    KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
+    REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
+    correct_status, correct_type,
+)
+from alfred.core.vault import extract_wikilinks
+from alfred.core.vault_ops import VaultError, vault_edit, vault_read
+from alfred.daemons.base import BaseDaemon
+
+log = structlog.get_logger()
+
+SWEEP_INTERVAL = 3600.0    # structural scan every hour
+DEEP_INTERVAL = 86400.0    # LLM enrichment once per day
+
+
+class IssueCode(str, Enum):
+    MISSING_REQUIRED_FIELD = "FM001"
+    INVALID_TYPE_VALUE = "FM002"
+    INVALID_STATUS_VALUE = "FM003"
+    INVALID_FIELD_TYPE = "FM004"
+    WRONG_DIRECTORY = "DIR001"
+    BROKEN_WIKILINK = "LINK001"
+    STUB_RECORD = "STUB001"
+    GARBAGE_CONTENT = "SEM001"
+
+
+class JanitorDaemon(BaseDaemon):
+    name = "janitor"
+
+    def __init__(self, cfg, state, events) -> None:
+        super().__init__(cfg, state, events)
+        self._last_sweep = 0.0
+        self._last_deep = 0.0
+        self._stem_index: dict[str, set[str]] = {}
+
+    async def run(self) -> None:
+        self.log.info("janitor.start")
+        try:
+            while not self._stop.is_set():
+                now = asyncio.get_event_loop().time()
+                if now - self._last_sweep > SWEEP_INTERVAL:
+                    await self._structural_sweep()
+                    self._last_sweep = now
+                if now - self._last_deep > DEEP_INTERVAL:
+                    await self._deep_sweep()
+                    self._last_deep = now
+                await asyncio.sleep(60.0)
+        finally:
+            await self.save_state()
+            self.log.info("janitor.stopped")
+
+    # ── Stage 1: structural scan ───────────────────────────────────────────────
+
+    async def _structural_sweep(self) -> None:
+        vault_path = self.cfg.vault_path
+        ignore = set(self.cfg.ignore_dirs)
+        issues: dict[str, list[dict]] = {}   # rel_path -> [{code, message, fix}]
+
+        self._stem_index = self._build_stem_index(vault_path, ignore)
+
+        for md_file in vault_path.rglob("*.md"):
+            rel = md_file.relative_to(vault_path)
+            if any(part in ignore for part in rel.parts):
+                continue
+            rel_str = str(rel).replace("\\", "/")
+            try:
+                file_issues = self._check_file(vault_path, rel_str)
+                if file_issues:
+                    issues[rel_str] = [i.__dict__ for i in file_issues]
+            except Exception as e:
+                self.log.warning("janitor.scan_error", path=rel_str, error=str(e))
+
+        # Update state open_issues
+        state = self.state.state
+        for rel_path, file_issues in issues.items():
+            if rel_path in state.files:
+                state.files[rel_path].open_issues = [i["code"] for i in file_issues]
+                state.files[rel_path].last_scanned = datetime.now(timezone.utc).isoformat()
+
+        self.log.info("janitor.sweep_complete", files_with_issues=len(issues))
+
+        # Stage 2: autofix deterministic issues
+        fixed = await self._autofix(issues, vault_path)
+        if fixed:
+            self.log.info("janitor.autofixed", count=len(fixed))
+
+        # Record sweep in state
+        state.janitor_sweeps.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "files_with_issues": len(issues),
+            "autofixed": len(fixed),
+        })
+        if len(state.janitor_sweeps) > 50:
+            state.janitor_sweeps = state.janitor_sweeps[-50:]
+
+        await self.save_state()
+
+    def _build_stem_index(self, vault_path: Path, ignore: set[str]) -> dict[str, set[str]]:
+        index: dict[str, set[str]] = {}
+        for md_file in vault_path.rglob("*.md"):
+            rel = md_file.relative_to(vault_path)
+            if any(part in ignore for part in rel.parts):
+                continue
+            rel_str = str(rel).replace("\\", "/")
+            stem = md_file.stem
+            index.setdefault(stem, set()).add(rel_str)
+            rel_no_ext = rel_str.removesuffix(".md")
+            index.setdefault(rel_no_ext, set()).add(rel_str)
+        return index
+
+    def _check_file(self, vault_path: Path, rel_path: str) -> list:
+        fp = vault_path / rel_path
+        try:
+            post = frontmatter.load(str(fp))
+            fm = dict(post.metadata)
+            body = post.content
+        except Exception:
+            return []
+
+        issues = []
+        rec_type = fm.get("type", "")
+
+        class _Issue:
+            def __init__(self, code, message):
+                self.code = code
+                self.message = message
+
+        for req in REQUIRED_FIELDS:
+            if not fm.get(req):
+                issues.append(_Issue(IssueCode.MISSING_REQUIRED_FIELD.value, f"Missing: {req}"))
+
+        if rec_type and rec_type not in KNOWN_TYPES:
+            issues.append(_Issue(IssueCode.INVALID_TYPE_VALUE.value, f"Unknown type: {rec_type!r}"))
+
+        status = fm.get("status", "")
+        if rec_type and status and rec_type in STATUS_BY_TYPE:
+            valid = STATUS_BY_TYPE[rec_type]
+            if valid and status not in valid:
+                issues.append(_Issue(IssueCode.INVALID_STATUS_VALUE.value, f"Invalid status: {status!r}"))
+
+        for field_name in LIST_FIELDS:
+            val = fm.get(field_name)
+            if val is not None and not isinstance(val, list):
+                if field_name == "project" and isinstance(val, str):
+                    continue
+                issues.append(_Issue(IssueCode.INVALID_FIELD_TYPE.value, f"Field {field_name!r} must be a list"))
+
+        for link in extract_wikilinks(fp.read_text(encoding="utf-8", errors="replace")):
+            if not self._stem_index.get(link):
+                issues.append(_Issue(IssueCode.BROKEN_WIKILINK.value, f"Broken: [[{link}]]"))
+                break  # only flag first broken link per file to keep noise down
+
+        # Stub detection
+        body_len = len(body.strip())
+        if rec_type and body_len < 50:
+            issues.append(_Issue(IssueCode.STUB_RECORD.value, f"Stub body ({body_len} chars)"))
+
+        return issues
+
+    # ── Stage 2: deterministic autofix ───────────────────────────────────────
+
+    async def _autofix(self, issues: dict[str, list[dict]], vault_path: Path) -> list[str]:
+        fixed: list[str] = []
+        for rel_path, file_issues in issues.items():
+            codes = {i["code"] for i in file_issues}
+            if not (codes & {
+                IssueCode.MISSING_REQUIRED_FIELD.value,
+                IssueCode.INVALID_TYPE_VALUE.value,
+                IssueCode.INVALID_STATUS_VALUE.value,
+                IssueCode.INVALID_FIELD_TYPE.value,
+            }):
+                continue
+            try:
+                rec = vault_read(vault_path, rel_path)
+                fm = rec["frontmatter"]
+                edits: dict = {}
+
+                # FM001: fill missing required fields
+                if "type" not in fm or not fm["type"]:
+                    inferred = self._infer_type(rel_path)
+                    if inferred:
+                        edits["type"] = inferred
+                if "created" not in fm or not fm["created"]:
+                    fp = vault_path / rel_path
+                    edits["created"] = date.fromtimestamp(fp.stat().st_mtime).isoformat()
+                # Set name from filename if missing
+                rec_type = edits.get("type", fm.get("type", ""))
+                title_field = NAME_FIELD_BY_TYPE.get(rec_type, "name")
+                if rec_type and not fm.get(title_field) and not fm.get("name"):
+                    edits[title_field] = Path(rel_path).stem
+
+                # FM002: correct type typos
+                raw_type = fm.get("type", "")
+                if raw_type and raw_type not in KNOWN_TYPES:
+                    corrected = correct_type(raw_type)
+                    if corrected:
+                        edits["type"] = corrected
+
+                # FM003: correct status typos
+                raw_status = fm.get("status", "")
+                effective_type = edits.get("type", fm.get("type", ""))
+                if raw_status and effective_type:
+                    valid = STATUS_BY_TYPE.get(effective_type, set())
+                    if valid and raw_status not in valid:
+                        corrected = correct_status(raw_status, effective_type)
+                        if corrected:
+                            edits["status"] = corrected
+
+                # FM004: wrap non-list list fields
+                for field_name in LIST_FIELDS:
+                    val = fm.get(field_name)
+                    if val is not None and not isinstance(val, list):
+                        if field_name == "project" and isinstance(val, str):
+                            continue
+                        edits[field_name] = [val]
+
+                if edits:
+                    vault_edit(vault_path, rel_path, set_fields=edits)
+                    fixed.append(rel_path)
+                    self.log.debug("janitor.autofixed", path=rel_path, fields=list(edits.keys()))
+            except Exception as e:
+                self.log.warning("janitor.autofix_error", path=rel_path, error=str(e))
+
+        return fixed
+
+    def _infer_type(self, rel_path: str) -> str:
+        parts = rel_path.replace("\\", "/").split("/")
+        if len(parts) < 2:
+            return ""
+        dir_to_type = {v: k for k, v in TYPE_DIRECTORY.items()}
+        return dir_to_type.get(parts[0], "")
+
+    # ── Stage 3: LLM enrichment (stub records, per-file, per-type prompt) ────
+
+    async def _deep_sweep(self) -> None:
+        """LLM enrichment for stub records. One call per file, one template per call."""
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not anthropic_key:
+            self.log.info("janitor.deep_skip", reason="no ANTHROPIC_API_KEY")
+            return
+
+        vault_path = self.cfg.vault_path
+        ignore = set(self.cfg.ignore_dirs)
+        state = self.state.state
+        enriched = 0
+
+        for rel_path, fs in list(state.files.items()):
+            if IssueCode.STUB_RECORD.value not in fs.open_issues:
+                continue
+            vault_file = vault_path / rel_path
+            if not vault_file.exists():
+                continue
+            try:
+                await self._enrich_file(vault_path, rel_path)
+                # Clear stub issue after enrichment attempt
+                fs.open_issues = [c for c in fs.open_issues if c != IssueCode.STUB_RECORD.value]
+                enriched += 1
+                await asyncio.sleep(1.0)   # gentle rate limiting
+            except Exception as e:
+                self.log.warning("janitor.enrich_error", path=rel_path, error=str(e))
+
+        if enriched:
+            self.log.info("janitor.enriched", count=enriched)
+            await self.save_state()
+
+    async def _enrich_file(self, vault_path: Path, rel_path: str) -> None:
+        """Ask LLM to fill in stub body for one file. Prompt capped at max_bytes."""
+        rec = vault_read(vault_path, rel_path)
+        fm = rec["frontmatter"]
+        body = rec["body"]
+        rec_type = fm.get("type", "unknown")
+
+        # Build a compact prompt — well under the 8KB cap
+        fm_summary = json.dumps({k: v for k, v in fm.items() if v}, indent=2)
+        prompt = (
+            f"You are enriching a personal knowledge vault record.\n"
+            f"Type: {rec_type}\n"
+            f"File: {rel_path}\n"
+            f"Current frontmatter:\n```json\n{fm_summary}\n```\n"
+            f"Current body:\n```\n{body[:500]}\n```\n\n"
+            f"Write a concise, factual body (2-4 sentences) for this {rec_type} record based on available context. "
+            f"Return ONLY the body text, no headers, no JSON."
+        )
+
+        # Enforce byte cap
+        prompt_bytes = prompt.encode("utf-8")
+        if len(prompt_bytes) > self.cfg.janitor_max_bytes_per_call:
+            prompt = prompt[:self.cfg.janitor_max_bytes_per_call].decode("utf-8", errors="replace")
+
+        import anthropic
+        client = anthropic.Anthropic()
+        resp = client.messages.create(
+            model=self.cfg.anthropic_model,
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        new_body = resp.content[0].text.strip()
+        if new_body and len(new_body) > 20:
+            vault_edit(vault_path, rel_path, body_replace=new_body)
+            self.log.info("janitor.enriched_file", path=rel_path, chars=len(new_body))
