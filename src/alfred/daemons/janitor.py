@@ -308,14 +308,19 @@ class JanitorDaemon(BaseDaemon):
         if len(prompt_bytes) > self.cfg.janitor_max_bytes_per_call:
             prompt = prompt[:self.cfg.janitor_max_bytes_per_call].decode("utf-8", errors="replace")
 
+        import asyncio
         import anthropic
         client = anthropic.Anthropic()
-        resp = client.messages.create(
-            model=self.cfg.anthropic_model,
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        new_body = resp.content[0].text.strip()
+
+        def _call():
+            resp = client.messages.create(
+                model=self.cfg.anthropic_model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.content[0].text.strip()
+
+        new_body = await asyncio.to_thread(_call)
         if new_body and len(new_body) > 20:
             vault_edit(vault_path, rel_path, body_replace=new_body)
             self.log.info("janitor.enriched_file", path=rel_path, chars=len(new_body))

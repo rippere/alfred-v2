@@ -66,12 +66,13 @@ class CuratorDaemon(BaseDaemon):
             if rel_str in state.curator_processed:
                 continue
             try:
-                await self._ingest_file(md_file, processed_dir)
-                state.curator_processed[rel_str] = datetime.now(timezone.utc).isoformat()
+                ingested = await self._ingest_file(md_file, processed_dir)
+                if ingested:
+                    state.curator_processed[rel_str] = datetime.now(timezone.utc).isoformat()
             except Exception as e:
                 self.log.warning("curator.ingest_error", path=rel_str, error=str(e))
 
-    async def _ingest_file(self, inbox_file: Path, processed_dir: Path) -> None:
+    async def _ingest_file(self, inbox_file: Path, processed_dir: Path) -> bool:
         try:
             post = frontmatter.load(str(inbox_file))
             fm = dict(post.metadata)
@@ -88,12 +89,12 @@ class CuratorDaemon(BaseDaemon):
         classification = await self._classify(content_preview)
         if not classification:
             self.log.info("curator.skip_no_classification", path=inbox_file.name)
-            return
+            return False
 
         rec_type = classification.get("type", "")
         if rec_type not in KNOWN_TYPES:
             self.log.info("curator.skip_unknown_type", type=rec_type, path=inbox_file.name)
-            return
+            return False
 
         name = classification.get("name") or inbox_file.stem
         # sanitize name for filesystem
@@ -131,6 +132,7 @@ class CuratorDaemon(BaseDaemon):
             inbox_file.unlink()
 
         self.emit("curator_ingested", source=inbox_file.name, type=rec_type)
+        return True
 
     async def _classify(self, content: str) -> dict | None:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -143,15 +145,19 @@ class CuratorDaemon(BaseDaemon):
         )
 
         try:
+            import asyncio
             import anthropic
             client = anthropic.Anthropic()
-            resp = client.messages.create(
-                model=self.cfg.anthropic_model,
-                max_tokens=256,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = resp.content[0].text.strip()
-            # Strip markdown fences if present
+
+            def _call():
+                resp = client.messages.create(
+                    model=self.cfg.anthropic_model,
+                    max_tokens=256,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return resp.content[0].text.strip()
+
+            raw = await asyncio.to_thread(_call)
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             return json.loads(raw)

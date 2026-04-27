@@ -118,14 +118,19 @@ class DistillerDaemon(BaseDaemon):
             body=body[:2000],
         )
 
+        import asyncio
         import anthropic
         client = anthropic.Anthropic()
-        resp = client.messages.create(
-            model=self.cfg.anthropic_model,
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = resp.content[0].text.strip()
+
+        def _call():
+            resp = client.messages.create(
+                model=self.cfg.anthropic_model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.content[0].text.strip()
+
+        raw = await asyncio.to_thread(_call)
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
