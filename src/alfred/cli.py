@@ -88,6 +88,7 @@ def up(
     config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
     only: Optional[str] = typer.Option(None, "--only", help="Comma-separated daemon names to start"),
     daemon: bool = typer.Option(False, "--daemon", "-d", help="Fork to background"),
+    no_pid_check: bool = typer.Option(False, "--no-pid-check", hidden=True),
 ):
     """Start all daemons (or a named subset with --only surveyor,janitor)."""
     import asyncio
@@ -96,20 +97,30 @@ def up(
     cfg = _load(config)
     pid_path = cfg.data_dir / "alfred.pid"
 
-    if pid_path.exists():
+    if not no_pid_check and pid_path.exists():
         existing_pid = pid_path.read_text().strip()
         console.print(f"[yellow]Alfred may already be running (PID {existing_pid}). Use 'alfred down' first.[/yellow]")
         raise typer.Exit(1)
 
     if daemon:
-        # Fork to background
+        # Fork to background — redirect stdout/stderr to log file so process survives terminal close
         import subprocess
-        args = [sys.executable, "-m", "alfred.cli", "up", "--config", str(config)]
+        cfg2 = _load(config)
+        log_path = cfg2.data_dir / "alfred.log"
+        cfg2.data_dir.mkdir(parents=True, exist_ok=True)
+        args = [sys.executable, "-m", "alfred.cli", "up", "--config", str(config.resolve()), "--no-pid-check"]
         if only:
             args += ["--only", only]
-        proc = subprocess.Popen(args, start_new_session=True)
-        pid_path.write_text(str(proc.pid))
+        with open(log_path, "a") as logf:
+            proc = subprocess.Popen(
+                args,
+                start_new_session=True,
+                stdout=logf,
+                stderr=logf,
+                cwd=str(config.resolve().parent),
+            )
         console.print(f"[green]Alfred started in background (PID {proc.pid})[/green]")
+        console.print(f"[dim]Logs: {log_path}[/dim]")
         return
 
     # Write PID
