@@ -101,8 +101,12 @@ class CuratorDaemon(BaseDaemon):
         safe_name = _slugify(name)
 
         set_fields: dict = {}
-        if status := classification.get("status"):
-            set_fields["status"] = status
+        if raw_status := classification.get("status"):
+            from alfred.core.schema import correct_status
+            valid_status = correct_status(raw_status, rec_type) or raw_status
+            from alfred.core.schema import STATUS_BY_TYPE
+            if valid_status in STATUS_BY_TYPE.get(rec_type, {valid_status}):
+                set_fields["status"] = valid_status
         if tags := classification.get("tags"):
             set_fields["tags"] = tags if isinstance(tags, list) else [tags]
 
