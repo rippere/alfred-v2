@@ -142,3 +142,9 @@ def run_server(config_path: Path) -> None:
         }
 
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    import os
+    _config = os.environ.get("ALFRED_CONFIG") or str(Path(__file__).parents[3] / "config.yaml")
+    run_server(Path(_config))
