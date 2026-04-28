@@ -172,8 +172,10 @@ class JanitorDaemon(BaseDaemon):
                 issues.append(_Issue(IssueCode.INVALID_FIELD_TYPE.value, f"Field {field_name!r} must be a list"))
 
         for link in extract_wikilinks(fp.read_text(encoding="utf-8", errors="replace")):
-            if not self._stem_index.get(link):
-                issues.append(_Issue(IssueCode.BROKEN_WIKILINK.value, f"Broken: [[{link}]]"))
+            # Normalize multiline YAML string artifacts (e.g. "foo\n  bar" → "foo bar")
+            normalized = " ".join(link.split())
+            if not self._stem_index.get(normalized):
+                issues.append(_Issue(IssueCode.BROKEN_WIKILINK.value, f"Broken: [[{normalized}]]"))
                 break  # only flag first broken link per file to keep noise down
 
         # Stub detection
