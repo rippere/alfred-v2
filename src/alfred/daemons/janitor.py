@@ -93,12 +93,15 @@ class JanitorDaemon(BaseDaemon):
             except Exception as e:
                 self.log.warning("janitor.scan_error", path=rel_str, error=str(e))
 
-        # Update state open_issues
+        # Update state open_issues — clear all tracked files first so resolved issues don't persist
         state = self.state.state
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for fs in state.files.values():
+            fs.open_issues = []
         for rel_path, file_issues in issues.items():
             if rel_path in state.files:
                 state.files[rel_path].open_issues = [i["code"] for i in file_issues]
-                state.files[rel_path].last_scanned = datetime.now(timezone.utc).isoformat()
+                state.files[rel_path].last_scanned = now_iso
 
         self.log.info("janitor.sweep_complete", files_with_issues=len(issues))
 
