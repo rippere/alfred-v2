@@ -10,7 +10,7 @@ from pathlib import Path
 
 import frontmatter
 
-WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]+)?\]\]")
+WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[#|][^\]]+)?\]\]")
 
 MAX_EMBEDDING_CHARS = 6_000
 CHUNK_SIZE = 3_000
@@ -33,7 +33,8 @@ class VaultRecord:
 
 
 def extract_wikilinks(text: str) -> list[str]:
-    return WIKILINK_RE.findall(text)
+    # Strip Obsidian Bases plugin virtual tables (*.base) — not real files
+    return [l for l in WIKILINK_RE.findall(text) if not l.endswith(".base")]
 
 
 def parse_file(vault_path: Path, rel_path: str) -> VaultRecord:

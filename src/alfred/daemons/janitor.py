@@ -56,13 +56,15 @@ class JanitorDaemon(BaseDaemon):
 
     async def run(self) -> None:
         self.log.info("janitor.start")
+        sweep_interval = float(self.cfg.janitor_sweep_interval_s)
+        deep_interval = float(self.cfg.janitor_deep_interval_h * 3600)
         try:
             while not self._stop.is_set():
                 now = asyncio.get_event_loop().time()
-                if now - self._last_sweep > SWEEP_INTERVAL:
+                if now - self._last_sweep > sweep_interval:
                     await self._structural_sweep()
                     self._last_sweep = now
-                if now - self._last_deep > DEEP_INTERVAL:
+                if now - self._last_deep > deep_interval:
                     await self._deep_sweep()
                     self._last_deep = now
                 await asyncio.sleep(60.0)

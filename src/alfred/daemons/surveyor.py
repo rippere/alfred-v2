@@ -15,8 +15,8 @@ if TYPE_CHECKING:
     from alfred.config import AlfredConfig
     from alfred.store.state import StateStore
 
-WATCH_INTERVAL = 5.0       # seconds between filesystem polls
-CLUSTER_INTERVAL = 900.0   # re-cluster every 15 minutes
+WATCH_INTERVAL = 60.0      # seconds between filesystem polls
+CLUSTER_INTERVAL = 1800.0  # re-cluster every 30 minutes
 
 
 class SurveyorDaemon(BaseDaemon):

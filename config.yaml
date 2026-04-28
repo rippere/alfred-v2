@@ -1,8 +1,10 @@
 vault:
   path: /mnt/external/obsidian-vault
   ignore_dirs:
-    - inbox/processed
+    - inbox
     - wiki
+    - ai-dialogue
+    - .obsidian
 
 data_dir: ./data
 
@@ -16,7 +18,7 @@ surveyor:
   embed_dims: 768
 
 janitor:
-  sweep_interval_s: 3600
+  sweep_interval_s: 14400
   deep_interval_h: 24
   max_bytes_per_call: 8000
 

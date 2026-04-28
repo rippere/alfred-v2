@@ -96,8 +96,12 @@ class CuratorDaemon(BaseDaemon):
             self.log.info("curator.skip_unknown_type", type=rec_type, path=inbox_file.name)
             return False
 
-        name = classification.get("name") or inbox_file.stem
-        # sanitize name for filesystem
+        # Prefer a real heading/title from the source over LLM-generated slug
+        extracted_title = (
+            fm.get("title") or fm.get("name") or fm.get("subject")
+            or _extract_heading(body)
+        )
+        name = extracted_title or classification.get("name") or inbox_file.stem
         safe_name = _slugify(name)
 
         set_fields: dict = {}
@@ -176,3 +180,12 @@ def _slugify(text: str) -> str:
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_-]+", "-", text).strip("-")
     return text[:80] or "untitled"
+
+
+def _extract_heading(body: str) -> str:
+    """Return text of the first H1 heading in the body, or empty string."""
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("# "):
+            return line[2:].strip()[:120]
+    return ""
