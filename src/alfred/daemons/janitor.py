@@ -50,8 +50,8 @@ class JanitorDaemon(BaseDaemon):
 
     def __init__(self, cfg, state, events) -> None:
         super().__init__(cfg, state, events)
-        self._last_sweep = 0.0
-        self._last_deep = 0.0
+        self._last_sweep = float("-inf")
+        self._last_deep = float("-inf")
         self._stem_index: dict[str, set[str]] = {}
 
     async def run(self) -> None:
@@ -294,7 +294,12 @@ class JanitorDaemon(BaseDaemon):
         rec_type = fm.get("type", "unknown")
 
         # Build a compact prompt — well under the 8KB cap
-        fm_summary = json.dumps({k: v for k, v in fm.items() if v}, indent=2)
+        from datetime import date, datetime
+        fm_summary = json.dumps(
+            {k: v.isoformat() if isinstance(v, (date, datetime)) else v
+             for k, v in fm.items() if v},
+            indent=2,
+        )
         prompt = (
             f"You are enriching a personal knowledge vault record.\n"
             f"Type: {rec_type}\n"

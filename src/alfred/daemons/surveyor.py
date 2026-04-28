@@ -27,7 +27,7 @@ class SurveyorDaemon(BaseDaemon):
         self.milvus = milvus
         self._embedder = None
         self._bm25 = None
-        self._last_cluster = 0.0
+        self._last_cluster = float("-inf")
 
     def _get_embedder(self):
         if self._embedder is None:
