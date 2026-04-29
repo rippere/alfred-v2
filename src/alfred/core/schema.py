@@ -32,6 +32,7 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     "constraint": {"active", "expired", "waived", "superseded"},
     "contradiction": {"unresolved", "resolved", "accepted"},
     "synthesis": {"draft", "active", "superseded"},
+    "learn": {"active", "absorbed", "superseded"},
 }
 
 TYPE_DIRECTORY: dict[str, str] = {

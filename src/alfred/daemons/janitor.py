@@ -96,6 +96,18 @@ class JanitorDaemon(BaseDaemon):
         # Update state open_issues — clear all tracked files first so resolved issues don't persist
         state = self.state.state
         now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Prune ghost state entries (files deleted from vault but still in state.files)
+        live_paths = {
+            str(md_file.relative_to(vault_path)).replace("\\", "/")
+            for md_file in vault_path.rglob("*.md")
+        }
+        ghost_keys = [k for k in state.files if k not in live_paths]
+        for k in ghost_keys:
+            del state.files[k]
+        if ghost_keys:
+            self.log.info("janitor.pruned_ghosts", count=len(ghost_keys))
+
         for fs in state.files.values():
             fs.open_issues = []
         for rel_path, file_issues in issues.items():

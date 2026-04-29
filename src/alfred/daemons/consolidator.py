@@ -1,22 +1,24 @@
-"""ConsolidatorDaemon — cluster summarization via Ollama + wiki page generation."""
+"""ConsolidatorDaemon — cluster summarization via Ollama + wiki page generation + synthesis pass."""
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import httpx
 import structlog
 
-from alfred.core.vault_ops import vault_read
+from alfred.core.vault_ops import vault_create, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
 
 log = structlog.get_logger()
 
 CONSOLIDATE_INTERVAL = 1800.0   # run every 30 minutes
 MIN_MEMBERS = 3                  # skip clusters with fewer files
-MAX_MEMBERS_IN_PROMPT = 8        # cap members sent to Ollama
+MAX_MEMBERS_IN_PROMPT = 8        # cap members sent to LLM
+SYNTHESIS_BATCH = 20             # max clusters to synthesize per run
 
 # Record types that should get wiki pages
 WIKI_ENTITY_TYPES = {"person", "org"}
@@ -87,8 +89,148 @@ class ConsolidatorDaemon(BaseDaemon):
             self.log.info("consolidator.labeled", clusters=updated)
             await self.save_state()
 
+        # Synthesize high-centrality clusters into synthesis/ pages
+        await self._synthesis_pass(vault_path)
+
         # Generate wiki stub pages for all person/org records (no LLM needed)
         await self._generate_wiki_stubs(vault_path)
+
+    async def _synthesis_pass(self, vault_path) -> None:
+        """Synthesize learn/ clusters into synthesis/ pages, ranked by graph centrality."""
+        from alfred.store.graph import GraphStore
+
+        state = self.state.state
+        graph = GraphStore(self.cfg.graph_path)
+        graph.load()
+
+        ranked: list[tuple[str, object, int]] = []
+        for key, cluster in state.clusters.items():
+            if len(cluster.member_files) < MIN_MEMBERS:
+                continue
+            if cluster.consolidated_chunk_id:
+                continue  # already synthesized
+            if not cluster.label:
+                continue  # not yet labeled — wait for label pass
+            degree_sum = sum(graph.get_node_degree(f) for f in cluster.member_files)
+            ranked.append((key, cluster, degree_sum))
+
+        ranked.sort(key=lambda x: x[2], reverse=True)
+
+        synthesized = 0
+        for cluster_key, cluster, _ in ranked[:SYNTHESIS_BATCH]:
+            try:
+                await self._synthesize_cluster(cluster, vault_path)
+                synthesized += 1
+                await asyncio.sleep(2.0)  # gentle rate limit between LLM calls
+            except Exception as e:
+                self.log.warning("consolidator.synthesize_error", cluster=cluster_key, error=str(e))
+
+        if synthesized:
+            self.log.info("consolidator.synthesized", clusters=synthesized)
+            await self.save_state()
+
+    async def _synthesize_cluster(self, cluster, vault_path) -> None:
+        """Build a synthesis/ page from a cluster's learn/ members, then mark them absorbed."""
+        learn_entries: list[tuple[str, str, str]] = []  # (rel_path, name, body)
+        for rel_path in cluster.member_files[:MAX_MEMBERS_IN_PROMPT]:
+            try:
+                rec = vault_read(vault_path, rel_path)
+                name = rec["frontmatter"].get("name") or rel_path.rsplit("/", 1)[-1].replace(".md", "")
+                body = rec["body"].strip()
+                if body:
+                    learn_entries.append((rel_path, name, body))
+            except Exception:
+                pass
+
+        if not learn_entries:
+            return
+
+        label = cluster.label[0] if cluster.label else "cluster"
+        synthesis_body = await self._call_synthesis_llm(label, learn_entries)
+        if not synthesis_body:
+            return
+
+        # Wikilinks pointing back to each learn/ source
+        source_links = [
+            f"[[{rel.removesuffix('.md')}]]"
+            for rel, _, _ in learn_entries
+        ]
+        full_body = f"{synthesis_body}\n\n## Sources\n" + "\n".join(f"- {lnk}" for lnk in source_links)
+
+        label_slug = "-".join(label.lower().split())[:60]
+        # Avoid name collision — append cluster_id suffix if file already exists
+        candidate = label_slug
+        if (vault_path / "synthesis" / f"{candidate}.md").exists():
+            candidate = f"{label_slug}-{cluster.cluster_id}"
+        result = vault_create(
+            vault_path,
+            "synthesis",
+            candidate,
+            set_fields={
+                "status": "draft",
+                "cluster_sources": source_links,
+                "confidence": "medium",
+                "created": date.today().isoformat(),
+            },
+            body=full_body,
+        )
+
+        # Mark each learn/ file absorbed
+        for rel_path, _, _ in learn_entries:
+            try:
+                vault_edit(vault_path, rel_path, set_fields={"status": "absorbed"})
+            except Exception as e:
+                self.log.debug("consolidator.absorb_skip", path=rel_path, error=str(e))
+
+        cluster.consolidated_chunk_id = result.get("path", f"synthesis/{label_slug}.md")
+        self.log.info("consolidator.cluster_synthesized", label=label, path=cluster.consolidated_chunk_id)
+
+    async def _call_synthesis_llm(self, label: str, entries: list[tuple[str, str, str]]) -> str:
+        """Call Claude API for synthesis (falls back to Ollama if key absent)."""
+        bodies_text = "\n\n".join(f"### {name}\n{body}" for _, name, body in entries)
+        prompt = (
+            f"You are synthesizing atomic knowledge fragments into a coherent insight document "
+            f"for a personal knowledge vault.\n\n"
+            f"Cluster topic: {label}\n\n"
+            f"Atomic learnings:\n{bodies_text}\n\n"
+            f"Write a synthesis in this exact format (300-400 words):\n\n"
+            f"## Insight\n<2-3 sentences: the core unified insight across all fragments>\n\n"
+            f"## Evidence\n<What the fragments show; reference key points>\n\n"
+            f"## Implications\n<What this means practically>\n\n"
+            f"## Applicability\n<When and where this insight applies>\n\n"
+            f"Return only the formatted synthesis — no preamble."
+        )
+
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if anthropic_key:
+            try:
+                import anthropic
+
+                def _call():
+                    client = anthropic.Anthropic(api_key=anthropic_key)
+                    resp = client.messages.create(
+                        model=self.cfg.anthropic_model,
+                        max_tokens=600,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    return resp.content[0].text.strip()
+
+                return await asyncio.to_thread(_call)
+            except Exception as e:
+                self.log.warning("consolidator.claude_error", error=str(e))
+
+        # Ollama fallback
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{self.cfg.ollama_base_url}/api/generate",
+                    json={"model": self.cfg.ollama_llm_model, "prompt": prompt, "stream": False},
+                )
+                resp.raise_for_status()
+                return resp.json().get("response", "").strip()
+        except Exception as e:
+            self.log.warning("consolidator.ollama_synthesis_error", error=str(e))
+            return ""
 
     async def _generate_wiki_stubs(self, vault_path) -> None:
         """Create wiki stub pages for all person and org records that don't have one yet."""

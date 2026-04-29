@@ -91,6 +91,13 @@ class GraphStore:
         if g.has_node(rel_path):
             g.remove_node(rel_path)
 
+    def get_node_degree(self, rel_path: str) -> int:
+        """Return total in+out degree for centrality ranking."""
+        g = self._graph()
+        if not g.has_node(rel_path):
+            return 0
+        return g.in_degree(rel_path) + g.out_degree(rel_path)
+
     def get_neighbors(self, rel_path: str) -> list[tuple[str, float]]:
         """Return [(neighbor_rel_path, weight)] for direct neighbors."""
         g = self._graph()
