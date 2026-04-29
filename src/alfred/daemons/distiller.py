@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,13 +47,13 @@ class DistillerDaemon(BaseDaemon):
 
     def __init__(self, cfg, state, events) -> None:
         super().__init__(cfg, state, events)
-        self._last_run = 0.0
+        self._last_run = 0.0  # epoch 0 ensures first run fires immediately
 
     async def run(self) -> None:
         self.log.info("distiller.start")
         try:
             while not self._stop.is_set():
-                now = asyncio.get_event_loop().time()
+                now = time.time()  # wall-clock time so 0.0 sentinel triggers first run
                 if now - self._last_run > DISTILL_INTERVAL:
                     await self._distill_sweep()
                     self._last_run = now
@@ -110,7 +111,19 @@ class DistillerDaemon(BaseDaemon):
         if rec_type in ("learn",):
             return 0  # don't distill learn records from other learn records
 
-        fm_summary = json.dumps({k: v for k, v in fm.items() if v}, indent=2)
+        from datetime import date as _date, datetime as _datetime
+
+        class _DateEncoder(json.JSONEncoder):
+            def default(self, o):
+                if isinstance(o, (_date, _datetime)):
+                    return o.isoformat()
+                return super().default(o)
+
+        fm_summary = json.dumps(
+            {k: v for k, v in fm.items() if v},
+            indent=2,
+            cls=_DateEncoder,
+        )
         prompt = _EXTRACT_PROMPT.format(
             rec_type=rec_type or "unknown",
             rel_path=rel_path,

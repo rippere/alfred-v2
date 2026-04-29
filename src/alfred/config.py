@@ -44,7 +44,8 @@ class AlfredConfig:
     janitor_max_bytes_per_call: int = 8000
 
     # Surveyor
-    hdbscan_min_cluster_size: int = 3
+    hdbscan_min_cluster_size: int = 2
+    hdbscan_min_samples: int = 1
     leiden_resolution: float = 1.0
 
     # Query
@@ -111,6 +112,7 @@ class AlfredConfig:
         # Surveyor
         if s := raw.get("surveyor"):
             cfg.hdbscan_min_cluster_size = s.get("hdbscan_min_cluster_size", cfg.hdbscan_min_cluster_size)
+            cfg.hdbscan_min_samples = s.get("hdbscan_min_samples", cfg.hdbscan_min_samples)
             cfg.embed_dims = s.get("embed_dims", cfg.embed_dims)
 
         # Query

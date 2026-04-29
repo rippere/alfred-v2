@@ -5,7 +5,7 @@ KNOWN_TYPES: set[str] = {
     "project", "task", "session", "input", "person", "org",
     "location", "note", "decision", "process", "run", "event",
     "account", "asset", "conversation", "assumption", "constraint",
-    "contradiction", "synthesis",
+    "contradiction", "synthesis", "wiki", "learn",
 }
 
 LEARN_TYPES: set[str] = {
@@ -40,6 +40,7 @@ TYPE_DIRECTORY: dict[str, str] = {
     "process": "process", "run": "run", "event": "event", "account": "account",
     "asset": "asset", "conversation": "conversation", "assumption": "assumption",
     "constraint": "constraint", "contradiction": "contradiction", "synthesis": "synthesis",
+    "wiki": "wiki", "learn": "learn",
 }
 
 LIST_FIELDS: set[str] = {

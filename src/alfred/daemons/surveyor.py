@@ -199,6 +199,7 @@ class SurveyorDaemon(BaseDaemon):
             # HDBSCAN
             labels = HDBSCAN(
                 min_cluster_size=self.cfg.hdbscan_min_cluster_size,
+                min_samples=self.cfg.hdbscan_min_samples,
                 metric="cosine",
             ).fit_predict(vectors)
 

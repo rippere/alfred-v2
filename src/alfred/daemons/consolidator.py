@@ -1,4 +1,4 @@
-"""ConsolidatorDaemon — cluster summarization via Ollama."""
+"""ConsolidatorDaemon — cluster summarization via Ollama + wiki page generation."""
 from __future__ import annotations
 
 import asyncio
@@ -17,6 +17,9 @@ log = structlog.get_logger()
 CONSOLIDATE_INTERVAL = 1800.0   # run every 30 minutes
 MIN_MEMBERS = 3                  # skip clusters with fewer files
 MAX_MEMBERS_IN_PROMPT = 8        # cap members sent to Ollama
+
+# Record types that should get wiki pages
+WIKI_ENTITY_TYPES = {"person", "org"}
 
 
 _LABEL_PROMPT = """\
@@ -82,6 +85,41 @@ class ConsolidatorDaemon(BaseDaemon):
 
         if updated:
             self.log.info("consolidator.labeled", clusters=updated)
+            await self.save_state()
+
+        # Generate wiki stub pages for all person/org records (no LLM needed)
+        await self._generate_wiki_stubs(vault_path)
+
+    async def _generate_wiki_stubs(self, vault_path) -> None:
+        """Create wiki stub pages for all person and org records that don't have one yet."""
+        try:
+            from alfred.wiki.writer import WikiWriter
+        except ImportError:
+            return
+
+        writer = WikiWriter(self.cfg, self.state)
+        state = self.state.state
+        created = 0
+
+        for rel_path, fs in list(state.files.items()):
+            try:
+                rec = vault_read(vault_path, rel_path)
+                fm = rec["frontmatter"]
+                rec_type = fm.get("type", "")
+                if rec_type not in WIKI_ENTITY_TYPES:
+                    continue
+                name = fm.get("name") or fm.get("subject")
+                if not name:
+                    continue
+                key = name.lower()
+                if key not in state.wiki_pages:
+                    writer.ensure_page(name, rec_type, rel_path)
+                    created += 1
+            except Exception as e:
+                self.log.debug("consolidator.wiki_skip", path=rel_path, error=str(e))
+
+        if created:
+            self.log.info("consolidator.wiki_stubs_created", count=created)
             await self.save_state()
 
     async def _label_cluster(self, member_files: list[str], vault_path) -> str:

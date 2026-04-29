@@ -14,7 +14,8 @@ ollama:
   llm_model: mistral:latest
 
 surveyor:
-  hdbscan_min_cluster_size: 3
+  hdbscan_min_cluster_size: 2
+  hdbscan_min_samples: 1
   embed_dims: 768
 
 janitor:

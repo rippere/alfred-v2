@@ -122,16 +122,23 @@ class JanitorDaemon(BaseDaemon):
         await self.save_state()
 
     def _build_stem_index(self, vault_path: Path, ignore: set[str]) -> dict[str, set[str]]:
+        """Build a lookup index for wikilink resolution.
+
+        Indexes all vault files (including ignored dirs like ai-dialogue) so that
+        wikilinks pointing into those dirs don't appear as false-positive LINK001.
+        The ignore list only controls which files are *scanned for issues*, not
+        which files are valid link targets.
+        """
         index: dict[str, set[str]] = {}
         for md_file in vault_path.rglob("*.md"):
             rel = md_file.relative_to(vault_path)
-            if any(part in ignore for part in rel.parts):
-                continue
             rel_str = str(rel).replace("\\", "/")
             stem = md_file.stem
+            # Register under stem, path-without-extension, and full path (with .md)
             index.setdefault(stem, set()).add(rel_str)
             rel_no_ext = rel_str.removesuffix(".md")
             index.setdefault(rel_no_ext, set()).add(rel_str)
+            index.setdefault(rel_str, set()).add(rel_str)
         return index
 
     def _check_file(self, vault_path: Path, rel_path: str) -> list:
