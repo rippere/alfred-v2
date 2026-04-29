@@ -163,6 +163,8 @@ class DistillerDaemon(BaseDaemon):
             if not title or not body_text:
                 continue
             try:
+                source_link = rel_path[:-3] if rel_path.endswith(".md") else rel_path
+                body_with_link = body_text + f"\n\nSource: [[{source_link}]]"
                 result = vault_create(
                     vault_path,
                     "learn",
@@ -171,7 +173,7 @@ class DistillerDaemon(BaseDaemon):
                         "tags": tags if isinstance(tags, list) else [],
                         "source": rel_path,
                     },
-                    body=body_text,
+                    body=body_with_link,
                 )
                 # Track learn record in source file's state
                 if rel_path in state.files:

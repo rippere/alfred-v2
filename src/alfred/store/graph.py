@@ -54,14 +54,37 @@ class GraphStore:
             else:
                 g[source_rel_path][t]["weight"] += 0.1   # reinforce repeated links
 
-    def add_cluster_edges(self, cluster_members: list[str]) -> None:
-        """Add weak edges between all files in the same semantic cluster."""
+    def clear_cluster_edges(self) -> int:
+        """Remove all cluster-type edges. Returns count removed."""
         g = self._graph()
-        for i, a in enumerate(cluster_members):
-            for b in cluster_members[i + 1:]:
-                if not g.has_edge(a, b):
-                    g.add_edge(a, b, weight=0.3, edge_type="cluster")
-                    g.add_edge(b, a, weight=0.3, edge_type="cluster")
+        to_remove = [(u, v) for u, v, d in g.edges(data=True) if d.get("edge_type") == "cluster"]
+        g.remove_edges_from(to_remove)
+        return len(to_remove)
+
+    def add_cluster_edges(self, cluster_members: list[str], max_fan: int = 5) -> None:
+        """Add weak edges within a semantic cluster.
+
+        Small clusters (≤ max_fan*2): all-pairs.
+        Large clusters: ring topology with max_fan forward links per node — O(N*k)
+        instead of O(N²), keeps the subgraph connected without flooding spreading activation.
+        """
+        g = self._graph()
+        n = len(cluster_members)
+        if n < 2:
+            return
+        if n <= max_fan * 2:
+            for i, a in enumerate(cluster_members):
+                for b in cluster_members[i + 1:]:
+                    if not g.has_edge(a, b):
+                        g.add_edge(a, b, weight=0.3, edge_type="cluster")
+                        g.add_edge(b, a, weight=0.3, edge_type="cluster")
+        else:
+            for i, a in enumerate(cluster_members):
+                for step in range(1, max_fan + 1):
+                    b = cluster_members[(i + step) % n]
+                    if not g.has_edge(a, b):
+                        g.add_edge(a, b, weight=0.3, edge_type="cluster")
+                        g.add_edge(b, a, weight=0.3, edge_type="cluster")
 
     def remove_file(self, rel_path: str) -> None:
         g = self._graph()

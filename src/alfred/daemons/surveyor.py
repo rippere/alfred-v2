@@ -215,6 +215,7 @@ class SurveyorDaemon(BaseDaemon):
                 if cid_int != -1:
                     cluster_members.setdefault(cid_int, []).append(path)
 
+            # Update cluster state
             for cid, members in cluster_members.items():
                 key = f"semantic_{cid}"
                 existing = state.clusters.get(key)
@@ -225,15 +226,19 @@ class SurveyorDaemon(BaseDaemon):
                     member_files=members,
                     last_labeled=existing.last_labeled if existing else "",
                 )
-                # Add cluster edges to graph
-                try:
-                    from alfred.store.graph import GraphStore
-                    graph = GraphStore(self.cfg.graph_path)
-                    graph.load()
+
+            # Rebuild cluster edges in one graph pass (clear stale edges first)
+            try:
+                from alfred.store.graph import GraphStore
+                graph = GraphStore(self.cfg.graph_path)
+                graph.load()
+                cleared = graph.clear_cluster_edges()
+                self.log.debug("surveyor.cluster_edges_cleared", count=cleared)
+                for members in cluster_members.values():
                     graph.add_cluster_edges(members)
-                    graph.save()
-                except Exception:
-                    pass
+                graph.save()
+            except Exception as e:
+                self.log.warning("surveyor.graph_update_failed", error=str(e))
 
             self.emit("clusters_updated", cluster_count=len(cluster_members))
             self.log.info("surveyor.clustered", clusters=len(cluster_members), files=len(paths))
