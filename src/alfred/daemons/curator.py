@@ -86,10 +86,23 @@ class CuratorDaemon(BaseDaemon):
             fm_str = json.dumps({k: v for k, v in fm.items() if v}, indent=2)
             content_preview = f"Frontmatter:\n{fm_str}\n\nBody:\n{content_preview}"
 
-        classification = await self._classify(content_preview)
-        if not classification:
-            self.log.info("curator.skip_no_classification", path=inbox_file.name)
-            return False
+        # If the file already declares a known type, skip LLM classification entirely.
+        # This is cheaper, faster, and prevents misclassification of structured drops
+        # (e.g. session-end hook writes type: session explicitly).
+        existing_type = fm.get("type", "")
+        if existing_type and existing_type in KNOWN_TYPES:
+            classification = {
+                "type": existing_type,
+                "name": fm.get("name") or fm.get("subject") or None,
+                "status": fm.get("status") or None,
+                "tags": fm.get("tags") or [],
+            }
+            self.log.debug("curator.type_from_frontmatter", type=existing_type, path=inbox_file.name)
+        else:
+            classification = await self._classify(content_preview)
+            if not classification:
+                self.log.info("curator.skip_no_classification", path=inbox_file.name)
+                return False
 
         rec_type = classification.get("type", "")
         if rec_type not in KNOWN_TYPES:

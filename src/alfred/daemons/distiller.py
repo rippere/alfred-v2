@@ -75,6 +75,8 @@ class DistillerDaemon(BaseDaemon):
         learn_count = 0
 
         for rel_path, fs in list(state.files.items()):
+            if rel_path.startswith("learn/"):
+                continue  # distiller output — never re-distill
             if _is_stale(fs.last_distilled):
                 try:
                     created = await self._distill_file(vault_path, rel_path)
