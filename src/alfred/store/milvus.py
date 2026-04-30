@@ -11,6 +11,25 @@ from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
 
 log = structlog.get_logger()
 
+
+def _is_channel_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "closed channel" in msg or "invoke rpc" in msg or "channel" in msg and "grpc" in msg
+
+
+def _auto_reconnect(method):
+    """Retry once after reconnecting if the gRPC channel to milvus-lite is dead."""
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as e:
+            if _is_channel_error(e):
+                log.warning("milvus.channel_dead", error=str(e)[:120])
+                self._reconnect()
+                return method(self, *args, **kwargs)
+            raise
+    return wrapper
+
 COLLECTION = "vault_v2"
 
 
@@ -46,6 +65,27 @@ class MilvusStore:
 
         self._ensure_collection()
 
+    def _reconnect(self) -> None:
+        """Re-open the MilvusClient after the internal subprocess crashes."""
+        try:
+            self._client.close()
+        except Exception:
+            pass
+        for attempt in range(4):
+            try:
+                self._client = MilvusClient(uri=self.uri)
+                self._ensure_collection()
+                log.info("milvus.reconnected")
+                return
+            except Exception as e:
+                if attempt < 3:
+                    delay = 2.0 * (2 ** attempt)
+                    log.warning("milvus.reconnect_retry", attempt=attempt + 1, delay=delay, error=str(e))
+                    time.sleep(delay)
+                else:
+                    log.error("milvus.reconnect_failed", error=str(e))
+                    raise
+
     def _ensure_collection(self) -> None:
         if self._client.has_collection(self.collection):
             return
@@ -69,6 +109,7 @@ class MilvusStore:
         self._client.create_index(collection_name=self.collection, index_params=index_params)
         log.info("milvus.collection_created", name=self.collection)
 
+    @_auto_reconnect
     def upsert(
         self,
         chunk_id: str,
@@ -90,6 +131,7 @@ class MilvusStore:
             }],
         )
 
+    @_auto_reconnect
     def delete_file(self, rel_path: str, chunk_ids: list[str] | None = None) -> None:
         """Delete all chunks for a file. Uses known chunk_ids when available (fast path)."""
         if chunk_ids:
@@ -101,6 +143,7 @@ class MilvusStore:
                 filter=f'id >= "{rel_path}::chunk_" and id < "{rel_path}::chunk_~"',
             )
 
+    @_auto_reconnect
     def search(
         self,
         dense_vec: list[float],
@@ -146,6 +189,7 @@ class MilvusStore:
             ))
         return hits
 
+    @_auto_reconnect
     def query_all(self, output_fields: list[str] | None = None) -> list[dict[str, Any]]:
         """Page through entire collection. Used for migration and cluster building."""
         PAGE = 16_000
@@ -168,6 +212,7 @@ class MilvusStore:
             offset += PAGE
         return all_rows
 
+    @_auto_reconnect
     def count(self) -> int:
         stats = self._client.get_collection_stats(self.collection)
         return int(stats.get("row_count", 0))

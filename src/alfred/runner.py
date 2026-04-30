@@ -61,6 +61,17 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
             except asyncio.QueueEmpty:
                 await asyncio.sleep(0.5)
 
+    async def _periodic_save():
+        """Save state every 5 minutes so a SIGKILL loses at most 5min of progress."""
+        while not stop_event.is_set():
+            await asyncio.sleep(300)
+            if not stop_event.is_set():
+                try:
+                    state_store.save()
+                    log.debug("alfred.periodic_save")
+                except Exception as e:
+                    log.warning("alfred.periodic_save_failed", error=str(e))
+
     async with anyio.create_task_group() as tg:
         # Register signal handlers
         loop = asyncio.get_event_loop()
@@ -68,6 +79,7 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
             loop.add_signal_handler(sig, _handle_signal)
 
         tg.start_soon(_event_loop)
+        tg.start_soon(_periodic_save)
         for daemon in active.values():
             tg.start_soon(daemon.run)
 

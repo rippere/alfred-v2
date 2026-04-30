@@ -11,7 +11,8 @@ from rich import box
 app = typer.Typer(name="alfred", help="Personal agentic knowledge infrastructure.", add_completion=False)
 console = Console()
 
-_DEFAULT_CONFIG = Path("config.yaml")
+# Resolve relative to repo root regardless of CWD
+_DEFAULT_CONFIG = Path(__file__).resolve().parent.parent.parent / "config.yaml"
 
 
 def _load(config_path: Path):
@@ -99,8 +100,20 @@ def up(
 
     if not no_pid_check and pid_path.exists():
         existing_pid = pid_path.read_text().strip()
-        console.print(f"[yellow]Alfred may already be running (PID {existing_pid}). Use 'alfred down' first.[/yellow]")
-        raise typer.Exit(1)
+        try:
+            pid_int = int(existing_pid)
+            import os as _os
+            _os.kill(pid_int, 0)  # raises if process is dead
+            console.print(f"[yellow]Alfred already running (PID {existing_pid}). Use 'alfred down' first.[/yellow]")
+            raise typer.Exit(1)
+        except ProcessLookupError:
+            console.print(f"[dim]Removing stale PID file (PID {existing_pid} is dead).[/dim]")
+            pid_path.unlink(missing_ok=True)
+        except PermissionError:
+            console.print(f"[yellow]Alfred already running (PID {existing_pid}). Use 'alfred down' first.[/yellow]")
+            raise typer.Exit(1)
+        except ValueError:
+            pid_path.unlink(missing_ok=True)
 
     if daemon:
         # Fork to background — redirect stdout/stderr to log file so process survives terminal close

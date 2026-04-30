@@ -81,6 +81,9 @@ class DistillerDaemon(BaseDaemon):
                     fs.last_distilled = now_iso
                     learn_count += created
                     distilled_count += 1
+                    if distilled_count % 50 == 0:
+                        await self.save_state()
+                        self.log.debug("distiller.incremental_save", files=distilled_count)
                     await asyncio.sleep(1.5)
                 except Exception as e:
                     self.log.warning("distiller.file_error", path=rel_path, error=str(e))
