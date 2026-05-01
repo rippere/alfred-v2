@@ -132,6 +132,57 @@ def vault_edit(
     return {"path": rel_path, "fields_changed": changed}
 
 
+def vault_append_to_topic(
+    vault_path: Path,
+    topic_slug: str,
+    insight_title: str,
+    insight_body: str,
+    tags: list[str] | None = None,
+    source: str | None = None,
+) -> dict:
+    """Append an insight section to topic/{topic_slug}.md, creating the file if needed."""
+    rel_path = f"topic/{topic_slug}.md"
+    fp = _resolve(vault_path, rel_path)
+    tags = tags or []
+
+    source_link = (source[:-3] if source and source.endswith(".md") else source) or ""
+    section = f"## {insight_title}\n\n{insight_body.strip()}"
+    if source_link:
+        section += f"\n\nSource: [[{source_link}]]"
+
+    if fp.exists():
+        fm, body = _parse(fp)
+        existing_tags: list = fm.get("tags", [])
+        if not isinstance(existing_tags, list):
+            existing_tags = [existing_tags] if existing_tags else []
+        for t in tags:
+            if t not in existing_tags:
+                existing_tags.append(t)
+        fm["tags"] = existing_tags
+        existing_sources: list = fm.get("sources", [])
+        if not isinstance(existing_sources, list):
+            existing_sources = [existing_sources] if existing_sources else []
+        if source and source not in existing_sources:
+            existing_sources.append(source)
+        fm["sources"] = existing_sources
+        body = body.rstrip() + "\n\n---\n\n" + section + "\n"
+        fp.write_text(_serialize(fm, body), encoding="utf-8")
+    else:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fm = {
+            "type": "topic",
+            "name": topic_slug,
+            "tags": tags,
+            "sources": [source] if source else [],
+            "created": date.today().isoformat(),
+            "status": "active",
+        }
+        body = f"# {topic_slug}\n\n{section}\n"
+        fp.write_text(_serialize(fm, body), encoding="utf-8")
+
+    return {"path": rel_path}
+
+
 def vault_delete(vault_path: Path, rel_path: str) -> dict:
     fp = _resolve(vault_path, rel_path)
     if not fp.exists():

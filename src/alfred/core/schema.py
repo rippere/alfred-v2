@@ -5,7 +5,7 @@ KNOWN_TYPES: set[str] = {
     "project", "task", "session", "input", "person", "org",
     "location", "note", "decision", "process", "run", "event",
     "account", "asset", "conversation", "assumption", "constraint",
-    "contradiction", "synthesis", "wiki", "learn",
+    "contradiction", "synthesis", "wiki", "learn", "topic",
 }
 
 LEARN_TYPES: set[str] = {
@@ -33,6 +33,7 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     "contradiction": {"unresolved", "resolved", "accepted"},
     "synthesis": {"draft", "active", "superseded"},
     "learn": {"active", "absorbed", "superseded"},
+    "topic": {"active", "archived"},
 }
 
 TYPE_DIRECTORY: dict[str, str] = {
@@ -41,7 +42,7 @@ TYPE_DIRECTORY: dict[str, str] = {
     "process": "process", "run": "run", "event": "event", "account": "account",
     "asset": "asset", "conversation": "conversation", "assumption": "assumption",
     "constraint": "constraint", "contradiction": "contradiction", "synthesis": "synthesis",
-    "wiki": "wiki", "learn": "learn",
+    "wiki": "wiki", "learn": "learn", "topic": "topic",
 }
 
 LIST_FIELDS: set[str] = {

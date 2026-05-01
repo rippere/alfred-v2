@@ -11,7 +11,7 @@ from pathlib import Path
 import frontmatter
 import structlog
 
-from alfred.core.vault_ops import VaultError, vault_create, vault_read
+from alfred.core.vault_ops import VaultError, vault_append_to_topic, vault_read
 from alfred.daemons.base import BaseDaemon
 
 log = structlog.get_logger()
@@ -75,7 +75,7 @@ class DistillerDaemon(BaseDaemon):
         learn_count = 0
 
         for rel_path, fs in list(state.files.items()):
-            if rel_path.startswith("learn/"):
+            if rel_path.startswith(("learn/", "topic/")):
                 continue  # distiller output — never re-distill
             if _is_stale(fs.last_distilled):
                 try:
@@ -168,27 +168,31 @@ class DistillerDaemon(BaseDaemon):
             if not title or not body_text:
                 continue
             try:
-                source_link = rel_path[:-3] if rel_path.endswith(".md") else rel_path
-                body_with_link = body_text + f"\n\nSource: [[{source_link}]]"
-                result = vault_create(
+                tag_list = tags if isinstance(tags, list) else []
+                topic_slug = _tag_to_slug(tag_list[0] if tag_list else "misc")
+                result = vault_append_to_topic(
                     vault_path,
-                    "learn",
+                    topic_slug,
                     title,
-                    set_fields={
-                        "tags": tags if isinstance(tags, list) else [],
-                        "source": rel_path,
-                    },
-                    body=body_with_link,
+                    body_text,
+                    tags=tag_list,
+                    source=rel_path,
                 )
-                # Track learn record in source file's state
                 if rel_path in state.files:
                     state.files[rel_path].learn_records_created.append(result["path"])
                 created += 1
-                self.log.debug("distiller.created_learn", path=result["path"])
+                self.log.debug("distiller.appended_topic", path=result["path"], title=title)
             except VaultError:
                 pass
 
         return created
+
+
+def _tag_to_slug(tag: str) -> str:
+    import re as _re
+    slug = tag.lower().strip()
+    slug = _re.sub(r"[^a-z0-9]+", "-", slug)
+    return slug.strip("-") or "misc"
 
 
 def _is_stale(last_distilled: str) -> bool:
