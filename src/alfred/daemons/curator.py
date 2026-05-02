@@ -10,7 +10,7 @@ from pathlib import Path
 import frontmatter
 import structlog
 
-from alfred.core.schema import KNOWN_TYPES, TYPE_DIRECTORY
+from alfred.core.schema import KNOWN_TYPES, STATUS_BY_TYPE, TYPE_DIRECTORY, correct_status, correct_type
 from alfred.core.vault_ops import VaultError, vault_create, vault_move
 from alfred.daemons.base import BaseDaemon
 
@@ -29,6 +29,12 @@ Fields to extract:
 - "status": appropriate initial status for the type (optional)
 - "tags": list of relevant topic tags (optional, max 5)
 - "summary": 1-2 sentence description (optional, used as body if the note is short)
+
+Routing rules:
+- AI conversation sessions, Claude Code handoffs, chat logs → type: "session"
+- Beliefs, limits, system constraints → type: "assumption" or "constraint" (stored in topic/)
+- Contradictions, conflicts → type: "contradiction" (stored in topic/)
+- Choices, trade-offs, architectural decisions → type: "decision" (stored in topic/)
 
 Note content:
 ---
@@ -89,7 +95,11 @@ class CuratorDaemon(BaseDaemon):
         # If the file already declares a known type, skip LLM classification entirely.
         # This is cheaper, faster, and prevents misclassification of structured drops
         # (e.g. session-end hook writes type: session explicitly).
+        # Normalise legacy types: conversation → session, ai-dialogue → session.
         existing_type = fm.get("type", "")
+        if existing_type in ("conversation", "ai-dialogue"):
+            existing_type = "session"
+            fm["type"] = "session"
         if existing_type and existing_type in KNOWN_TYPES:
             classification = {
                 "type": existing_type,
@@ -105,6 +115,16 @@ class CuratorDaemon(BaseDaemon):
                 return False
 
         rec_type = classification.get("type", "")
+        # Normalise legacy type aliases before validation
+        if rec_type in ("conversation", "ai-dialogue"):
+            rec_type = "session"
+            classification["type"] = "session"
+        # Try _TYPE_CORRECTIONS if not directly known
+        if rec_type not in KNOWN_TYPES:
+            corrected = correct_type(rec_type)
+            if corrected:
+                rec_type = corrected
+                classification["type"] = corrected
         if rec_type not in KNOWN_TYPES:
             self.log.info("curator.skip_unknown_type", type=rec_type, path=inbox_file.name)
             return False
@@ -119,9 +139,7 @@ class CuratorDaemon(BaseDaemon):
 
         set_fields: dict = {}
         if raw_status := classification.get("status"):
-            from alfred.core.schema import correct_status
             valid_status = correct_status(raw_status, rec_type) or raw_status
-            from alfred.core.schema import STATUS_BY_TYPE
             if valid_status in STATUS_BY_TYPE.get(rec_type, {valid_status}):
                 set_fields["status"] = valid_status
         if tags := classification.get("tags"):

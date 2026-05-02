@@ -1,0 +1,34 @@
+{
+  "_comment": "Merge this into ~/.claude/settings.json on the laptop. The alfred-vault MCP points to the desktop server over LAN (SSE). Adjust the IP if the desktop IP changes.",
+  "mcpServers": {
+    "alfred-vault": {
+      "type": "sse",
+      "url": "http://192.168.254.182:8765/sse"
+    }
+  },
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.config/claude/hooks/session-end.sh",
+            "timeout": 90,
+            "statusMessage": "Generating session handoff..."
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.config/claude/hooks/pre-compact.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

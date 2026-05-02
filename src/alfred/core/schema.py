@@ -5,9 +5,12 @@ KNOWN_TYPES: set[str] = {
     "project", "task", "session", "input", "person", "org",
     "location", "note", "decision", "process", "run", "event",
     "account", "asset", "conversation", "assumption", "constraint",
-    "contradiction", "synthesis", "wiki", "learn", "topic",
+    "contradiction", "synthesis", "wiki", "topic",
+    # Legacy — recognised for read-path compat but no longer written as directories
+    "learn", "ai-dialogue",
 }
 
+# Epistemic types that consolidate into topic/ directory (tracked via tags)
 LEARN_TYPES: set[str] = {
     "assumption", "decision", "constraint", "contradiction", "synthesis",
 }
@@ -38,11 +41,17 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
 
 TYPE_DIRECTORY: dict[str, str] = {
     "project": "project", "task": "task", "person": "person", "org": "org",
-    "location": "location", "note": "note", "decision": "decision",
+    "location": "location", "note": "note",
     "process": "process", "run": "run", "event": "event", "account": "account",
-    "asset": "asset", "conversation": "conversation", "assumption": "assumption",
-    "constraint": "constraint", "contradiction": "contradiction", "synthesis": "synthesis",
-    "wiki": "wiki", "learn": "learn", "topic": "topic",
+    "asset": "asset", "synthesis": "synthesis",
+    "wiki": "wiki", "topic": "topic",
+    # Session types — all go to session/
+    "session": "session", "conversation": "session", "ai-dialogue": "session",
+    # Epistemic types — consolidated into topic/ (subtype tracked via tags)
+    "decision": "topic", "assumption": "topic",
+    "constraint": "topic", "contradiction": "topic",
+    # Legacy type — no longer written, but kept for read-path compatibility
+    "learn": "topic",
 }
 
 LIST_FIELDS: set[str] = {
@@ -64,8 +73,11 @@ _TYPE_CORRECTIONS: dict[str, str] = {
     "organization": "org", "company": "org", "projects": "project",
     "tasks": "task", "todo": "task", "notes": "note", "decisions": "decision",
     "processes": "process", "workflow": "process", "events": "event",
-    "accounts": "account", "assets": "asset", "conversations": "conversation",
-    "chat": "conversation", "thread": "conversation", "runs": "run",
+    "accounts": "account", "assets": "asset",
+    # conversation aliases → session
+    "conversations": "session", "chat": "session", "thread": "session",
+    "ai-dialogue": "session", "ai_dialogue": "session", "dialogue": "session",
+    "runs": "run",
     "sessions": "session", "inputs": "input", "assumptions": "assumption",
     "constraints": "constraint", "contradictions": "contradiction",
     "syntheses": "synthesis",

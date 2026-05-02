@@ -9,6 +9,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import json
 import os
@@ -30,8 +31,9 @@ from alfred.daemons.base import BaseDaemon
 
 log = structlog.get_logger()
 
-SWEEP_INTERVAL = 3600.0    # structural scan every hour
-DEEP_INTERVAL = 86400.0    # LLM enrichment once per day
+SWEEP_INTERVAL = 3600.0     # structural scan every hour
+DEEP_INTERVAL = 86400.0     # LLM enrichment once per day
+DEDUP_INTERVAL = 604800.0   # dedup sweep once per week (7 days)
 
 
 class IssueCode(str, Enum):
@@ -52,6 +54,7 @@ class JanitorDaemon(BaseDaemon):
         super().__init__(cfg, state, events)
         self._last_sweep = float("-inf")
         self._last_deep = float("-inf")
+        self._last_dedup = float("-inf")
         self._stem_index: dict[str, set[str]] = {}
 
     async def run(self) -> None:
@@ -67,6 +70,9 @@ class JanitorDaemon(BaseDaemon):
                 if now - self._last_deep > deep_interval:
                     await self._deep_sweep()
                     self._last_deep = now
+                if now - self._last_dedup > DEDUP_INTERVAL:
+                    await self._dedup_sweep()
+                    self._last_dedup = now
                 await asyncio.sleep(60.0)
         finally:
             await self.save_state()
@@ -355,3 +361,156 @@ class JanitorDaemon(BaseDaemon):
         if new_body and len(new_body) > 20:
             vault_edit(vault_path, rel_path, body_replace=new_body)
             self.log.info("janitor.enriched_file", path=rel_path, chars=len(new_body))
+
+    # ── Dedup sweep: weekly similarity-based deduplication ────────────────────
+
+    async def _dedup_sweep(self) -> None:
+        """Compare all vault .md files within each directory and merge near-duplicates.
+
+        Uses difflib.SequenceMatcher on file bodies: if ratio > 0.85 and both files
+        are in the same directory, the shorter file's unique content is appended to
+        the longer file, then the shorter is deleted.
+
+        Runs at most once per week. Writes a summary to inbox/dedup-report-{date}.md.
+        """
+        vault_path = self.cfg.vault_path
+        ignore = set(self.cfg.ignore_dirs) | {"inbox", "_archived", "_templates", "_bases"}
+        state = self.state.state
+
+        # Guard: skip if already ran this week (using state timestamp)
+        last_run_iso = getattr(state, "last_dedup", None)
+        if last_run_iso:
+            try:
+                last_run_dt = datetime.fromisoformat(last_run_iso)
+                elapsed = (datetime.now(timezone.utc) - last_run_dt).total_seconds()
+                if elapsed < DEDUP_INTERVAL:
+                    self.log.debug("janitor.dedup_skip", reason="ran recently", elapsed_h=round(elapsed/3600, 1))
+                    return
+            except Exception:
+                pass
+
+        self.log.info("janitor.dedup_sweep.start")
+        merged_count = 0
+        merge_log: list[str] = []
+
+        # Group all markdown files by their parent directory
+        dir_files: dict[str, list[Path]] = {}
+        for md_file in vault_path.rglob("*.md"):
+            rel = md_file.relative_to(vault_path)
+            if any(part in ignore for part in rel.parts):
+                continue
+            dir_key = str(rel.parent)
+            dir_files.setdefault(dir_key, []).append(md_file)
+
+        # Compare pairs within each directory
+        for dir_key, files in dir_files.items():
+            if len(files) < 2:
+                continue
+            # Sort for determinism; limit to 200 files per dir to avoid O(n²) blowup
+            files_sorted = sorted(files)[:200]
+            checked: set[str] = set()
+
+            for i, fa in enumerate(files_sorted):
+                if str(fa) in checked:
+                    continue
+                try:
+                    post_a = frontmatter.load(str(fa))
+                    body_a = post_a.content.strip()
+                except Exception:
+                    continue
+                if len(body_a) < 30:
+                    continue
+
+                for fb in files_sorted[i + 1:]:
+                    if str(fb) in checked:
+                        continue
+                    try:
+                        post_b = frontmatter.load(str(fb))
+                        body_b = post_b.content.strip()
+                    except Exception:
+                        continue
+                    if len(body_b) < 30:
+                        continue
+
+                    ratio = difflib.SequenceMatcher(None, body_a, body_b, autojunk=False).ratio()
+                    if ratio < 0.85:
+                        continue
+
+                    # Decide keeper (longer body wins)
+                    if len(body_a) >= len(body_b):
+                        keeper, dupe = fa, fb
+                        keeper_body, dupe_body = body_a, body_b
+                        keeper_post = post_a
+                    else:
+                        keeper, dupe = fb, fa
+                        keeper_body, dupe_body = body_b, body_a
+                        keeper_post = post_b
+
+                    # Extract lines from dupe that are absent from keeper
+                    keeper_lines = set(keeper_body.splitlines())
+                    unique_lines = [
+                        ln for ln in dupe_body.splitlines()
+                        if ln.strip() and ln not in keeper_lines
+                    ]
+                    unique_content = "\n".join(unique_lines).strip()
+
+                    # Append unique content to keeper if meaningful
+                    if unique_content and len(unique_content) > 20:
+                        try:
+                            vault_edit(
+                                vault_path,
+                                str(keeper.relative_to(vault_path)).replace("\\", "/"),
+                                body_append=f"<!-- merged from {dupe.name} -->\n{unique_content}",
+                            )
+                        except Exception as e:
+                            self.log.warning("janitor.dedup_merge_error", keeper=keeper.name, error=str(e))
+                            continue
+
+                    # Delete duplicate
+                    try:
+                        dupe_rel = str(dupe.relative_to(vault_path)).replace("\\", "/")
+                        dupe.unlink()
+                        # Prune from state
+                        state.files.pop(dupe_rel, None)
+                        checked.add(str(dupe))
+                        merged_count += 1
+                        msg = f"merged {dupe.name} → {keeper.name} (ratio={ratio:.2f})"
+                        merge_log.append(msg)
+                        self.log.info("janitor.dedup_merged", **dict(zip(
+                            ["dupe", "keeper", "ratio"],
+                            [dupe.name, keeper.name, round(ratio, 3)]
+                        )))
+                    except Exception as e:
+                        self.log.warning("janitor.dedup_delete_error", path=dupe.name, error=str(e))
+
+        # Update last_dedup timestamp on state
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            state.last_dedup = now_iso
+        except Exception:
+            pass  # state model may not have this attr yet — harmless
+
+        # Write dedup report to inbox
+        report_path = vault_path / "inbox" / f"dedup-report-{date.today().isoformat()}.md"
+        report_lines = [
+            "---",
+            "type: note",
+            f"created: '{date.today().isoformat()}'",
+            "tags: [janitor, dedup]",
+            f"name: dedup-report-{date.today().isoformat()}",
+            "---",
+            "",
+            f"# Dedup Report — {date.today().isoformat()}",
+            "",
+            f"**Files merged:** {merged_count}",
+            "",
+        ]
+        if merge_log:
+            report_lines.append("## Merge Log\n")
+            report_lines.extend(f"- {entry}" for entry in merge_log)
+        else:
+            report_lines.append("No duplicates found.")
+        report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+        self.log.info("janitor.dedup_sweep.done", merged=merged_count)
+        await self.save_state()
