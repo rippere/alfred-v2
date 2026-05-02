@@ -27,7 +27,9 @@ def load_env(config_path: Path) -> None:
 class AlfredConfig:
     vault_path: Path
     data_dir: Path
-    ignore_dirs: list[str] = field(default_factory=lambda: ["inbox/processed", "wiki"])
+    ignore_dirs: list[str] = field(default_factory=lambda: [
+        "inbox/processed", "wiki", "_archived", "_templates", "_bases",
+    ])
 
     # Ollama
     ollama_base_url: str = "http://localhost:11434"

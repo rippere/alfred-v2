@@ -3,7 +3,9 @@ vault:
   ignore_dirs:
     - inbox
     - wiki
-    - ai-dialogue
+    - _archived
+    - _templates
+    - _bases
     - .obsidian
 
 data_dir: ./data
