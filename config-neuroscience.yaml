@@ -1,0 +1,30 @@
+vault:
+  path: /mnt/external/vault-neuroscience
+  ignore_dirs:
+    - inbox
+    - wiki
+    - _archived
+    - _templates
+    - _bases
+    - .obsidian
+
+data_dir: ./data-neuroscience
+
+ollama:
+  base_url: http://localhost:11434
+  embed_model: nomic-embed-text
+  llm_model: mistral:latest
+
+distiller:
+  stale_days: 30
+
+consolidator:
+  synthesis_batch: 5
+
+query:
+  top_k: 8
+  hopfield_beta: 2.0
+
+synthesis:
+  anthropic_model: claude-sonnet-4-6
+  openrouter_model: x-ai/grok-4.1-fast

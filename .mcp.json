@@ -1,0 +1,12 @@
+{
+  "alfred": {
+    "type": "stdio",
+    "command": "/home/rippere/alfred-v2/.venv/bin/python",
+    "args": ["-m", "alfred.mcp.meta_server", "--config", "/home/rippere/alfred-v2/config-meta.yaml"]
+  },
+  "alfred-vault": {
+    "type": "stdio",
+    "command": "/home/rippere/alfred-v2/.venv/bin/alfred",
+    "args": ["mcp", "--config", "/home/rippere/alfred-v2/config.yaml"]
+  }
+}
