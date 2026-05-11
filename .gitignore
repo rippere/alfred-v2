@@ -11,6 +11,10 @@ wheels/
 
 # Runtime data (milvus, bm25 index, state, logs)
 data/
+data-finance/
+data-neuroscience/
+data-personal/
+data.backup-*/
 
 # Secrets
 .env
