@@ -18,7 +18,7 @@ log = structlog.get_logger()
 CONSOLIDATE_INTERVAL = 1800.0   # run every 30 minutes
 MIN_MEMBERS = 3                  # skip clusters with fewer files
 MAX_MEMBERS_IN_PROMPT = 8        # cap members sent to LLM
-SYNTHESIS_BATCH = 20             # max clusters to synthesize per run
+SYNTHESIS_BATCH = 5              # max clusters to synthesize per run
 
 # Record types that should get wiki pages
 WIKI_ENTITY_TYPES = {"person", "org"}
@@ -103,14 +103,47 @@ class ConsolidatorDaemon(BaseDaemon):
         graph = GraphStore(self.cfg.graph_path)
         graph.load()
 
+        SYNTHESIS_STALE_DAYS = 30  # only re-synthesize existing pages after 30 days
+
         ranked: list[tuple[str, object, int]] = []
         for key, cluster in state.clusters.items():
             if len(cluster.member_files) < MIN_MEMBERS:
                 continue
-            if cluster.consolidated_chunk_id:
-                continue  # already synthesized
             if not cluster.label:
                 continue  # not yet labeled — wait for label pass
+
+            # Guard: if consolidated_chunk_id is set, verify the file exists on disk.
+            # If it exists and is fresh (< 30 days old), skip — already synthesized.
+            # If consolidated_chunk_id is set but the file is gone, allow re-synthesis.
+            if cluster.consolidated_chunk_id:
+                synthesis_path = vault_path / cluster.consolidated_chunk_id
+                if synthesis_path.exists():
+                    try:
+                        mtime = synthesis_path.stat().st_mtime
+                        age_days = (time.time() - mtime) / 86400
+                        if age_days < SYNTHESIS_STALE_DAYS:
+                            continue  # fresh synthesis exists — skip
+                    except OSError:
+                        pass  # can't stat — fall through and re-synthesize
+                else:
+                    # consolidated_chunk_id points to a missing file — reset it
+                    cluster.consolidated_chunk_id = ""
+
+            # Additional guard: even without consolidated_chunk_id, check if target
+            # synthesis file already exists on disk (race condition / state reset).
+            label_slug = "-".join((cluster.label[0] if cluster.label else "cluster").lower().split())[:60]
+            synthesis_rel = f"synthesis/{label_slug}.md"
+            if not cluster.consolidated_chunk_id and (vault_path / synthesis_rel).exists():
+                try:
+                    mtime = (vault_path / synthesis_rel).stat().st_mtime
+                    age_days = (time.time() - mtime) / 86400
+                    if age_days < SYNTHESIS_STALE_DAYS:
+                        # File exists and is fresh — adopt it without re-synthesizing
+                        cluster.consolidated_chunk_id = synthesis_rel
+                        continue
+                except OSError:
+                    pass
+
             degree_sum = sum(graph.get_node_degree(f) for f in cluster.member_files)
             ranked.append((key, cluster, degree_sum))
 
@@ -158,22 +191,37 @@ class ConsolidatorDaemon(BaseDaemon):
         full_body = f"{synthesis_body}\n\n## Sources\n" + "\n".join(f"- {lnk}" for lnk in source_links)
 
         label_slug = "-".join(label.lower().split())[:60]
-        # Avoid name collision — append cluster_id suffix if file already exists
-        candidate = label_slug
-        if (vault_path / "synthesis" / f"{candidate}.md").exists():
-            candidate = f"{label_slug}-{cluster.cluster_id}"
-        result = vault_create(
-            vault_path,
-            "synthesis",
-            candidate,
-            set_fields={
-                "status": "draft",
-                "cluster_sources": source_links,
-                "confidence": "medium",
-                "created": date.today().isoformat(),
-            },
-            body=full_body,
-        )
+        synthesis_rel = f"synthesis/{label_slug}.md"
+        if (vault_path / synthesis_rel).exists():
+            # Update in place: merge source links, replace body with fresh synthesis
+            try:
+                existing = vault_read(vault_path, synthesis_rel)
+                existing_sources = existing["frontmatter"].get("cluster_sources", [])
+                merged_sources = list(dict.fromkeys(existing_sources + source_links))
+                merged_body = f"{synthesis_body}\n\n## Sources\n" + "\n".join(f"- {lnk}" for lnk in merged_sources)
+                vault_edit(
+                    vault_path,
+                    synthesis_rel,
+                    set_fields={"status": "active", "cluster_sources": merged_sources},
+                    body_replace=merged_body,
+                )
+            except Exception as e:
+                self.log.warning("consolidator.synthesis_update_failed", path=synthesis_rel, error=str(e))
+                return
+            result = {"path": synthesis_rel}
+        else:
+            result = vault_create(
+                vault_path,
+                "synthesis",
+                label_slug,
+                set_fields={
+                    "status": "draft",
+                    "cluster_sources": source_links,
+                    "confidence": "medium",
+                    "created": date.today().isoformat(),
+                },
+                body=full_body,
+            )
 
         # Mark each learn/ file absorbed
         for rel_path, _, _ in learn_entries:

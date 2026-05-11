@@ -95,6 +95,10 @@ class QueryEngine:
     def query(self, text: str, opts: QueryOptions | None = None) -> QueryResult:
         if opts is None:
             opts = QueryOptions(top_k=self.cfg.default_top_k)
+
+        if self.cfg.bm25_only:
+            return self._query_bm25_only(text, opts)
+
         t = {}
 
         # ── Step 0: Wiki fast-path ─────────────────────────────────────────────
@@ -180,6 +184,86 @@ class QueryEngine:
             state_store = self._get_state()
             record_access(hits, state_store.state)
             state_store.save()
+
+        return QueryResult(
+            query=text,
+            wiki_hit=wiki_hit,
+            hits=hits,
+            sources=sources,
+            context=context,
+            answer=answer,
+            synthesis_backend=backend,
+            synthesis_model=model,
+            elapsed=t,
+        )
+
+    def _query_bm25_only(self, text: str, opts: QueryOptions) -> QueryResult:
+        """Lightweight query path: BM25 corpus search only, no Milvus or Ollama.
+
+        Requires the BM25 index to have been built with fit_and_store() (phase4 rebuild).
+        Returns results ranked by BM25 score then reranked by FlashRank.
+        """
+        t = {}
+
+        t0 = time.perf_counter()
+        wiki_hit = self._wiki.lookup(text)
+        t["wiki"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        bm25 = self._get_bm25()
+        if not bm25.has_corpus:
+            raise RuntimeError(
+                "BM25-only mode requires corpus storage. "
+                "Rebuild with phase4_rebuild_milvus.py (it calls fit_and_store)."
+            )
+        raw_hits = bm25.search(text, top_k=opts.top_k * 3)
+        t["bm25"] = time.perf_counter() - t0
+
+        hits: list[SearchHit] = []
+        seen_paths: set[str] = set()
+        for chunk_id, score in raw_hits:
+            rel_path = chunk_id.rsplit("::", 1)[0]
+            if not opts.include_inbox and rel_path.startswith("inbox/"):
+                continue
+            if rel_path in seen_paths:
+                continue
+            seen_paths.add(rel_path)
+            hits.append(SearchHit(
+                chunk_id=chunk_id,
+                rel_path=rel_path,
+                score=score,
+                record_type="",
+                name=Path(rel_path).stem,
+            ))
+
+        # FlashRank reranking
+        t0 = time.perf_counter()
+        from alfred.query.context import _chunk_text
+        from alfred.embed.reranker import rerank
+        texts = {h.chunk_id: (_chunk_text(self.cfg.vault_path, h.chunk_id) or "") for h in hits}
+        hits = rerank(text, hits, texts, top_n=opts.top_k)
+        t["rerank"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        context, sources = assemble(hits, self.cfg.vault_path)
+        if wiki_hit:
+            wiki_block = f"[Wiki: {wiki_hit.rel_path}  score=0.95]\n{wiki_hit.content}"
+            context = wiki_block + "\n\n---\n\n" + context if context else wiki_block
+        t["assemble"] = time.perf_counter() - t0
+
+        answer, backend, model = "", "", ""
+        if opts.include_synthesis and context:
+            t0 = time.perf_counter()
+            from alfred.query.synth import synthesize
+            answer, backend, model = synthesize(
+                query=text,
+                context=context,
+                anthropic_model=self.cfg.anthropic_model,
+                openrouter_model=self.cfg.openrouter_model,
+                ollama_base_url=self.cfg.ollama_base_url,
+                ollama_model=self.cfg.ollama_llm_model,
+            )
+            t["synth"] = time.perf_counter() - t0
 
         return QueryResult(
             query=text,

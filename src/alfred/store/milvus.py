@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
+
+try:
+    from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
+except ImportError:
+    CollectionSchema = DataType = FieldSchema = MilvusClient = None  # type: ignore[assignment,misc]
 
 log = structlog.get_logger()
 
@@ -45,6 +49,8 @@ class SearchHit:
 
 class MilvusStore:
     def __init__(self, uri: str, embed_dims: int = 768, collection: str = COLLECTION) -> None:
+        if MilvusClient is None:
+            raise RuntimeError("pymilvus not installed — install with: uv pip install 'alfred-v2[embed]'")
         self.uri = uri
         self.embed_dims = embed_dims
         self.collection = collection

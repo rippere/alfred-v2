@@ -128,6 +128,11 @@ class JanitorDaemon(BaseDaemon):
         if fixed:
             self.log.info("janitor.autofixed", count=len(fixed))
 
+        # Stage 2b: archive stale absorbed/completed sessions
+        archived = await self._archive_sessions(vault_path)
+        if archived:
+            self.log.info("janitor.sessions_archived", count=archived)
+
         # Record sweep in state
         state.janitor_sweeps.append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -404,6 +409,7 @@ class JanitorDaemon(BaseDaemon):
 
         # Compare pairs within each directory
         for dir_key, files in dir_files.items():
+            await asyncio.sleep(0)  # yield to event loop between directories
             if len(files) < 2:
                 continue
             # Sort for determinism; limit to 200 files per dir to avoid O(n²) blowup
@@ -411,6 +417,8 @@ class JanitorDaemon(BaseDaemon):
             checked: set[str] = set()
 
             for i, fa in enumerate(files_sorted):
+                if i % 20 == 0:
+                    await asyncio.sleep(0)  # yield every 20 files
                 if str(fa) in checked:
                     continue
                 try:
@@ -514,3 +522,66 @@ class JanitorDaemon(BaseDaemon):
 
         self.log.info("janitor.dedup_sweep.done", merged=merged_count)
         await self.save_state()
+
+    # ── Session archive: move old absorbed/completed sessions out of active vault ─
+
+    async def _archive_sessions(self, vault_path: Path) -> int:
+        """Move session files with status absorbed or completed that are older than
+        90 days into _archived/session/ to reduce active vault clutter and free
+        Milvus slots on the next rebuild.
+
+        Returns the count of files moved.
+        """
+        SESSION_ARCHIVE_DAYS = 90
+        session_dir = vault_path / "session"
+        if not session_dir.exists():
+            return 0
+
+        archive_dir = vault_path / "_archived" / "session"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        archived = 0
+        state = self.state.state
+
+        for md_file in list(session_dir.glob("*.md")):
+            try:
+                post = frontmatter.load(str(md_file))
+                status = str(post.metadata.get("status", "")).lower()
+            except Exception:
+                continue
+
+            if status not in {"absorbed", "completed"}:
+                continue
+
+            try:
+                age_days = (now_ts - md_file.stat().st_mtime) / 86400
+            except OSError:
+                continue
+
+            if age_days < SESSION_ARCHIVE_DAYS:
+                continue
+
+            dest = archive_dir / md_file.name
+            # If destination already exists, skip (idempotent)
+            if dest.exists():
+                md_file.unlink(missing_ok=True)
+                rel_path = f"session/{md_file.name}"
+                state.files.pop(rel_path, None)
+                archived += 1
+                continue
+
+            try:
+                md_file.rename(dest)
+                rel_path = f"session/{md_file.name}"
+                state.files.pop(rel_path, None)
+                archived += 1
+                self.log.debug(
+                    "janitor.session_archived",
+                    file=md_file.name,
+                    age_days=round(age_days, 1),
+                )
+            except Exception as e:
+                self.log.warning("janitor.session_archive_error", file=md_file.name, error=str(e))
+
+        return archived

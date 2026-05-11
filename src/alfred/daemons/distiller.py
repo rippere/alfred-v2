@@ -17,8 +17,72 @@ from alfred.daemons.base import BaseDaemon
 log = structlog.get_logger()
 
 DISTILL_INTERVAL = 86400.0   # run once per day
-STALE_DAYS = 7               # re-distill file if not distilled in 7 days
+STALE_DAYS = 30              # re-distill file if not distilled in 30 days
 MIN_BODY_LEN = 200           # skip files with trivial bodies
+
+# Canonical topic slug map — variant tags → canonical slug.
+# Prevents the distiller from spawning duplicate topic files for the same concept.
+# Keys are raw tag strings that Claude might emit; values are the canonical slug
+# of the richest existing topic file.
+_TAG_CANONICAL: dict[str, str] = {
+    # --- ai / agents / llm cluster ---
+    "agent":                   "ai-agents",
+    "agents":                  "ai-agents",
+    "agentic":                 "ai-agents",
+    "agentic-ai":              "ai-agents",
+    "agentic-systems":         "ai-agents",
+    "agentic-workflow":        "ai-agents",
+    "agentic-builds":          "ai-agents",
+    "agentic-coding":          "ai-agents",
+    "agent-systems":           "ai-agents",
+    "agent-setup":             "ai-agents",
+    "agent-orchestration":     "ai-agents",
+    "agent-design":            "ai-agents",
+    "agent-architecture":      "ai-agents",
+    "multi-agent":             "ai-agents",
+    "llm-systems":             "llm",
+    "llm-architecture":        "llm",
+    "llm-pipelines":           "llm",
+    "llm-workflows":           "llm",
+    "local-llm":               "llm",
+    "local-ai":                "llm",
+    "local-inference":         "llm",
+    "local-ml":                "llm",
+    "foundation-models":       "llm",
+    # ai-systems → ai (most content)
+    "ai-systems":              "ai",
+    "ai-systems-design":       "ai",
+    "artificial-intelligence": "ai",
+    # --- knowledge cluster ---
+    "knowledge-systems":       "knowledge-management",
+    "knowledge-organization":  "knowledge-management",
+    "knowledge-architecture":  "knowledge-management",
+    "knowledge-quality":       "knowledge-management",
+    "knowledge-integrity":     "knowledge-management",
+    "knowledge-capture":       "knowledge-management",
+    "knowledge-distillation":  "knowledge-management",
+    "knowledge-extraction":    "knowledge-management",
+    "knowledge-transfer":      "knowledge-management",
+    "pkm":                     "knowledge-management",
+    "personal-knowledge-management": "knowledge-management",
+    "second-brain":            "knowledge-management",
+    # --- workflow cluster ---
+    "workflows":               "workflow",
+    "workflow-automation":     "workflow",
+    "workflow-design":         "workflow",
+    "workflow-evolution":      "workflow",
+    "workflow-optimization":   "workflow",
+    "workflow-orchestration":  "workflow",
+    "workflow-sequencing":     "workflow",
+    # --- architecture / system-design cluster ---
+    "systems-design":          "system-design",
+    "software-design":         "software-architecture",
+    "software-engineering":    "software-architecture",
+    # --- graph cluster ---
+    "knowledge-graphs":        "knowledge-graph",
+    # --- knowledge-graph → system-design (graph is a design tool) ---
+    # (kept separate — they're distinct enough)
+}
 
 
 _EXTRACT_PROMPT = """\
@@ -192,7 +256,10 @@ def _tag_to_slug(tag: str) -> str:
     import re as _re
     slug = tag.lower().strip()
     slug = _re.sub(r"[^a-z0-9]+", "-", slug)
-    return slug.strip("-") or "misc"
+    slug = slug.strip("-") or "misc"
+    # Resolve variant slugs to their canonical counterpart so the distiller
+    # doesn't proliferate near-duplicate topic files.
+    return _TAG_CANONICAL.get(slug, slug)
 
 
 def _is_stale(last_distilled: str) -> bool:

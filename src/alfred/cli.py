@@ -104,8 +104,20 @@ def up(
             pid_int = int(existing_pid)
             import os as _os
             _os.kill(pid_int, 0)  # raises if process is dead
-            console.print(f"[yellow]Alfred already running (PID {existing_pid}). Use 'alfred down' first.[/yellow]")
-            raise typer.Exit(1)
+            # PIDs recycle after reboot — verify this is actually Alfred
+            _stale = False
+            try:
+                cmdline = Path(f"/proc/{pid_int}/cmdline").read_bytes().replace(b"\x00", b" ").lower()
+                if b"alfred" not in cmdline:
+                    _stale = True
+            except OSError:
+                pass  # /proc unavailable — assume Alfred is running
+            if _stale:
+                console.print(f"[dim]Removing stale PID file (PID {existing_pid} recycled to another process).[/dim]")
+                pid_path.unlink(missing_ok=True)
+            else:
+                console.print(f"[yellow]Alfred already running (PID {existing_pid}). Use 'alfred down' first.[/yellow]")
+                raise typer.Exit(1)
         except ProcessLookupError:
             console.print(f"[dim]Removing stale PID file (PID {existing_pid} is dead).[/dim]")
             pid_path.unlink(missing_ok=True)

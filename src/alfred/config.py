@@ -56,6 +56,7 @@ class AlfredConfig:
     hopfield_beta: float = 2.0
     graph_hops: int = 2
     graph_decay: float = 0.5
+    bm25_only: bool = False   # lightweight mode: skip Milvus/Ollama, use stored BM25 corpus
 
     # Wiki
     wiki_dir: str = "wiki"
@@ -121,6 +122,7 @@ class AlfredConfig:
         if q := raw.get("query"):
             cfg.default_top_k = q.get("top_k", cfg.default_top_k)
             cfg.hopfield_beta = q.get("hopfield_beta", cfg.hopfield_beta)
+            cfg.bm25_only = q.get("bm25_only", cfg.bm25_only)
 
         # Janitor
         if j := raw.get("janitor"):

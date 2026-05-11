@@ -132,6 +132,46 @@ def vault_edit(
     return {"path": rel_path, "fields_changed": changed}
 
 
+def _find_richest_topic_by_tag(vault_path: Path, tags: list[str]) -> str | None:
+    """Scan existing topic files for one that already covers any of the given tags.
+
+    Returns the rel_path of the most content-rich (highest line count) matching file,
+    or None if no match is found.  This prevents the distiller from spawning a new topic
+    file when the concept is already covered under a different slug.
+    """
+    topic_dir = vault_path / "topic"
+    if not topic_dir.exists():
+        return None
+
+    tag_set = {t.lower().strip() for t in tags if t}
+    if not tag_set:
+        return None
+
+    best_path: str | None = None
+    best_lines: int = -1
+
+    for md_file in topic_dir.glob("*.md"):
+        try:
+            post = frontmatter.load(str(md_file))
+        except Exception:
+            continue
+        file_tags_raw = post.metadata.get("tags", [])
+        if not isinstance(file_tags_raw, list):
+            file_tags_raw = [file_tags_raw] if file_tags_raw else []
+        file_tags = {str(t).lower().strip() for t in file_tags_raw}
+        if not (tag_set & file_tags):
+            continue
+        try:
+            line_count = md_file.read_text(encoding="utf-8").count("\n")
+        except OSError:
+            line_count = 0
+        if line_count > best_lines:
+            best_lines = line_count
+            best_path = f"topic/{md_file.name}"
+
+    return best_path
+
+
 def vault_append_to_topic(
     vault_path: Path,
     topic_slug: str,
@@ -140,10 +180,23 @@ def vault_append_to_topic(
     tags: list[str] | None = None,
     source: str | None = None,
 ) -> dict:
-    """Append an insight section to topic/{topic_slug}.md, creating the file if needed."""
+    """Append an insight section to topic/{topic_slug}.md, creating the file if needed.
+
+    Before creating a new topic file, scans existing topic files for one that already
+    covers any of the incoming tags.  If found, appends to the richest matching file
+    instead of spawning a duplicate.
+    """
+    tags = tags or []
     rel_path = f"topic/{topic_slug}.md"
     fp = _resolve(vault_path, rel_path)
-    tags = tags or []
+
+    # If the canonical slug file does not exist, look for an existing topic that
+    # already covers one of these tags — prefer appending there over creating new.
+    if not fp.exists():
+        existing_rel = _find_richest_topic_by_tag(vault_path, tags + [topic_slug])
+        if existing_rel and existing_rel != rel_path:
+            rel_path = existing_rel
+            fp = _resolve(vault_path, rel_path)
 
     source_link = (source[:-3] if source and source.endswith(".md") else source) or ""
     section = f"## {insight_title}\n\n{insight_body.strip()}"

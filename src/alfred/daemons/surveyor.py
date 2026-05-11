@@ -168,22 +168,27 @@ class SurveyorDaemon(BaseDaemon):
         self.emit("files_embedded", paths=diff["new"] + diff["changed"])
 
     async def _recluster(self) -> None:
-        """HDBSCAN + Leiden clustering over current embeddings."""
+        """HDBSCAN clustering over current embeddings.
+
+        The Milvus query_all (~48s for 4k vectors) and HDBSCAN run in a thread
+        pool so the event loop stays responsive for other daemons.
+        """
         try:
-            import igraph as ig
-            import leidenalg
             import numpy as np
             from sklearn.cluster import HDBSCAN
         except ImportError as e:
             self.log.warning("surveyor.cluster_skip", reason=str(e))
             return
 
-        try:
-            rows = self.milvus.query_all(output_fields=["id", "embedding", "record_type", "name"])
-            if not rows:
-                return
+        min_cluster_size = self.cfg.hdbscan_min_cluster_size
+        min_samples = self.cfg.hdbscan_min_samples
+        milvus = self.milvus
 
-            # Deduplicate by rel_path (use first chunk per file)
+        def _compute() -> tuple[dict[int, list[str]], list[tuple[str, int]]] | None:
+            rows = milvus.query_all(output_fields=["id", "embedding"])
+            if not rows:
+                return None
+
             seen: dict[str, list[float]] = {}
             for r in rows:
                 rel_path = r["id"].rsplit("::", 1)[0]
@@ -193,55 +198,64 @@ class SurveyorDaemon(BaseDaemon):
             paths = list(seen.keys())
             vectors = np.array(list(seen.values()), dtype=np.float32)
 
-            if len(paths) < self.cfg.hdbscan_min_cluster_size:
-                return
+            if len(paths) < min_cluster_size:
+                return None
 
-            # HDBSCAN
             labels = HDBSCAN(
-                min_cluster_size=self.cfg.hdbscan_min_cluster_size,
-                min_samples=self.cfg.hdbscan_min_samples,
+                min_cluster_size=min_cluster_size,
+                min_samples=min_samples,
                 metric="cosine",
             ).fit_predict(vectors)
 
-            state = self.state.state
-            from alfred.core.models import ClusterState
-            from datetime import datetime, timezone
-
             cluster_members: dict[int, list[str]] = {}
+            path_labels: list[tuple[str, int]] = []
             for path, cid in zip(paths, labels):
                 cid_int = int(cid)
-                if path in state.files:
-                    state.files[path].semantic_cluster_id = cid_int
+                path_labels.append((path, cid_int))
                 if cid_int != -1:
                     cluster_members.setdefault(cid_int, []).append(path)
 
-            # Update cluster state
-            for cid, members in cluster_members.items():
-                key = f"semantic_{cid}"
-                existing = state.clusters.get(key)
-                state.clusters[key] = ClusterState(
-                    cluster_id=cid,
-                    cluster_type="semantic",
-                    label=existing.label if existing else [],
-                    member_files=members,
-                    last_labeled=existing.last_labeled if existing else "",
-                )
+            return cluster_members, path_labels
 
-            # Rebuild cluster edges in one graph pass (clear stale edges first)
-            try:
-                from alfred.store.graph import GraphStore
-                graph = GraphStore(self.cfg.graph_path)
-                graph.load()
-                cleared = graph.clear_cluster_edges()
-                self.log.debug("surveyor.cluster_edges_cleared", count=cleared)
-                for members in cluster_members.values():
-                    graph.add_cluster_edges(members)
-                graph.save()
-            except Exception as e:
-                self.log.warning("surveyor.graph_update_failed", error=str(e))
-
-            self.emit("clusters_updated", cluster_count=len(cluster_members))
-            self.log.info("surveyor.clustered", clusters=len(cluster_members), files=len(paths))
-
+        try:
+            result = await asyncio.to_thread(_compute)
+            if result is None:
+                return
+            cluster_members, path_labels = result
         except Exception as e:
             self.log.error("surveyor.cluster_failed", error=str(e))
+            return
+
+        state = self.state.state
+        from alfred.core.models import ClusterState
+
+        for path, cid_int in path_labels:
+            if path in state.files:
+                state.files[path].semantic_cluster_id = cid_int
+
+        for cid, members in cluster_members.items():
+            key = f"semantic_{cid}"
+            existing = state.clusters.get(key)
+            state.clusters[key] = ClusterState(
+                cluster_id=cid,
+                cluster_type="semantic",
+                label=existing.label if existing else [],
+                member_files=members,
+                last_labeled=existing.last_labeled if existing else "",
+                consolidated_chunk_id=existing.consolidated_chunk_id if existing else "",
+            )
+
+        try:
+            from alfred.store.graph import GraphStore
+            graph = GraphStore(self.cfg.graph_path)
+            graph.load()
+            cleared = graph.clear_cluster_edges()
+            self.log.debug("surveyor.cluster_edges_cleared", count=cleared)
+            for members in cluster_members.values():
+                graph.add_cluster_edges(members)
+            graph.save()
+        except Exception as e:
+            self.log.warning("surveyor.graph_update_failed", error=str(e))
+
+        self.emit("clusters_updated", cluster_count=len(cluster_members))
+        self.log.info("surveyor.clustered", clusters=len(cluster_members), files=len(path_labels))

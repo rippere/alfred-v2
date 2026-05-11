@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -44,8 +45,15 @@ Note content:
 Respond with only a JSON object on a single line. No prose, no markdown fences."""
 
 
+def _json_default(obj):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
 class CuratorDaemon(BaseDaemon):
     name = "curator"
+    _classify_paused_until: float = 0.0
 
     async def run(self) -> None:
         self.log.info("curator.start")
@@ -89,7 +97,7 @@ class CuratorDaemon(BaseDaemon):
 
         content_preview = (body[:2000]).strip()
         if fm:
-            fm_str = json.dumps({k: v for k, v in fm.items() if v}, indent=2)
+            fm_str = json.dumps({k: v for k, v in fm.items() if v}, indent=2, default=_json_default)
             content_preview = f"Frontmatter:\n{fm_str}\n\nBody:\n{content_preview}"
 
         # If the file already declares a known type, skip LLM classification entirely.
@@ -178,6 +186,9 @@ class CuratorDaemon(BaseDaemon):
         if not api_key:
             return None
 
+        if time.monotonic() < self._classify_paused_until:
+            return None
+
         prompt = _CLASSIFY_PROMPT.format(
             types=", ".join(sorted(KNOWN_TYPES)),
             content=content[:3000],
@@ -201,7 +212,11 @@ class CuratorDaemon(BaseDaemon):
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             return json.loads(raw)
         except Exception as e:
-            self.log.warning("curator.classify_error", error=str(e))
+            err_str = str(e)
+            self.log.warning("curator.classify_error", error=err_str)
+            if "credit balance is too low" in err_str or "balance is too low" in err_str:
+                self._classify_paused_until = time.monotonic() + 3600
+                self.log.warning("curator.classify_paused", reason="credit_exhaustion", resume_in_seconds=3600)
             return None
 
 
