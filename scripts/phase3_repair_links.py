@@ -104,10 +104,10 @@ def repair_body(body: str, redirect_map: dict[str, str | None]) -> tuple[str, in
         if (VAULT_PATH / rel_path).exists():
             continue
 
-        # File is gone — check redirect map
+        # File is gone — check redirect map for a canonical target
+        full_match = match.group(0)  # e.g. [[synthesis/foo-358]]
         if rel_path in redirect_map:
             target = redirect_map[rel_path]
-            full_match = match.group(0)  # e.g. [[synthesis/foo-358]]
             if target is not None:
                 # Rewrite to canonical (strip .md suffix for wikilink format)
                 new_link_target = target.removesuffix(".md")
@@ -118,6 +118,10 @@ def repair_body(body: str, redirect_map: dict[str, str | None]) -> tuple[str, in
                 # No canonical — remove the dead link entirely
                 result = result.replace(full_match, "")
                 removed += 1
+        else:
+            # File deleted without a redirect record — remove the dead link
+            result = result.replace(full_match, "")
+            removed += 1
 
     return result.strip(), rewritten, removed
 
