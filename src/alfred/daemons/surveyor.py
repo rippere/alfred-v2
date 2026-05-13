@@ -55,6 +55,26 @@ class SurveyorDaemon(BaseDaemon):
             await self.save_state()
             self.log.info("surveyor.stopped")
 
+    async def tick(self) -> None:
+        """One-shot poll — called by APScheduler every WATCH_INTERVAL seconds."""
+        try:
+            await self._tick()
+        except Exception as e:
+            self.log.error("surveyor.tick_error", error=str(e))
+
+    async def recluster(self) -> None:
+        """One-shot recluster — called by APScheduler on CLUSTER_INTERVAL."""
+        try:
+            await self._recluster()
+        except Exception as e:
+            self.log.error("surveyor.recluster_error", error=str(e))
+
+    async def teardown(self) -> None:
+        """Clean shutdown: flush embedder and save state."""
+        if self._embedder:
+            await self._embedder.close()
+        await self.save_state()
+
     async def _tick(self) -> None:
         diff = self._compute_diff()
         if diff["new"] or diff["changed"] or diff["deleted"]:
@@ -77,7 +97,11 @@ class SurveyorDaemon(BaseDaemon):
                 continue
             rel_str = str(rel).replace("\\", "/")
             try:
-                current[rel_str] = hashlib.md5(md_file.read_bytes()).hexdigest()
+                raw = md_file.read_bytes()
+                # Skip LLM-generated files — they must not feed back into the index
+                if b"generated_by: llm" in raw or b"generated_by: \"llm\"" in raw:
+                    continue
+                current[rel_str] = hashlib.md5(raw).hexdigest()
             except OSError:
                 continue
 

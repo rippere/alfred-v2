@@ -5,11 +5,13 @@ import asyncio
 import json
 import os
 import time
+import traceback
 from datetime import date, datetime, timezone
 
 import httpx
 import structlog
 
+from alfred.core.anthropic_client import get_client
 from alfred.core.vault_ops import vault_create, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
 
@@ -59,6 +61,13 @@ class ConsolidatorDaemon(BaseDaemon):
             await self.save_state()
             self.log.info("consolidator.stopped")
 
+    async def tick(self) -> None:
+        """One-shot consolidation — called by APScheduler every consolidator_min_interval_s."""
+        try:
+            await self._consolidate()
+        except Exception as e:
+            self.log.error("consolidator.tick_error", error=str(e))
+
     async def _consolidate(self) -> None:
         state = self.state.state
         vault_path = self.cfg.vault_path
@@ -82,8 +91,8 @@ class ConsolidatorDaemon(BaseDaemon):
                     cluster.label = [label]
                     cluster.last_labeled = datetime.now(timezone.utc).isoformat()
                     updated += 1
-            except Exception as e:
-                self.log.warning("consolidator.label_error", cluster=key, error=str(e))
+            except Exception:
+                self.log.warning("consolidator.label_error", cluster=key, error=traceback.format_exc())
 
         if updated:
             self.log.info("consolidator.labeled", clusters=updated)
@@ -178,6 +187,16 @@ class ConsolidatorDaemon(BaseDaemon):
         if not learn_entries:
             return
 
+        # Guard: if every source is daemon-generated content, skip synthesis.
+        # Synthesizing LLM output produces compounding noise, not knowledge.
+        daemon_prefixes = ("topic/", "synthesis/", "learn/")
+        human_sources = [p for p, _, _ in learn_entries
+                         if not any(p.startswith(pfx) for pfx in daemon_prefixes)]
+        if not human_sources:
+            self.log.info("consolidator.skip_all_daemon_sources",
+                          cluster=cluster.label, entries=len(learn_entries))
+            return
+
         label = cluster.label[0] if cluster.label else "cluster"
         synthesis_body = await self._call_synthesis_llm(label, learn_entries)
         if not synthesis_body:
@@ -202,7 +221,7 @@ class ConsolidatorDaemon(BaseDaemon):
                 vault_edit(
                     vault_path,
                     synthesis_rel,
-                    set_fields={"status": "active", "cluster_sources": merged_sources},
+                    set_fields={"status": "active", "cluster_sources": merged_sources, "generated_by": "llm"},
                     body_replace=merged_body,
                 )
             except Exception as e:
@@ -219,6 +238,7 @@ class ConsolidatorDaemon(BaseDaemon):
                     "cluster_sources": source_links,
                     "confidence": "medium",
                     "created": date.today().isoformat(),
+                    "generated_by": "llm",
                 },
                 body=full_body,
             )
@@ -252,18 +272,24 @@ class ConsolidatorDaemon(BaseDaemon):
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if anthropic_key:
             try:
-                import anthropic
+                client = get_client()
 
                 def _call():
-                    client = anthropic.Anthropic(api_key=anthropic_key)
                     resp = client.messages.create(
                         model=self.cfg.anthropic_model,
                         max_tokens=600,
                         messages=[{"role": "user", "content": prompt}],
                     )
-                    return resp.content[0].text.strip()
+                    return resp
 
-                return await asyncio.to_thread(_call)
+                resp = await asyncio.to_thread(_call)
+                usage = resp.usage
+                self.state.record_api_call(
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cached_tokens=getattr(usage, "cache_read_input_tokens", 0),
+                )
+                return resp.content[0].text.strip()
             except Exception as e:
                 self.log.warning("consolidator.claude_error", error=str(e))
 
@@ -331,6 +357,7 @@ class ConsolidatorDaemon(BaseDaemon):
         file_list = "\n".join(lines)
         prompt = _LABEL_PROMPT.format(file_list=file_list)
 
+        # ── Primary: Ollama ───────────────────────────────────────────────────
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(
@@ -343,12 +370,56 @@ class ConsolidatorDaemon(BaseDaemon):
                 )
                 resp.raise_for_status()
                 raw = resp.json().get("response", "").strip()
-        except Exception as e:
-            self.log.warning("consolidator.ollama_error", error=str(e))
-            return ""
 
-        # Parse LABEL: line
-        for line in raw.splitlines():
-            if line.upper().startswith("LABEL:"):
-                return line.split(":", 1)[-1].strip()
-        return raw[:50].strip()
+            # Parse LABEL: line
+            for line in raw.splitlines():
+                if line.upper().startswith("LABEL:"):
+                    return line.split(":", 1)[-1].strip()
+            if raw:
+                return raw[:50].strip()
+        except Exception:
+            self.log.warning(
+                "consolidator.ollama_error",
+                error=traceback.format_exc(),
+            )
+
+        # ── Fallback 1: Anthropic ─────────────────────────────────────────────
+        try:
+            from alfred.core.anthropic_client import get_client
+
+            client = get_client()
+            file_list_short = "\n".join(f"- {f}" for f in member_files[:10])
+            fallback_prompt = (
+                f"These files are in the same knowledge cluster:\n{file_list_short}\n\n"
+                "Give a 2-4 word descriptive label for this cluster. "
+                "Return only the label, no explanation."
+            )
+
+            def _call():
+                response = client.messages.create(
+                    model=self.cfg.anthropic_model,
+                    max_tokens=20,
+                    messages=[{"role": "user", "content": fallback_prompt}],
+                )
+                return response.content[0].text.strip()
+
+            label = await asyncio.to_thread(_call)
+            if label:
+                return label
+        except Exception:
+            self.log.warning(
+                "consolidator.anthropic_label_error",
+                error=traceback.format_exc(),
+            )
+
+        # ── Fallback 2: deterministic from file names ─────────────────────────
+        from pathlib import Path
+        from collections import Counter
+
+        dirs = [Path(f).parent.name for f in member_files if Path(f).parent.name not in (".", "")]
+        if dirs:
+            most_common_dir = Counter(dirs).most_common(1)[0][0]
+            return most_common_dir
+
+        stems = [Path(f).stem for f in member_files[:2]]
+        return "/".join(stems) if stems else "unlabeled"

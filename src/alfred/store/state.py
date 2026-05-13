@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from dataclasses import asdict
+from datetime import date
 from pathlib import Path
 
 from alfred.core.models import (
@@ -12,6 +15,13 @@ from alfred.core.models import (
     WikiPage,
 )
 
+_log = logging.getLogger(__name__)
+
+# Anthropic claude-sonnet-4-6 pricing (USD per token)
+_PRICE_INPUT = 3.00 / 1_000_000
+_PRICE_CACHE_READ = 0.30 / 1_000_000
+_PRICE_OUTPUT = 15.00 / 1_000_000
+
 
 def _decode_state(raw: dict) -> PipelineState:
     state = PipelineState(
@@ -20,6 +30,9 @@ def _decode_state(raw: dict) -> PipelineState:
         curator_processed=raw.get("curator_processed", {}),
         distiller_runs=raw.get("distiller_runs", []),
         janitor_sweeps=raw.get("janitor_sweeps", []),
+        api_calls_today=raw.get("api_calls_today", 0),
+        api_calls_date=raw.get("api_calls_date", ""),
+        api_cost_usd_today=raw.get("api_cost_usd_today", 0.0),
     )
     for rel_path, f in raw.get("files", {}).items():
         state.files[rel_path] = FileState(**{
@@ -45,9 +58,14 @@ def _decode_state(raw: dict) -> PipelineState:
 
 
 class StateStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, cfg=None) -> None:
         self.path = path
+        self._cfg = cfg  # optional AlfredConfig for api_warn_at_calls
         self._state: PipelineState = PipelineState()
+        # Guards concurrent writes from multiple scheduler jobs running in the
+        # same event loop.  Acquire before any bulk mutation of state.files or
+        # state.clusters, and before every save().
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     def load(self) -> PipelineState:
         if self.path.exists():
@@ -58,7 +76,13 @@ class StateStore:
         return self._state
 
     def save(self) -> None:
+        """Synchronous save — caller must hold self._lock when called from async context."""
         self.path.write_text(json.dumps(asdict(self._state), indent=2))
+
+    async def async_save(self) -> None:
+        """Async-safe save — acquires the state lock before writing."""
+        async with self._lock:
+            self.save()
 
     @property
     def state(self) -> PipelineState:
@@ -79,3 +103,45 @@ class StateStore:
 
     def chunk_count(self) -> int:
         return sum(len(f.chunk_ids) for f in self._state.files.values())
+
+    def record_api_call(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cached_tokens: int = 0,
+    ) -> None:
+        """Record a single Anthropic API call and accumulate cost estimate.
+
+        Resets the daily counters if the stored date differs from today.
+        Logs a warning if the call count hits api_warn_at_calls.
+
+        Args:
+            input_tokens: Non-cached input tokens consumed.
+            output_tokens: Output tokens generated.
+            cached_tokens: Cache-read input tokens (charged at reduced rate).
+        """
+        today = date.today().isoformat()
+        state = self._state
+
+        # Reset daily counters on date rollover
+        if state.api_calls_date != today:
+            state.api_calls_today = 0
+            state.api_cost_usd_today = 0.0
+            state.api_calls_date = today
+
+        state.api_calls_today += 1
+        state.api_cost_usd_today += (
+            input_tokens * _PRICE_INPUT
+            + cached_tokens * _PRICE_CACHE_READ
+            + output_tokens * _PRICE_OUTPUT
+        )
+
+        warn_threshold = (
+            self._cfg.api_warn_at_calls if self._cfg is not None else 400
+        )
+        if state.api_calls_today >= warn_threshold:
+            _log.warning(
+                "alfred.api_budget_warning",
+                calls_today=state.api_calls_today,
+                cost_usd=round(state.api_cost_usd_today, 4),
+            )

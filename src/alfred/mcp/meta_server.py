@@ -197,7 +197,7 @@ def run_meta_server(meta_config_path: Path) -> None:
     mcp = fastmcp.FastMCP("alfred-meta")
 
     @mcp.tool()
-    def vault_query(
+    async def vault_query(
         query: str,
         top_k: int = 8,
         synthesis: bool = False,
@@ -212,9 +212,7 @@ def run_meta_server(meta_config_path: Path) -> None:
             top_k: Total number of results to return across all vaults (default 8)
             synthesis: Include LLM synthesis of results (default False — expensive)
         """
-        all_hits = asyncio.run(
-            _parallel_query(engines, query, top_k_per_vault, synthesis)
-        )
+        all_hits = await _parallel_query(engines, query, top_k_per_vault, synthesis)
         ranked = _rerank_combined(all_hits, query, top_k or final_top_k)
         return {
             "hits": ranked,
@@ -223,7 +221,7 @@ def run_meta_server(meta_config_path: Path) -> None:
         }
 
     @mcp.tool()
-    def vault_search(
+    async def vault_search(
         query: str | None = None,
         record_type: str | None = None,
         status: str | None = None,
@@ -239,10 +237,7 @@ def run_meta_server(meta_config_path: Path) -> None:
             status: Optional status filter (e.g. 'active', 'done')
             limit: Max results per vault (default 20)
         """
-        results = asyncio.run(
-            _parallel_search(vault_cfgs, query, record_type, status, limit)
-        )
-        return results
+        return await _parallel_search(vault_cfgs, query, record_type, status, limit)
 
     @mcp.tool()
     def vault_entity_lookup(entity_name: str) -> list[dict[str, Any]]:

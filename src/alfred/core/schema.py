@@ -6,6 +6,8 @@ KNOWN_TYPES: set[str] = {
     "location", "note", "decision", "process", "run", "event",
     "account", "asset", "conversation", "assumption", "constraint",
     "contradiction", "synthesis", "wiki", "topic",
+    # Content creation types
+    "idea", "script", "hook",
     # Legacy — recognised for read-path compat but no longer written as directories
     "learn", "ai-dialogue",
 }
@@ -37,6 +39,9 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     "synthesis": {"draft", "active", "superseded"},
     "learn": {"active", "absorbed", "superseded"},
     "topic": {"active", "archived"},
+    "idea": {"raw", "researched", "scripted", "published", "shelved"},
+    "script": {"draft", "review", "final", "published"},
+    "hook": {"active", "retired"},
 }
 
 TYPE_DIRECTORY: dict[str, str] = {
@@ -45,6 +50,8 @@ TYPE_DIRECTORY: dict[str, str] = {
     "process": "process", "run": "run", "event": "event", "account": "account",
     "asset": "asset", "synthesis": "synthesis",
     "wiki": "wiki", "topic": "topic",
+    # Content creation types
+    "idea": "ideas", "script": "drafts", "hook": "hooks",
     # Session types — all go to session/
     "session": "session", "conversation": "session", "ai-dialogue": "session",
     # Epistemic types — consolidated into topic/ (subtype tracked via tags)

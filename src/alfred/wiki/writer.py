@@ -110,8 +110,8 @@ class WikiWriter:
         )
 
         try:
-            import anthropic
-            client = anthropic.Anthropic()
+            from alfred.core.anthropic_client import get_client
+            client = get_client()
             resp = client.messages.create(
                 model=self.cfg.anthropic_model,
                 max_tokens=512,

@@ -218,6 +218,7 @@ def vault_append_to_topic(
         if source and source not in existing_sources:
             existing_sources.append(source)
         fm["sources"] = existing_sources
+        fm["generated_by"] = "llm"
         body = body.rstrip() + "\n\n---\n\n" + section + "\n"
         fp.write_text(_serialize(fm, body), encoding="utf-8")
     else:
@@ -229,6 +230,7 @@ def vault_append_to_topic(
             "sources": [source] if source else [],
             "created": date.today().isoformat(),
             "status": "active",
+            "generated_by": "llm",
         }
         body = f"# {topic_slug}\n\n{section}\n"
         fp.write_text(_serialize(fm, body), encoding="utf-8")

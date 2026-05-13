@@ -141,6 +141,78 @@ def run_server(config_path: Path) -> None:
             "wiki_pages": state_store.wiki_page_count(),
         }
 
+    @mcp.tool()
+    def vault_api_cost() -> dict[str, Any]:
+        """Return today's Anthropic API call count and estimated cost.
+
+        Reads the daily counters persisted in state.json. Cost is estimated
+        using claude-sonnet-4-6 pricing: $3.00/M input, $0.30/M cached input,
+        $15.00/M output tokens.
+        """
+        state_store.load()
+        state = state_store.state
+        return {
+            "date": state.api_calls_date or "no calls recorded",
+            "calls_today": state.api_calls_today,
+            "cost_usd_today": round(state.api_cost_usd_today, 6),
+        }
+
+    @mcp.tool()
+    def vault_feedback(path: str, signal: int, query: str = "") -> dict[str, Any]:
+        """Record user feedback on a retrieved vault record.
+
+        signal: 1 = helpful/relevant, -1 = not helpful/irrelevant.
+        Updates the memory strength for the record so future queries
+        surface (or suppress) it accordingly.
+        path: relative vault path as returned by vault_query (e.g. 'sessions/my-note.md')
+        query: optional — the query that surfaced this result (for audit log)
+        """
+        import json
+        import math
+        from datetime import datetime, timezone
+        from alfred.core.models import MemoryStrength
+
+        if signal not in (1, -1):
+            return {"error": "signal must be 1 (helpful) or -1 (not helpful)"}
+
+        state_store.load()
+        state = state_store.state
+
+        ms = state.memory.get(path)
+        if ms is None:
+            ms = MemoryStrength(rel_path=path)
+            state.memory[path] = ms
+
+        if signal == 1:
+            ms.update()
+        else:
+            ms.stability = max(0.1, ms.stability - 0.5)
+
+        state_store.save()
+
+        # Append to feedback log
+        try:
+            log_path = cfg.data_dir / "query_log.jsonl"
+            entry = {
+                "type": "feedback",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "path": path,
+                "signal": signal,
+                "query": query,
+                "stability_after": round(ms.stability, 3),
+            }
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+
+        return {
+            "path": path,
+            "signal": signal,
+            "stability": round(ms.stability, 3),
+            "access_count": ms.access_count,
+        }
+
     mcp.run(transport="stdio")
 
 

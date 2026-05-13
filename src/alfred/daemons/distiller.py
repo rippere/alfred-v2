@@ -11,6 +11,7 @@ from pathlib import Path
 import frontmatter
 import structlog
 
+from alfred.core.anthropic_client import get_client
 from alfred.core.vault_ops import VaultError, vault_append_to_topic, vault_read
 from alfred.daemons.base import BaseDaemon
 
@@ -85,15 +86,9 @@ _TAG_CANONICAL: dict[str, str] = {
 }
 
 
-_EXTRACT_PROMPT = """\
-You are a personal knowledge distiller. Read the following vault record and extract the most \
-reusable, transferable insights or lessons from it — things worth remembering and reviewing later.
-
-Record type: {rec_type}
-File: {rel_path}
-Frontmatter: {fm_summary}
-Body:
-{body}
+_EXTRACT_SYSTEM = """\
+You are a personal knowledge distiller. Read vault records and extract the most \
+reusable, transferable insights or lessons — things worth remembering and reviewing later.
 
 Output a JSON array of learning objects (max 3). Each object must have:
   "title": short descriptive slug (3-6 words, lowercase, hyphens)
@@ -105,6 +100,13 @@ output an empty JSON array: []
 
 Respond with only the JSON array. No prose."""
 
+_EXTRACT_USER_TEMPLATE = """\
+Record type: {rec_type}
+File: {rel_path}
+Frontmatter: {fm_summary}
+Body:
+{body}"""
+
 
 class DistillerDaemon(BaseDaemon):
     name = "distiller"
@@ -114,10 +116,14 @@ class DistillerDaemon(BaseDaemon):
         self._last_run = 0.0  # epoch 0 ensures first run fires immediately
 
     async def run(self) -> None:
-        self.log.info("distiller.start")
+        self.log.info("distiller.start", mode=getattr(self.cfg, "distiller_mode", "scheduled"))
         try:
             while not self._stop.is_set():
-                now = time.time()  # wall-clock time so 0.0 sentinel triggers first run
+                # on_demand mode: never auto-run; wait for explicit trigger via trigger_sweep()
+                if getattr(self.cfg, "distiller_mode", "scheduled") == "on_demand":
+                    await asyncio.sleep(60.0)
+                    continue
+                now = time.time()
                 if now - self._last_run > DISTILL_INTERVAL:
                     await self._distill_sweep()
                     self._last_run = now
@@ -125,6 +131,18 @@ class DistillerDaemon(BaseDaemon):
         finally:
             await self.save_state()
             self.log.info("distiller.stopped")
+
+    async def trigger_sweep(self) -> None:
+        """Manually trigger a distill sweep regardless of mode."""
+        await self._distill_sweep()
+        self._last_run = time.time()
+
+    async def tick(self) -> None:
+        """One-shot distill sweep — called by APScheduler (daily at 2am when scheduled)."""
+        try:
+            await self._distill_sweep()
+        except Exception as e:
+            self.log.error("distiller.tick_error", error=str(e))
 
     async def _distill_sweep(self) -> None:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -139,8 +157,10 @@ class DistillerDaemon(BaseDaemon):
         learn_count = 0
 
         for rel_path, fs in list(state.files.items()):
-            if rel_path.startswith(("learn/", "topic/")):
-                continue  # distiller output — never re-distill
+            if rel_path.startswith(("learn/", "topic/", "synthesis/")):
+                continue  # daemon output — never re-distill
+            if fs.__dict__.get("generated_by") == "llm":
+                continue  # skip any file explicitly marked as LLM-generated
             if _is_stale(fs.last_distilled):
                 try:
                     created = await self._distill_file(vault_path, rel_path)
@@ -177,8 +197,10 @@ class DistillerDaemon(BaseDaemon):
 
         if not body or len(body.strip()) < MIN_BODY_LEN:
             return 0
-        if rec_type in ("learn",):
-            return 0  # don't distill learn records from other learn records
+        if rec_type in ("learn", "topic", "synthesis"):
+            return 0  # daemon output — never re-distill
+        if fm.get("generated_by") == "llm":
+            return 0  # LLM-generated content must not feed back into distillation
 
         from datetime import date as _date, datetime as _datetime
 
@@ -193,26 +215,36 @@ class DistillerDaemon(BaseDaemon):
             indent=2,
             cls=_DateEncoder,
         )
-        prompt = _EXTRACT_PROMPT.format(
+        user_text = _EXTRACT_USER_TEMPLATE.format(
             rec_type=rec_type or "unknown",
             rel_path=rel_path,
             fm_summary=fm_summary[:500],
             body=body[:2000],
         )
 
-        import asyncio
-        import anthropic
-        client = anthropic.Anthropic()
+        client = get_client()
 
         def _call():
             resp = client.messages.create(
                 model=self.cfg.anthropic_model,
                 max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
+                system=[{
+                    "type": "text",
+                    "text": _EXTRACT_SYSTEM,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{"role": "user", "content": user_text}],
             )
-            return resp.content[0].text.strip()
+            return resp
 
-        raw = await asyncio.to_thread(_call)
+        resp = await asyncio.to_thread(_call)
+        usage = resp.usage
+        self.state.record_api_call(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cached_tokens=getattr(usage, "cache_read_input_tokens", 0),
+        )
+        raw = resp.content[0].text.strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 

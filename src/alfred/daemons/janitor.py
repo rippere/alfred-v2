@@ -20,6 +20,7 @@ from pathlib import Path
 import frontmatter
 import structlog
 
+from alfred.core.anthropic_client import get_client
 from alfred.core.schema import (
     KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
@@ -70,13 +71,37 @@ class JanitorDaemon(BaseDaemon):
                 if now - self._last_deep > deep_interval:
                     await self._deep_sweep()
                     self._last_deep = now
-                if now - self._last_dedup > DEDUP_INTERVAL:
+                dedup_enabled = getattr(self.cfg, "janitor_dedup_enabled", False)
+                if dedup_enabled and now - self._last_dedup > DEDUP_INTERVAL:
                     await self._dedup_sweep()
                     self._last_dedup = now
                 await asyncio.sleep(60.0)
         finally:
             await self.save_state()
             self.log.info("janitor.stopped")
+
+    async def structural_tick(self) -> None:
+        """One-shot structural sweep — called by APScheduler on sweep_interval."""
+        try:
+            await self._structural_sweep()
+        except Exception as e:
+            self.log.error("janitor.structural_tick_error", error=str(e))
+
+    async def deep_tick(self) -> None:
+        """One-shot LLM enrichment sweep — called by APScheduler on deep_interval."""
+        try:
+            await self._deep_sweep()
+        except Exception as e:
+            self.log.error("janitor.deep_tick_error", error=str(e))
+
+    async def dedup_tick(self) -> None:
+        """One-shot dedup sweep — called by APScheduler weekly if enabled."""
+        if not getattr(self.cfg, "janitor_dedup_enabled", False):
+            return
+        try:
+            await self._dedup_sweep()
+        except Exception as e:
+            self.log.error("janitor.dedup_tick_error", error=str(e))
 
     # ── Stage 1: structural scan ───────────────────────────────────────────────
 
@@ -350,9 +375,7 @@ class JanitorDaemon(BaseDaemon):
         if len(prompt_bytes) > self.cfg.janitor_max_bytes_per_call:
             prompt = prompt[:self.cfg.janitor_max_bytes_per_call].decode("utf-8", errors="replace")
 
-        import asyncio
-        import anthropic
-        client = anthropic.Anthropic()
+        client = get_client()
 
         def _call():
             resp = client.messages.create(
@@ -360,9 +383,10 @@ class JanitorDaemon(BaseDaemon):
                 max_tokens=512,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return resp.content[0].text.strip()
+            return resp
 
-        new_body = await asyncio.to_thread(_call)
+        resp = await asyncio.to_thread(_call)
+        new_body = resp.content[0].text.strip()
         if new_body and len(new_body) > 20:
             vault_edit(vault_path, rel_path, body_replace=new_body)
             self.log.info("janitor.enriched_file", path=rel_path, chars=len(new_body))
@@ -491,12 +515,8 @@ class JanitorDaemon(BaseDaemon):
                     except Exception as e:
                         self.log.warning("janitor.dedup_delete_error", path=dupe.name, error=str(e))
 
-        # Update last_dedup timestamp on state
-        now_iso = datetime.now(timezone.utc).isoformat()
-        try:
-            state.last_dedup = now_iso
-        except Exception:
-            pass  # state model may not have this attr yet — harmless
+        # Update last_dedup timestamp on state (field now declared in PipelineState)
+        state.last_dedup = datetime.now(timezone.utc).isoformat()
 
         # Write dedup report to inbox
         report_path = vault_path / "inbox" / f"dedup-report-{date.today().isoformat()}.md"

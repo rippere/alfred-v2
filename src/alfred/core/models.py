@@ -81,3 +81,7 @@ class PipelineState:
     curator_processed: dict[str, str] = field(default_factory=dict)
     distiller_runs: list[dict[str, Any]] = field(default_factory=list)
     janitor_sweeps: list[dict[str, Any]] = field(default_factory=list)
+    last_dedup: str = ""
+    api_calls_today: int = 0
+    api_calls_date: str = ""
+    api_cost_usd_today: float = 0.0

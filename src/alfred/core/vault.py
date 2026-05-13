@@ -73,8 +73,41 @@ def _safe_chunk_id(rel_path: str, idx: int) -> str:
     return f"{safe}::chunk_{idx:02d}"
 
 
+def _split_by_headers(body: str, max_size: int) -> list[str]:
+    """Split a Markdown body on header boundaries, then sub-split oversized sections."""
+    header_re = re.compile(r"^#{1,3} ", re.MULTILINE)
+    # Find all header positions
+    positions = [m.start() for m in header_re.finditer(body)]
+    if not positions:
+        positions = []
+
+    # Build sections: text before first header + each header+body block
+    sections: list[str] = []
+    boundaries = positions + [len(body)]
+    prev = 0
+    for pos in boundaries[:-1] if positions else []:
+        if pos > prev:
+            sections.append(body[prev:pos].strip())
+        prev = pos
+    sections.append(body[prev:].strip())
+    sections = [s for s in sections if s]
+
+    # Sub-split any section that exceeds max_size
+    result: list[str] = []
+    for section in sections:
+        if len(section) <= max_size:
+            result.append(section)
+        else:
+            step = max(max_size - CHUNK_OVERLAP, 1)
+            start = 0
+            while start < len(section):
+                result.append(section[start:start + max_size])
+                start += step
+    return result or [body[:max_size]]
+
+
 def chunk_record(record: VaultRecord) -> list[tuple[str, str]]:
-    """Return (chunk_id, text) pairs. chunk_id format: rel_path::chunk_NN."""
+    """Return (chunk_id, text) pairs using header-aware Markdown chunking."""
     fm_parts: list[str] = []
     for key in EMBEDDING_FM_KEYS:
         val = record.frontmatter.get(key)
@@ -93,12 +126,9 @@ def chunk_record(record: VaultRecord) -> list[tuple[str, str]]:
         text = (fm_prefix + "\n" + body).strip()
         return [(_safe_chunk_id(record.rel_path, 0), text)]
 
+    sections = _split_by_headers(body, body_budget)
     chunks: list[tuple[str, str]] = []
-    step = max(body_budget - CHUNK_OVERLAP, 1)
-    start, idx = 0, 0
-    while start < len(body):
-        text = (fm_prefix + "\n" + body[start:start + body_budget]).strip()
+    for idx, section in enumerate(sections):
+        text = (fm_prefix + "\n" + section).strip()
         chunks.append((_safe_chunk_id(record.rel_path, idx), text))
-        start += step
-        idx += 1
     return chunks

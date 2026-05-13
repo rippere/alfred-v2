@@ -44,11 +44,22 @@ class AlfredConfig:
     janitor_sweep_interval_s: int = 3600
     janitor_deep_interval_h: int = 24
     janitor_max_bytes_per_call: int = 8000
+    janitor_dedup_enabled: bool = False
+
+    # Distiller
+    distiller_mode: str = "on_demand"   # "scheduled" | "on_demand"
+
+    # API budget
+    api_max_calls_per_day: int = 500
+    api_warn_at_calls: int = 400
 
     # Surveyor
     hdbscan_min_cluster_size: int = 2
     hdbscan_min_samples: int = 1
     leiden_resolution: float = 1.0
+
+    # Vector store backend: "lancedb" (default, no file-lock) or "milvus" (legacy)
+    vector_store: str = "lancedb"
 
     # Query
     default_top_k: int = 8
@@ -72,6 +83,11 @@ class AlfredConfig:
     @property
     def milvus_uri(self) -> str:
         return str(self.data_dir / "milvus.db")
+
+    @property
+    def lancedb_uri(self) -> str:
+        """Directory used by LanceDB (no file-lock contention)."""
+        return str(self.data_dir / "lancedb")
 
     @property
     def state_path(self) -> Path:
@@ -118,6 +134,10 @@ class AlfredConfig:
             cfg.hdbscan_min_samples = s.get("hdbscan_min_samples", cfg.hdbscan_min_samples)
             cfg.embed_dims = s.get("embed_dims", cfg.embed_dims)
 
+        # Vector store backend
+        if vs := raw.get("vector_store"):
+            cfg.vector_store = vs if isinstance(vs, str) else vs.get("backend", cfg.vector_store)
+
         # Query
         if q := raw.get("query"):
             cfg.default_top_k = q.get("top_k", cfg.default_top_k)
@@ -128,6 +148,16 @@ class AlfredConfig:
         if j := raw.get("janitor"):
             cfg.janitor_sweep_interval_s = j.get("sweep_interval_s", cfg.janitor_sweep_interval_s)
             cfg.janitor_max_bytes_per_call = j.get("max_bytes_per_call", cfg.janitor_max_bytes_per_call)
+            cfg.janitor_dedup_enabled = j.get("dedup_enabled", cfg.janitor_dedup_enabled)
+
+        # Distiller mode
+        if d := raw.get("distiller"):
+            cfg.distiller_mode = d.get("mode", cfg.distiller_mode)
+
+        # API budget
+        if b := raw.get("api_budget"):
+            cfg.api_max_calls_per_day = b.get("max_calls_per_day", cfg.api_max_calls_per_day)
+            cfg.api_warn_at_calls = b.get("warn_at_calls", cfg.api_warn_at_calls)
 
         # Synthesis models
         if syn := raw.get("synthesis"):

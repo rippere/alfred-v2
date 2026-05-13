@@ -1,9 +1,12 @@
 """QueryEngine — full hybrid retrieval pipeline."""
 from __future__ import annotations
 
+import json
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,7 +15,7 @@ import structlog
 from alfred.config import AlfredConfig
 from alfred.query.context import SourceRef, assemble, chunk_preview
 from alfred.query.wiki import WikiFastPath, WikiHit
-from alfred.store.milvus import MilvusStore, SearchHit
+from alfred.store.milvus import SearchHit
 
 if TYPE_CHECKING:
     pass
@@ -41,12 +44,13 @@ class QueryResult:
     synthesis_backend: str = ""
     synthesis_model: str = ""
     elapsed: dict[str, float] = field(default_factory=dict)
+    query_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
 class QueryEngine:
     def __init__(self, cfg: AlfredConfig) -> None:
         self.cfg = cfg
-        self._milvus: MilvusStore | None = None
+        self._store = None  # LanceDBStore or MilvusStore depending on cfg.vector_store
         self._bm25 = None
         self._embedder = None
         self._reranker_loaded = False
@@ -55,14 +59,24 @@ class QueryEngine:
         self._wiki = WikiFastPath(cfg.vault_path, cfg.wiki_dir)
         self._state_store = None
 
-    def _get_milvus(self) -> MilvusStore:
-        if self._milvus is None:
-            self._milvus = MilvusStore(
-                uri=self.cfg.milvus_uri,
-                embed_dims=self.cfg.embed_dims,
-                collection=self.cfg.milvus_collection,
-            )
-        return self._milvus
+    def _get_milvus(self):
+        """Return the active vector store (LanceDB or Milvus) — named _get_milvus for back-compat."""
+        if self._store is None:
+            if self.cfg.vector_store == "lancedb":
+                from alfred.store.lancedb_store import LanceDBStore
+                self._store = LanceDBStore(
+                    uri=self.cfg.lancedb_uri,
+                    collection=self.cfg.milvus_collection,
+                    dims=self.cfg.embed_dims,
+                )
+            else:
+                from alfred.store.milvus import MilvusStore
+                self._store = MilvusStore(
+                    uri=self.cfg.milvus_uri,
+                    embed_dims=self.cfg.embed_dims,
+                    collection=self.cfg.milvus_collection,
+                )
+        return self._store
 
     def _get_bm25(self):
         if self._bm25 is None:
@@ -138,21 +152,24 @@ class QueryEngine:
             hits = self._spread_activate(hits, opts.top_k)
             t["graph"] = time.perf_counter() - t0
 
-        # ── Step 6: Ebbinghaus score adjustment (optional) ───────────────────
-        if opts.use_ebbinghaus:
-            t0 = time.perf_counter()
-            state_store = self._get_state()
-            from alfred.query.memory import adjust_scores, record_access
-            adjust_scores(hits, state_store.state)
-            t["ebbinghaus"] = time.perf_counter() - t0
-
-        # ── Step 7: FlashRank reranking ───────────────────────────────────────
+        # ── Step 6: FlashRank reranking ───────────────────────────────────────
         t0 = time.perf_counter()
         from alfred.query.context import _chunk_text
         texts = {h.chunk_id: (_chunk_text(self.cfg.vault_path, h.chunk_id) or "") for h in hits}
         from alfred.embed.reranker import rerank
         hits = rerank(text, hits, texts, top_n=opts.top_k)
         t["rerank"] = time.perf_counter() - t0
+
+        # ── Step 7: Ebbinghaus late-stage reranking (optional) ────────────────
+        # Applied AFTER FlashRank so recency signal only adjusts final ordering
+        # among semantically relevant results, not the retrieval pool itself.
+        if opts.use_ebbinghaus:
+            t0 = time.perf_counter()
+            state_store = self._get_state()
+            from alfred.query.memory import adjust_scores
+            adjust_scores(hits, state_store.state)
+            hits.sort(key=lambda h: h.score, reverse=True)
+            t["ebbinghaus"] = time.perf_counter() - t0
 
         # ── Step 8: Context assembly ──────────────────────────────────────────
         t0 = time.perf_counter()
@@ -185,7 +202,7 @@ class QueryEngine:
             record_access(hits, state_store.state)
             state_store.save()
 
-        return QueryResult(
+        result = QueryResult(
             query=text,
             wiki_hit=wiki_hit,
             hits=hits,
@@ -196,6 +213,23 @@ class QueryEngine:
             synthesis_model=model,
             elapsed=t,
         )
+        self._log_query(result)
+        return result
+
+    def _log_query(self, result: QueryResult) -> None:
+        try:
+            log_path = self.cfg.data_dir / "query_log.jsonl"
+            entry = {
+                "query_id": result.query_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "query": result.query,
+                "top_paths": [h.rel_path for h in result.hits[:5]],
+                "synthesis_used": bool(result.answer),
+            }
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
 
     def _query_bm25_only(self, text: str, opts: QueryOptions) -> QueryResult:
         """Lightweight query path: BM25 corpus search only, no Milvus or Ollama.
@@ -289,19 +323,41 @@ class QueryEngine:
                     beta=self.cfg.hopfield_beta,
                 )
 
-            # Pass 1: get top-100 candidates with raw embeddings
-            candidates = self._get_milvus()._client.search(
-                collection_name=self.cfg.milvus_collection,
-                data=[dense_vec],
-                anns_field="embedding",
-                limit=min(100, self._get_milvus().count()),
-                search_params={"metric_type": "COSINE", "params": {}},
-                output_fields=["embedding"],
-            )
-            if not candidates or not candidates[0]:
+            store = self._get_milvus()
+            limit = min(100, store.count())
+            if limit == 0:
                 return dense_vec
 
-            raw_embs = np.array([r["entity"]["embedding"] for r in candidates[0]], dtype=np.float32)
+            # Retrieve top candidates with their raw embeddings.
+            # LanceDBStore exposes this via its search() + query_all() API;
+            # MilvusStore exposes it via the internal _client.search() call.
+            if self.cfg.vector_store == "lancedb":
+                from alfred.store.lancedb_store import LanceDBStore
+                assert isinstance(store, LanceDBStore)
+                rows = (
+                    store._tbl
+                    .search(dense_vec, vector_column_name="vector")
+                    .metric("cosine")
+                    .limit(limit)
+                    .select(["vector", "_distance"])
+                    .to_list()
+                )
+                if not rows:
+                    return dense_vec
+                raw_embs = np.array([r["vector"] for r in rows], dtype=np.float32)
+            else:
+                candidates = store._client.search(
+                    collection_name=self.cfg.milvus_collection,
+                    data=[dense_vec],
+                    anns_field="embedding",
+                    limit=limit,
+                    search_params={"metric_type": "COSINE", "params": {}},
+                    output_fields=["embedding"],
+                )
+                if not candidates or not candidates[0]:
+                    return dense_vec
+                raw_embs = np.array([r["entity"]["embedding"] for r in candidates[0]], dtype=np.float32)
+
             refined = self._hopfield.refine(np.array(dense_vec, dtype=np.float32), raw_embs)
             return refined.tolist()
         except Exception as e:
