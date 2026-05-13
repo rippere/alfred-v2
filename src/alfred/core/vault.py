@@ -67,6 +67,12 @@ def build_embedding_text(record: VaultRecord) -> str:
     return "\n".join(parts)
 
 
+def _safe_chunk_id(rel_path: str, idx: int) -> str:
+    """Build a Milvus-safe chunk_id. Strips characters that break Milvus's internal SQL parser."""
+    safe = rel_path.replace("'", "")
+    return f"{safe}::chunk_{idx:02d}"
+
+
 def chunk_record(record: VaultRecord) -> list[tuple[str, str]]:
     """Return (chunk_id, text) pairs. chunk_id format: rel_path::chunk_NN."""
     fm_parts: list[str] = []
@@ -81,18 +87,18 @@ def chunk_record(record: VaultRecord) -> list[tuple[str, str]]:
     body_budget = CHUNK_SIZE - fm_len
 
     if body_budget <= 0:
-        return [(f"{record.rel_path}::chunk_00", fm_prefix)]
+        return [(_safe_chunk_id(record.rel_path, 0), fm_prefix)]
 
     if len(body) <= body_budget:
         text = (fm_prefix + "\n" + body).strip()
-        return [(f"{record.rel_path}::chunk_00", text)]
+        return [(_safe_chunk_id(record.rel_path, 0), text)]
 
     chunks: list[tuple[str, str]] = []
     step = max(body_budget - CHUNK_OVERLAP, 1)
     start, idx = 0, 0
     while start < len(body):
         text = (fm_prefix + "\n" + body[start:start + body_budget]).strip()
-        chunks.append((f"{record.rel_path}::chunk_{idx:02d}", text))
+        chunks.append((_safe_chunk_id(record.rel_path, idx), text))
         start += step
         idx += 1
     return chunks
