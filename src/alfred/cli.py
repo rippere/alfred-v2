@@ -104,11 +104,18 @@ def up(
             pid_int = int(existing_pid)
             import os as _os
             _os.kill(pid_int, 0)  # raises if process is dead
-            # PIDs recycle after reboot — verify this is actually Alfred
+            # PIDs recycle after reboot — verify this is the correct Alfred instance.
+            # Checking just "alfred" in cmdline is insufficient: another vault's daemon
+            # (e.g. alfred-neuroscience) can get the same recycled PID and also contain
+            # "alfred", causing this vault to refuse to start. Match the config path too.
             _stale = False
             try:
-                cmdline = Path(f"/proc/{pid_int}/cmdline").read_bytes().replace(b"\x00", b" ").lower()
-                if b"alfred" not in cmdline:
+                cmdline = Path(f"/proc/{pid_int}/cmdline").read_bytes().replace(b"\x00", b" ")
+                config_bytes = str(config.resolve()).encode()
+                if b"alfred" not in cmdline.lower():
+                    _stale = True
+                elif config_bytes not in cmdline:
+                    # Different vault's Alfred instance has this PID
                     _stale = True
             except OSError:
                 pass  # /proc unavailable — assume Alfred is running
