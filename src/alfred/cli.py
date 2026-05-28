@@ -101,35 +101,40 @@ def up(
     if not no_pid_check and pid_path.exists():
         existing_pid = pid_path.read_text().strip()
         try:
-            pid_int = int(existing_pid)
+            _parts = existing_pid.split(":")
+            pid_int = int(_parts[0])
+            _expected_starttime = _parts[1] if len(_parts) > 1 else None
             import os as _os
-            _os.kill(pid_int, 0)  # raises if process is dead
-            # PIDs recycle after reboot — verify this is the correct Alfred instance.
-            # Checking just "alfred" in cmdline is insufficient: another vault's daemon
-            # (e.g. alfred-neuroscience) can get the same recycled PID and also contain
-            # "alfred", causing this vault to refuse to start. Match the config path too.
+            _os.kill(pid_int, 0)  # raises ProcessLookupError if process is dead
+            # Verify this is the same process that wrote the PID file, not a recycled PID.
+            # /proc/{pid}/stat field 22 (0-indexed 21) is the process start time in jiffies
+            # since boot — set at fork, never changes, and is unique per boot cycle.
+            # If it doesn't match what we recorded, a different process owns this PID now.
             _stale = False
             try:
-                cmdline = Path(f"/proc/{pid_int}/cmdline").read_bytes().replace(b"\x00", b" ")
-                config_bytes = str(config.resolve()).encode()
-                if b"alfred" not in cmdline.lower():
+                _stat_fields = Path(f"/proc/{pid_int}/stat").read_text().split()
+                _actual_starttime = _stat_fields[21]
+                if _expected_starttime and _actual_starttime != _expected_starttime:
                     _stale = True
-                elif config_bytes not in cmdline:
-                    # Different vault's Alfred instance has this PID
-                    _stale = True
+                elif not _expected_starttime:
+                    # Legacy PID file (no starttime) — fall back to cmdline heuristic
+                    cmdline = Path(f"/proc/{pid_int}/cmdline").read_bytes().replace(b"\x00", b" ")
+                    config_bytes = str(config.resolve()).encode()
+                    if b"alfred" not in cmdline.lower() or config_bytes not in cmdline:
+                        _stale = True
             except OSError:
-                pass  # /proc unavailable — assume Alfred is running
+                pass  # /proc unavailable — conservatively assume Alfred is running
             if _stale:
-                console.print(f"[dim]Removing stale PID file (PID {existing_pid} recycled to another process).[/dim]")
+                console.print(f"[dim]Removing stale PID file (PID {pid_int} start-time mismatch — recycled).[/dim]")
                 pid_path.unlink(missing_ok=True)
             else:
-                console.print(f"[yellow]Alfred already running (PID {existing_pid}). Use 'alfred down' first.[/yellow]")
+                console.print(f"[yellow]Alfred already running (PID {pid_int}). Use 'alfred down' first.[/yellow]")
                 raise typer.Exit(1)
         except ProcessLookupError:
-            console.print(f"[dim]Removing stale PID file (PID {existing_pid} is dead).[/dim]")
+            console.print(f"[dim]Removing stale PID file (PID {existing_pid.split(':')[0]} is dead).[/dim]")
             pid_path.unlink(missing_ok=True)
         except PermissionError:
-            console.print(f"[yellow]Alfred already running (PID {existing_pid}). Use 'alfred down' first.[/yellow]")
+            console.print(f"[yellow]Alfred already running (PID {existing_pid.split(':')[0]}). Use 'alfred down' first.[/yellow]")
             raise typer.Exit(1)
         except ValueError:
             pid_path.unlink(missing_ok=True)
@@ -155,10 +160,16 @@ def up(
         console.print(f"[dim]Logs: {log_path}[/dim]")
         return
 
-    # Write PID
+    # Write PID + process start time — start time is set at fork and never changes,
+    # making this file immune to PID recycling across reboots or rapid restarts.
     import os
-    pid_path.write_text(str(os.getpid()))
-    console.print(f"[green]Alfred starting...[/green] (PID {os.getpid()})")
+    _pid = os.getpid()
+    try:
+        _stat = Path(f"/proc/{_pid}/stat").read_text().split()
+        pid_path.write_text(f"{_pid}:{_stat[21]}")
+    except OSError:
+        pid_path.write_text(str(_pid))
+    console.print(f"[green]Alfred starting...[/green] (PID {_pid})")
 
     selected = set(only.split(",")) if only else None
 
@@ -186,7 +197,7 @@ def down(
 
     pid_str = pid_path.read_text().strip()
     try:
-        pid = int(pid_str)
+        pid = int(pid_str.split(":")[0])
         os.kill(pid, signal.SIGTERM)
         console.print(f"[green]Sent SIGTERM to Alfred (PID {pid})[/green]")
         pid_path.unlink(missing_ok=True)
