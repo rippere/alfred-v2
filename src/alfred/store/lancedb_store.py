@@ -9,6 +9,8 @@ Interface mirrors MilvusStore exactly so callers don't need to change.
 """
 from __future__ import annotations
 
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,30 @@ log = structlog.get_logger()
 
 # Re-export SearchHit from milvus so importers don't have to change.
 from alfred.store.milvus import SearchHit  # noqa: F401
+
+# Substrings that mark a *corrupt table* (interrupted-write damage: zero-byte
+# manifests, truncated fragments) as opposed to a transient/operational error
+# (permissions, disk full, schema mismatch).  We auto-quarantine only on these;
+# anything else re-raises so genuine faults stay loud.
+_CORRUPTION_MARKERS = (
+    "invalid range",
+    "lanceerror(io)",
+    "of size 0 bytes",
+    "corrupt",
+    "manifest",
+)
+
+# Circuit breaker: if we have to quarantine more than this many tables within a
+# rolling 24h window, the corruption cause is persistent (read-only FS, a Lance
+# bug, a hardware fault).  Silently recreating would shred the store and lose
+# data on every restart, so we re-raise instead and let the watchdog's tier-3
+# inbox alert page a human.
+_MAX_QUARANTINES_PER_DAY = 3
+
+
+def _looks_like_corruption(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _CORRUPTION_MARKERS)
 
 
 class LanceDBStore:
@@ -59,8 +85,21 @@ class LanceDBStore:
             pa.field("chunk_index",  pa.int32()),
         ])
 
+        # True if a corrupt table had to be quarantined + recreated empty during
+        # this open.  runner.py checks this to invalidate embed state and force
+        # a full re-embed (otherwise the surveyor sees no md5 diff and search
+        # stays permanently empty).
+        self.was_recreated = False
+
         if collection in self._db.table_names():
-            self._tbl = self._db.open_table(collection)
+            try:
+                self._tbl = self._db.open_table(collection)
+            except Exception as e:
+                # Only auto-heal genuine corruption; re-raise transient/op errors
+                # so they surface loudly instead of nuking a recoverable table.
+                if not _looks_like_corruption(e):
+                    raise
+                self._tbl = self._quarantine_and_recreate(collection, e)
         else:
             self._tbl = self._db.create_table(
                 collection,
@@ -68,6 +107,86 @@ class LanceDBStore:
                 mode="create",
             )
             log.info("lancedb.table_created", name=collection)
+
+    def _quarantine_and_recreate(self, collection: str, exc: Exception):
+        """Move a corrupt table aside (reversible) and recreate it empty.
+
+        Gated by a rolling-24h circuit breaker: a persistent corruption cause
+        would otherwise quarantine on every restart, shredding the store.  When
+        the breaker trips we re-raise so the service fails loudly for a human.
+        """
+        base = Path(self.uri)
+        cutoff = datetime.now().timestamp() - 24 * 3600
+        recent = [
+            p for p in base.glob(".quarantine-corrupt-*")
+            if p.is_dir() and p.stat().st_mtime >= cutoff
+        ]
+        if len(recent) >= _MAX_QUARANTINES_PER_DAY:
+            log.error(
+                "lancedb.quarantine_circuit_open",
+                name=collection,
+                recent_quarantines=len(recent),
+                error=str(exc),
+            )
+            raise exc
+
+        table_dir = base / f"{collection}.lance"
+        # Unique dest: a bare second-resolution stamp can collide (two
+        # corruptions in the same second), and shutil.move would then nest the
+        # table inside the existing dir and miscount the breaker.  Suffix until
+        # the path is free.
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = base / f".quarantine-corrupt-{stamp}"
+        n = 1
+        while dest.exists():
+            dest = base / f".quarantine-corrupt-{stamp}-{n}"
+            n += 1
+        if table_dir.exists():
+            shutil.move(str(table_dir), str(dest))
+            # shutil.move preserves the source's mtime (a Lance table dir keeps
+            # its creation time), so the circuit-breaker's 24h mtime window
+            # would never see freshly-quarantined dirs.  Stamp it to now so the
+            # breaker can actually count recent quarantines.
+            import os
+            os.utime(dest, None)
+        log.error(
+            "lancedb.table_quarantined",
+            name=collection,
+            quarantine=str(dest),
+            error=str(exc),
+        )
+        self._alert_corruption(collection, dest, exc)
+
+        # Reconnect so the table_names cache reflects the move, then recreate.
+        import lancedb
+        self._db = lancedb.connect(self.uri)
+        tbl = self._db.create_table(collection, schema=self._schema, mode="create")
+        self.was_recreated = True
+        log.info("lancedb.table_recreated", name=collection)
+        return tbl
+
+    def _alert_corruption(self, collection: str, dest: Path, exc: Exception) -> None:
+        """Best-effort inbox drop so an auto-healed corruption stays visible.
+
+        Without this, silent self-heal would hide a recurring data-loss bug.
+        """
+        try:
+            inbox = Path("/mnt/external/obsidian-vault/inbox")
+            if not inbox.is_dir():
+                return
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            note = inbox / f"alfred-lancedb-corruption-{stamp}.md"
+            note.write_text(
+                "# Alfred LanceDB table auto-quarantined\n\n"
+                f"- Table: `{collection}`\n"
+                f"- Quarantined to: `{dest}`\n"
+                f"- Error: `{exc}`\n"
+                "- Action: recreated empty; surveyor will re-embed the corpus.\n"
+                "- Follow up: interrupted-write cause (OOM / SIGKILL mid-commit).\n\n"
+                "<!-- alfred:source lancedb_quarantine -->\n"
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Write methods
@@ -103,6 +222,42 @@ class LanceDBStore:
             .when_matched_update_all()
             .when_not_matched_insert_all()
             .execute(row)
+        )
+
+    def upsert_many(self, rows: list[dict]) -> None:
+        """Batch upsert — ONE Lance commit for the whole batch.
+
+        The surveyor previously called :meth:`upsert` once per chunk, producing
+        one manifest version per chunk (~2,600 per full re-embed).  Each commit
+        is a fragile write window; if the process dies mid-commit Lance can be
+        left with a zero-byte manifest that crash-loops the next open.  Batching
+        per file cuts that churn ~50-100x and shrinks the corruption window
+        proportionally.
+
+        Each row dict needs: ``chunk_id``, ``dense``, ``record_type``, ``name``,
+        ``chunk_index``.  ``sparse`` is accepted and ignored (BM25Store owns it).
+        """
+        if not rows:
+            return
+        import pyarrow as pa
+
+        batch = pa.table({
+            "id":          [r["chunk_id"] for r in rows],
+            "vector":      pa.array(
+                [r["dense"] for r in rows],
+                type=pa.list_(pa.float32(), self.dims),
+            ),
+            "record_type": [r.get("record_type", "") for r in rows],
+            "name":        [r.get("name", "") for r in rows],
+            "chunk_index": pa.array(
+                [r.get("chunk_index", 0) for r in rows], type=pa.int32()
+            ),
+        })
+        (
+            self._tbl.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(batch)
         )
 
     def delete_file(self, rel_path: str, chunk_ids: list[str] | None = None) -> None:

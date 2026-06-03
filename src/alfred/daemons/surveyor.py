@@ -150,6 +150,7 @@ class SurveyorDaemon(BaseDaemon):
                     self.milvus.delete_file(rel_path, old_fs.chunk_ids)
 
             chunk_ids: list[str] = []
+            rows: list[dict] = []
             for chunk_id, text in chunks:
                 # Sanitize chunk_id to avoid Milvus apostrophe bug
                 safe_id = chunk_id.replace("'", "’")
@@ -157,18 +158,34 @@ class SurveyorDaemon(BaseDaemon):
                 if dense is None:
                     continue
                 sparse = bm25.encode(text) if bm25.is_fitted else {}
+                rows.append({
+                    "chunk_id": safe_id,
+                    "dense": dense,
+                    "sparse": sparse,
+                    "record_type": record.record_type,
+                    "name": record.frontmatter.get("name", rel_path),
+                    "chunk_index": len(chunk_ids),
+                })
+                chunk_ids.append(safe_id)
+            # One batched commit per file instead of one per chunk — collapses
+            # ~N manifest writes into a single Lance commit, shrinking the
+            # interrupted-write corruption window that crash-looped the daemon.
+            if rows:
                 try:
-                    self.milvus.upsert(
-                        chunk_id=safe_id,
-                        dense=dense,
-                        sparse=sparse,
-                        record_type=record.record_type,
-                        name=record.frontmatter.get("name", rel_path),
-                        chunk_index=len(chunk_ids),
-                    )
-                    chunk_ids.append(safe_id)
+                    self.milvus.upsert_many(rows)
                 except Exception as e:
-                    self.log.warning("surveyor.upsert_failed", chunk_id=safe_id, error=str(e))
+                    self.log.warning(
+                        "surveyor.upsert_failed",
+                        path=rel_path, count=len(rows), error=str(e),
+                    )
+                    # Leave state.files[rel_path] untouched so the old md5 is
+                    # preserved and the file is retried next tick.  Recording
+                    # md5=current here would mark it "done" with no chunks —
+                    # and for a changed file its old chunks are already gone
+                    # (deleted above), so it would silently drop from search.
+                    continue
+            # (rows empty → file has no embeddable content; fall through and
+            # record state so we don't retry an empty file forever.)
 
             now = datetime.now(timezone.utc).isoformat()
             state.files[rel_path] = FileState(

@@ -46,6 +46,16 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
             dims=cfg.embed_dims,
         )
         log.info("alfred.store", backend="lancedb")
+        if getattr(vector_store, "was_recreated", False):
+            # A corrupt table was quarantined and recreated empty.  The surveyor
+            # diffs vault md5s against state.files and would see no change —
+            # leaving search permanently empty.  Clear embed state so the next
+            # tick re-embeds the whole corpus into the fresh table.
+            cleared = len(state_store.state.files)
+            state_store.state.files.clear()
+            state_store.state.clusters.clear()
+            state_store.save()
+            log.warning("alfred.store_recreated_reembed", cleared_files=cleared)
     else:
         from alfred.store.milvus import MilvusStore
         vector_store = MilvusStore(

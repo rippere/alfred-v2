@@ -138,6 +138,27 @@ class MilvusStore:
         )
 
     @_auto_reconnect
+    def upsert_many(self, rows: list[dict]) -> None:
+        """Batch upsert — interface parity with LanceDBStore.upsert_many.
+
+        Each row dict needs: ``chunk_id``, ``dense``, ``sparse``,
+        ``record_type``, ``name``, ``chunk_index``.
+        """
+        if not rows:
+            return
+        self._client.upsert(
+            collection_name=self.collection,
+            data=[{
+                "id":               r["chunk_id"],
+                "embedding":        r["dense"],
+                "sparse_embedding": r.get("sparse", {}),
+                "record_type":      r.get("record_type", ""),
+                "name":             r.get("name", ""),
+                "chunk_index":      r.get("chunk_index", 0),
+            } for r in rows],
+        )
+
+    @_auto_reconnect
     def delete_file(self, rel_path: str, chunk_ids: list[str] | None = None) -> None:
         """Delete all chunks for a file. Uses known chunk_ids when available (fast path)."""
         if chunk_ids:
