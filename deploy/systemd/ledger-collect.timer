@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Alfred life-ledger snapshot daily at 23:45 (local)
+Documentation=file:///home/rippere/alfred-v2/deploy/systemd/INSTALL.md
+
+[Timer]
+# 23:45 local time, every day. Persistent=true runs a missed snapshot on the
+# next boot (e.g. if the machine was asleep at 23:45).
+OnCalendar=*-*-* 23:45:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

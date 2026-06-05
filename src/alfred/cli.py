@@ -296,3 +296,8 @@ def mcp(
     """Start the MCP stdio server (for Claude Code integration)."""
     from alfred.mcp.server import run_server
     run_server(config)
+
+
+# Daily life-ledger KPI snapshots: `alfred ledger collect|backfill|show`.
+from alfred.ledger.cli import ledger_app  # noqa: E402
+app.add_typer(ledger_app, name="ledger")
