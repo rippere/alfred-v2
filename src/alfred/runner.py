@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import anyio
 import structlog
@@ -117,12 +117,33 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
     if getattr(cfg, "janitor_dedup_enabled", False):
         _add("janitor", janitor.dedup_tick, "interval", weeks=1)
 
-    # ── Distiller: every 24h from daemon start (not fixed clock time) ────────────
-    # Interval-based so it fires during waking hours regardless of when the machine
-    # was last on, rather than at a hardcoded 2am that may be missed entirely.
+    # ── Distiller: nightly at 2am, with startup catch-up ─────────────────────────
+    # cron, not interval: interval-24h restarts its countdown on every daemon
+    # restart, and this daemon restarts far more often than daily (game-guard
+    # pauses, debugging) — the 24h mark was never reached and the distiller
+    # produced ZERO scheduled runs after 2026-05-14. The catch-up one-shot covers
+    # the original concern behind the interval choice (machine off/paused at 2am):
+    # if the last run is >36h stale, run once shortly after startup instead.
     if "distiller" in active_names:
         if getattr(cfg, "distiller_mode", "on_demand") == "scheduled":
-            _add("distiller", distiller.tick, "interval", hours=24)
+            _add("distiller", distiller.tick, "cron", hour=2)
+            last_run_ts: str | None = None
+            try:
+                runs = getattr(state_store.load(), "distiller_runs", None) or []
+                last_run_ts = runs[-1].get("timestamp") if runs else None
+                stale = last_run_ts is None or (
+                    datetime.now(timezone.utc) - datetime.fromisoformat(last_run_ts)
+                ) > timedelta(hours=36)
+            except Exception:
+                stale = True
+            if stale:
+                scheduler.add_job(
+                    distiller.tick,
+                    "date",
+                    run_date=datetime.now(timezone.utc) + timedelta(minutes=10),
+                    id="distiller_catchup",
+                )
+                log.info("distiller.catchup_scheduled", last_run=last_run_ts)
         else:
             log.info("distiller.scheduled_skipped", reason="distiller_mode=on_demand")
 
