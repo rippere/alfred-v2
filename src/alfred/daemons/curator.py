@@ -199,6 +199,7 @@ class CuratorDaemon(BaseDaemon):
                 except VaultError as e2:
                     if "Already exists" in str(e2):
                         self.log.debug("curator.duplicate_skip", path=inbox_file.name)
+                        result = {}
                     else:
                         raise
             else:
@@ -228,6 +229,9 @@ class CuratorDaemon(BaseDaemon):
             return None
 
         if time.monotonic() < self._classify_paused_until:
+            return None
+
+        if not self.state.can_make_api_call(daemon="curator"):
             return None
 
         system_text = _CLASSIFY_SYSTEM.format(types=", ".join(sorted(KNOWN_TYPES)))

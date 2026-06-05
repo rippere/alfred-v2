@@ -147,6 +147,7 @@ class AlfredConfig:
         # Janitor
         if j := raw.get("janitor"):
             cfg.janitor_sweep_interval_s = j.get("sweep_interval_s", cfg.janitor_sweep_interval_s)
+            cfg.janitor_deep_interval_h = j.get("deep_interval_h", cfg.janitor_deep_interval_h)
             cfg.janitor_max_bytes_per_call = j.get("max_bytes_per_call", cfg.janitor_max_bytes_per_call)
             cfg.janitor_dedup_enabled = j.get("dedup_enabled", cfg.janitor_dedup_enabled)
 

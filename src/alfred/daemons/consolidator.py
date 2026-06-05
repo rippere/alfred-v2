@@ -270,7 +270,7 @@ class ConsolidatorDaemon(BaseDaemon):
         )
 
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if anthropic_key:
+        if anthropic_key and self.state.can_make_api_call(daemon="consolidator"):
             try:
                 client = get_client()
 
@@ -384,6 +384,8 @@ class ConsolidatorDaemon(BaseDaemon):
             )
 
         # ── Fallback 1: Anthropic ─────────────────────────────────────────────
+        if not self.state.can_make_api_call(daemon="consolidator"):
+            return ""
         try:
             from alfred.core.anthropic_client import get_client
 

@@ -189,7 +189,7 @@ def run_server(config_path: Path, host: str = "127.0.0.1", port: int = 8765) -> 
             # (safe because we're bound to loopback).
             pass
 
-    mcp.run(transport="sse", host=host, port=port)
+    mcp.run(transport="streamable-http", host=host, port=port)
 
 
 if __name__ == "__main__":

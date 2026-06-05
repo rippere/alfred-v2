@@ -222,6 +222,9 @@ class DistillerDaemon(BaseDaemon):
             body=body[:2000],
         )
 
+        if not self.state.can_make_api_call(daemon="distiller"):
+            return 0
+
         client = get_client()
 
         def _call():

@@ -73,6 +73,12 @@ class StateStore:
             self._state = _decode_state(raw)
         else:
             self._state = PipelineState()
+        # Reset daily API counters if date rolled over since last save
+        today = date.today().isoformat()
+        if self._state.api_calls_date != today:
+            self._state.api_calls_today = 0
+            self._state.api_cost_usd_today = 0.0
+            self._state.api_calls_date = today
         return self._state
 
     def save(self) -> None:
@@ -145,3 +151,28 @@ class StateStore:
                 calls_today=state.api_calls_today,
                 cost_usd=round(state.api_cost_usd_today, 4),
             )
+
+    def budget_remaining(self) -> int:
+        """Return API calls remaining today. Resets counter if date rolled over."""
+        today = date.today().isoformat()
+        state = self._state
+        if state.api_calls_date != today:
+            state.api_calls_today = 0
+            state.api_cost_usd_today = 0.0
+            state.api_calls_date = today
+        limit = self._cfg.api_max_calls_per_day if self._cfg is not None else 500
+        return max(0, limit - state.api_calls_today)
+
+    def can_make_api_call(self, daemon: str = "") -> bool:
+        """Return False and log when daily budget is exhausted."""
+        remaining = self.budget_remaining()
+        if remaining <= 0:
+            _log.warning(
+                "alfred.api_budget_exhausted",
+                daemon=daemon,
+                calls_today=self._state.api_calls_today,
+                cost_usd=round(self._state.api_cost_usd_today, 4),
+                limit=self._cfg.api_max_calls_per_day if self._cfg else 500,
+            )
+            return False
+        return True
