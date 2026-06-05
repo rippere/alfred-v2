@@ -11,6 +11,27 @@ INBOX="/mnt/external/obsidian-vault/inbox"
 WORK_DIR="/home/rippere/alfred-v2"
 CLAUDE_BIN="$(which claude 2>/dev/null || echo "")"
 
+# ── game-guard awareness ──────────────────────────────────────────────────────
+# ollama-game-guard intentionally pauses the alfred fleet while a game runs and
+# re-enforces the pause every 5s — healing mid-game just creates the recursive
+# heal-vs-pause storm observed 2026-06-04. Skip entirely while the pause is in
+# effect. Mode semantics mirror the guard: off → guard disabled, heal normally;
+# on → forced GPU-free, fleet is MEANT to be down; auto → detect a live game.
+GUARD_MODE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/ollama-game-guard/mode"
+_game_active() {
+    local mode
+    mode="$(cat "$GUARD_MODE_FILE" 2>/dev/null || echo auto)"
+    [[ "$mode" == "off" ]] && return 1
+    [[ "$mode" == "on" ]] && return 0
+    pgrep -f 'reaper.*SteamLaunch AppId=' >/dev/null 2>&1 && return 0
+    gamemoded -s 2>/dev/null | grep -q 'gamemode is active' && return 0
+    return 1
+}
+if _game_active; then
+    echo "[watchdog] game active — fleet intentionally paused by game-guard; skipping all tiers"
+    exit 0
+fi
+
 declare -A SERVICES=(
     [alfred]="$WORK_DIR/data/alfred.pid"
     [alfred-personal]="$WORK_DIR/data-personal/alfred.pid"
