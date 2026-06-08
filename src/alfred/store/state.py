@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
@@ -15,7 +14,13 @@ from alfred.core.models import (
     WikiPage,
 )
 
-_log = logging.getLogger(__name__)
+import structlog
+
+# Use structlog (like every other module) — the budget-guard warnings below pass
+# structured kwargs (daemon=, calls_today=, ...). A stdlib logger rejects those with
+# "Logger._log() got an unexpected keyword argument 'daemon'", which since the Jun-5
+# budget guards + distiller-cron fix turned into ~1.5k distiller.file_error/run.
+_log = structlog.get_logger(__name__)
 
 # Anthropic claude-sonnet-4-6 pricing (USD per token)
 _PRICE_INPUT = 3.00 / 1_000_000
