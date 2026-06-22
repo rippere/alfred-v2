@@ -246,6 +246,9 @@ class SurveyorDaemon(BaseDaemon):
                 min_cluster_size=min_cluster_size,
                 min_samples=min_samples,
                 metric="cosine",
+                # Pin current (False) behaviour; the default flips to True in
+                # sklearn 1.10 and otherwise emits a FutureWarning every cluster.
+                copy=False,
             ).fit_predict(vectors)
 
             cluster_members: dict[int, list[str]] = {}
