@@ -52,6 +52,11 @@ VAULTS: dict[str, dict] = {
         "state": REPO_ROOT / "data-personal" / "state.json",
         "domain": "life",
     },
+    "employment": {
+        "root": Path("/mnt/external/vault-employment"),
+        "state": REPO_ROOT / "data-employment" / "state.json",
+        "domain": "life",
+    },
 }
 
 # Vault sub-directories that are NOT knowledge records (don't count them).

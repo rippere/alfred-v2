@@ -7,6 +7,8 @@ vaults:
     config: /home/rippere/alfred-v2/config-finance.yaml
   - name: personal
     config: /home/rippere/alfred-v2/config-personal.yaml
+  - name: employment
+    config: /home/rippere/alfred-v2/config-employment.yaml
 
 meta_server:
   top_k_per_vault: 5
