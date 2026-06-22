@@ -85,7 +85,7 @@ class QueryEngine:
             if not store.load():
                 raise RuntimeError(
                     f"BM25 index not found at {self.cfg.bm25_path}. "
-                    "Run: uv run python scripts/migrate_milvus.py"
+                    "Run: uv run python scripts/_archive/migrate_milvus.py"
                 )
             self._bm25 = store
         return self._bm25
@@ -248,7 +248,7 @@ class QueryEngine:
         if not bm25.has_corpus:
             raise RuntimeError(
                 "BM25-only mode requires corpus storage. "
-                "Rebuild with phase4_rebuild_milvus.py (it calls fit_and_store)."
+                "Rebuild with scripts/_archive/phase4_rebuild_milvus.py (it calls fit_and_store)."
             )
         raw_hits = bm25.search(text, top_k=opts.top_k * 3)
         t["bm25"] = time.perf_counter() - t0

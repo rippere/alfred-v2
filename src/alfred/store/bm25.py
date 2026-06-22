@@ -68,7 +68,7 @@ class BM25Store:
         """
         if not self.has_corpus:
             raise RuntimeError(
-                "Corpus not available — rebuild with phase4_rebuild_milvus.py to enable "
+                "Corpus not available — rebuild with scripts/_archive/phase4_rebuild_milvus.py to enable "
                 "offline search, or use hybrid Milvus search instead."
             )
         query_vec = self._vec.transform([text])

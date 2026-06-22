@@ -11,12 +11,15 @@ from datetime import date
 from pathlib import Path
 
 import frontmatter
+import structlog
 import yaml
 
 from alfred.core.schema import (
     KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
 )
+
+log = structlog.get_logger()
 
 
 class VaultError(Exception):
@@ -153,7 +156,8 @@ def _find_richest_topic_by_tag(vault_path: Path, tags: list[str]) -> str | None:
     for md_file in topic_dir.glob("*.md"):
         try:
             post = frontmatter.load(str(md_file))
-        except Exception:
+        except Exception as e:
+            log.debug("vault_ops.frontmatter_skip", path=str(md_file), where="find_richest_topic", error=str(e))
             continue
         file_tags_raw = post.metadata.get("tags", [])
         if not isinstance(file_tags_raw, list):
@@ -281,7 +285,8 @@ def vault_search(
         try:
             post = frontmatter.load(str(md_file))
             fm = post.metadata
-        except Exception:
+        except Exception as e:
+            log.debug("vault_ops.frontmatter_skip", path=str(md_file), where="vault_search", error=str(e))
             fm = {}
         rel_str = str(rel).replace("\\", "/")
         results.append({
@@ -303,7 +308,8 @@ def vault_context(vault_path: Path, ignore_dirs: list[str] | None = None) -> dic
             continue
         try:
             post = frontmatter.load(str(md_file))
-        except Exception:
+        except Exception as e:
+            log.debug("vault_ops.frontmatter_skip", path=str(md_file), where="vault_context", error=str(e))
             continue
         rec_type = post.metadata.get("type", "")
         if not rec_type:

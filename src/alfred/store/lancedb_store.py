@@ -185,8 +185,10 @@ class LanceDBStore:
                 "- Follow up: interrupted-write cause (OOM / SIGKILL mid-commit).\n\n"
                 "<!-- alfred:source lancedb_quarantine -->\n"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # Critical: self-heal happened but the operator was never told. Surface
+            # it loudly so a recurring data-loss bug isn't masked by a failed alert.
+            log.warning("lancedb.corruption_alert_failed", collection=collection, error=str(e))
 
     # ------------------------------------------------------------------
     # Write methods
