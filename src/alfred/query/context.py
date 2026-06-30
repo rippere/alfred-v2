@@ -4,8 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import structlog
+
 from alfred.core.vault import chunk_record, parse_file
 from alfred.store.milvus import SearchHit
+
+log = structlog.get_logger()
 
 MAX_CONTEXT_CHARS = 60_000
 CHUNK_PREVIEW_CHARS = 200
@@ -86,5 +90,6 @@ def _chunk_text(vault_path: Path, chunk_id: str) -> str | None:
         record = parse_file(vault_path, rel_path)
         chunks = chunk_record(record)
         return chunks[idx][1] if idx < len(chunks) else None
-    except Exception:
+    except Exception as e:
+        log.debug("context.chunk_resolve_failed", rel_path=str(rel_path), error=str(e))
         return None

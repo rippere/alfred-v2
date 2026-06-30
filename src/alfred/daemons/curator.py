@@ -100,7 +100,10 @@ class CuratorDaemon(BaseDaemon):
             post = frontmatter.load(str(inbox_file))
             fm = dict(post.metadata)
             body = post.content
-        except Exception:
+        except Exception as e:
+            # Malformed frontmatter — ingest the raw text rather than drop the file,
+            # but surface it so a bad source isn't silently stripped of metadata.
+            self.log.warning("curator.frontmatter_parse_failed", path=str(inbox_file), error=str(e))
             fm = {}
             body = inbox_file.read_text(encoding="utf-8", errors="replace")
 
@@ -305,7 +308,8 @@ def _build_project_index(vault_path) -> dict[str, str]:
                 if variant and len(variant) > 3:
                     index[variant.lower().replace("-", " ")] = rel
                     index[variant.lower()] = rel
-        except Exception:
+        except Exception as e:
+            log.debug("curator.project_index_skip", path=str(md), error=str(e))
             continue
     return index
 

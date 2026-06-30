@@ -75,8 +75,10 @@ class MilvusStore:
         """Re-open the MilvusClient after the internal subprocess crashes."""
         try:
             self._client.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # Expected: the client's subprocess already crashed — we're about to
+            # reconnect. Record it at debug so it's greppable without log spam.
+            log.debug("milvus.close_failed", error=str(e))
         for attempt in range(4):
             try:
                 self._client = MilvusClient(uri=self.uri)

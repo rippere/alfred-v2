@@ -260,7 +260,7 @@ NEXT STEPS
   2. For topic merges, copy synthesis.topic.merge_groups from the manifest
      to data/topic-merge-confirmed.json and trim to only the groups you want
      to merge (format: [{"canonical": "slug", "merge_in": ["slug2", ...]}, ...]).
-  3. Run: uv run python scripts/phase1a_safe_deletes.py --dry-run
+  3. Run: uv run python scripts/_archive/phase1a_safe_deletes.py --dry-run
 """)
 
 

@@ -188,7 +188,8 @@ class DistillerDaemon(BaseDaemon):
     async def _distill_file(self, vault_path: Path, rel_path: str) -> int:
         try:
             rec = vault_read(vault_path, rel_path)
-        except Exception:
+        except Exception as e:
+            self.log.warning("distiller.distill_read_failed", path=rel_path, error=str(e))
             return 0
 
         fm = rec["frontmatter"]
@@ -304,5 +305,6 @@ def _is_stale(last_distilled: str) -> bool:
         last = datetime.fromisoformat(last_distilled)
         days = (datetime.now(timezone.utc) - last).total_seconds() / 86400
         return days >= STALE_DAYS
-    except Exception:
+    except Exception as e:
+        log.debug("distiller.stale_parse_failed", value=last_distilled, error=str(e))
         return True

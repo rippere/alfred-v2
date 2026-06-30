@@ -15,6 +15,10 @@ import os
 from pathlib import Path
 from typing import Any
 
+import structlog
+
+log = structlog.get_logger()
+
 
 def _make_auth_middleware(token: str | None):
     """Return a Starlette middleware class that validates the Bearer token.
@@ -130,7 +134,8 @@ def run_server(config_path: Path, host: str = "127.0.0.1", port: int = 8765) -> 
         try:
             rec = vault_read(cfg.vault_path, page.rel_path)
             body = rec["body"]
-        except Exception:
+        except Exception as e:
+            log.debug("mcp.entity_body_read_failed", path=page.rel_path, error=str(e))
             body = ""
 
         return {
@@ -184,10 +189,11 @@ def run_server(config_path: Path, host: str = "127.0.0.1", port: int = 8765) -> 
             raw_app = getattr(mcp, "app", None) or getattr(mcp, "_app", None)
             if raw_app is not None:
                 raw_app.add_middleware(AuthMiddleware)
-        except Exception:
+        except Exception as e:
             # Middleware attachment failed — fall through and start without auth
-            # (safe because we're bound to loopback).
-            pass
+            # (safe because we're bound to loopback). Warn: a token was configured
+            # but isn't being enforced, which is a security-relevant surprise.
+            log.warning("mcp.auth_middleware_attach_failed", error=str(e))
 
     mcp.run(transport="streamable-http", host=host, port=port)
 
