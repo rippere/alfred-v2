@@ -1,0 +1,17 @@
+[Unit]
+Description=Alfred — sync Meetily meeting notes into the vault inbox
+Documentation=file:///home/rippere/alfred-v2/deploy/systemd/INSTALL.md
+
+[Service]
+Type=oneshot
+# Ingest any new Meetily meetings. Curator (running under the main alfred
+# service) picks them up from inbox/ within ~10s and files them into meeting/.
+# Point MEETILY_DB at your real Meetily SQLite file, or set meetily.db_path in
+# config.yaml and drop the Environment= line.
+Environment=MEETILY_DB=%h/.local/share/meetily/meeting_minutes.db
+ExecStart=/home/rippere/alfred-v2/.venv/bin/alfred meetily sync
+WorkingDirectory=/home/rippere/alfred-v2
+Nice=10
+
+[Install]
+WantedBy=default.target

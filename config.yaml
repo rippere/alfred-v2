@@ -40,3 +40,10 @@ query:
 synthesis:
   anthropic_model: claude-sonnet-4-6
   openrouter_model: x-ai/grok-4.1-fast
+
+# Meetily meeting-note ingestion (`alfred meetily sync`).
+# db_path: absolute path to Meetily's local SQLite store. If omitted, Alfred
+# probes common locations and honours $MEETILY_DB. Meetings are written to
+# inbox/ as type: meeting and filed by the Curator into meeting/.
+meetily:
+  db_path: ~/.local/share/meetily/meeting_minutes.db

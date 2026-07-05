@@ -8,6 +8,8 @@ KNOWN_TYPES: set[str] = {
     "contradiction", "synthesis", "wiki", "topic",
     # Content creation types
     "idea", "script", "hook",
+    # Meeting capture (Meetily ingestion)
+    "meeting",
     # Legacy — recognised for read-path compat but no longer written as directories
     "learn", "ai-dialogue",
 }
@@ -42,6 +44,10 @@ STATUS_BY_TYPE: dict[str, set[str]] = {
     "idea": {"raw", "researched", "scripted", "published", "shelved"},
     "script": {"draft", "review", "final", "published"},
     "hook": {"active", "retired"},
+    # captured  = transcript imported, no summary yet
+    # summarized = Meetily produced a summary/action-items block
+    # reviewed  = a human has read/acted on it
+    "meeting": {"captured", "summarized", "reviewed", "archived"},
 }
 
 TYPE_DIRECTORY: dict[str, str] = {
@@ -52,6 +58,8 @@ TYPE_DIRECTORY: dict[str, str] = {
     "wiki": "wiki", "topic": "topic",
     # Content creation types
     "idea": "ideas", "script": "drafts", "hook": "hooks",
+    # Meeting capture — Meetily-ingested notes land in meeting/
+    "meeting": "meeting",
     # Session types — all go to session/
     "session": "session", "conversation": "session", "ai-dialogue": "session",
     # Epistemic types — consolidated into topic/ (subtype tracked via tags)
@@ -88,6 +96,9 @@ _TYPE_CORRECTIONS: dict[str, str] = {
     "sessions": "session", "inputs": "input", "assumptions": "assumption",
     "constraints": "constraint", "contradictions": "contradiction",
     "syntheses": "synthesis",
+    # meeting aliases
+    "meetings": "meeting", "minutes": "meeting", "call": "meeting",
+    "standup": "meeting", "1on1": "meeting", "one-on-one": "meeting",
 }
 
 _STATUS_CORRECTIONS: dict[str, str] = {
