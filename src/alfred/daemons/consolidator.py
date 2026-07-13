@@ -12,6 +12,7 @@ import httpx
 import structlog
 
 from alfred.core.anthropic_client import get_client
+from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import vault_create, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
 
@@ -189,9 +190,7 @@ class ConsolidatorDaemon(BaseDaemon):
 
         # Guard: if every source is daemon-generated content, skip synthesis.
         # Synthesizing LLM output produces compounding noise, not knowledge.
-        daemon_prefixes = ("topic/", "synthesis/", "learn/")
-        human_sources = [p for p, _, _ in learn_entries
-                         if not any(p.startswith(pfx) for pfx in daemon_prefixes)]
+        human_sources = [p for p, _, _ in learn_entries if not is_daemon_generated(p)]
         if not human_sources:
             self.log.info("consolidator.skip_all_daemon_sources",
                           cluster=cluster.label, entries=len(learn_entries))

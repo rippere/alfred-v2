@@ -7,12 +7,13 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from alfred.core.provenance import is_daemon_generated_raw
 from alfred.core.vault import VaultRecord, chunk_record, parse_file
 from alfred.daemons.base import BaseDaemon, DaemonEvent
-from alfred.store.milvus import MilvusStore
 
 if TYPE_CHECKING:
     from alfred.config import AlfredConfig
+    from alfred.store.lancedb_store import LanceDBStore
     from alfred.store.state import StateStore
 
 WATCH_INTERVAL = 60.0      # seconds between filesystem polls
@@ -22,9 +23,9 @@ CLUSTER_INTERVAL = 1800.0  # re-cluster every 30 minutes
 class SurveyorDaemon(BaseDaemon):
     name = "surveyor"
 
-    def __init__(self, cfg, state, events, milvus: MilvusStore) -> None:
+    def __init__(self, cfg, state, events, store: LanceDBStore) -> None:
         super().__init__(cfg, state, events)
-        self.milvus = milvus
+        self.store = store
         self._embedder = None
         self._bm25 = None
         self._last_cluster = float("-inf")
@@ -99,7 +100,7 @@ class SurveyorDaemon(BaseDaemon):
             try:
                 raw = md_file.read_bytes()
                 # Skip LLM-generated files — they must not feed back into the index
-                if b"generated_by: llm" in raw or b"generated_by: \"llm\"" in raw:
+                if is_daemon_generated_raw(raw):
                     continue
                 current[rel_str] = hashlib.md5(raw).hexdigest()
             except OSError:
@@ -122,7 +123,7 @@ class SurveyorDaemon(BaseDaemon):
             fs = state.files.get(rel_path)
             chunk_ids = fs.chunk_ids if fs else None
             try:
-                self.milvus.delete_file(rel_path, chunk_ids)
+                self.store.delete_file(rel_path, chunk_ids)
             except Exception as e:
                 self.log.warning("surveyor.delete_failed", path=rel_path, error=str(e))
             state.files.pop(rel_path, None)
@@ -147,7 +148,7 @@ class SurveyorDaemon(BaseDaemon):
             if rel_path in diff["changed"]:
                 old_fs = state.files.get(rel_path)
                 if old_fs:
-                    self.milvus.delete_file(rel_path, old_fs.chunk_ids)
+                    self.store.delete_file(rel_path, old_fs.chunk_ids)
 
             chunk_ids: list[str] = []
             rows: list[dict] = []
@@ -172,7 +173,7 @@ class SurveyorDaemon(BaseDaemon):
             # interrupted-write corruption window that crash-looped the daemon.
             if rows:
                 try:
-                    self.milvus.upsert_many(rows)
+                    self.store.upsert_many(rows)
                 except Exception as e:
                     self.log.warning(
                         "surveyor.upsert_failed",
@@ -211,8 +212,8 @@ class SurveyorDaemon(BaseDaemon):
     async def _recluster(self) -> None:
         """HDBSCAN clustering over current embeddings.
 
-        The Milvus query_all (~48s for 4k vectors) and HDBSCAN run in a thread
-        pool so the event loop stays responsive for other daemons.
+        The vector-store query_all (~48s for 4k vectors) and HDBSCAN run in a
+        thread pool so the event loop stays responsive for other daemons.
         """
         try:
             import numpy as np
@@ -223,10 +224,10 @@ class SurveyorDaemon(BaseDaemon):
 
         min_cluster_size = self.cfg.hdbscan_min_cluster_size
         min_samples = self.cfg.hdbscan_min_samples
-        milvus = self.milvus
+        store = self.store
 
         def _compute() -> tuple[dict[int, list[str]], list[tuple[str, int]]] | None:
-            rows = milvus.query_all(output_fields=["id", "embedding"])
+            rows = store.query_all(output_fields=["id", "embedding"])
             if not rows:
                 return None
 

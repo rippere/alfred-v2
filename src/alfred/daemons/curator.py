@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -55,7 +54,6 @@ def _json_default(obj):
 
 class CuratorDaemon(BaseDaemon):
     name = "curator"
-    _classify_paused_until: float = 0.0
 
     async def run(self) -> None:
         self.log.info("curator.start")
@@ -231,9 +229,6 @@ class CuratorDaemon(BaseDaemon):
         if not api_key:
             return None
 
-        if time.monotonic() < self._classify_paused_until:
-            return None
-
         if not self.state.can_make_api_call(daemon="curator"):
             return None
 
@@ -270,9 +265,9 @@ class CuratorDaemon(BaseDaemon):
         except Exception as e:
             err_str = str(e)
             self.log.warning("curator.classify_error", error=err_str)
-            if "credit balance is too low" in err_str or "balance is too low" in err_str:
-                self._classify_paused_until = time.monotonic() + 3600
-                self.log.warning("curator.classify_paused", reason="credit_exhaustion", resume_in_seconds=3600)
+            # Recognized failure signatures (e.g. credit exhaustion) pause ALL
+            # daemons' API calls via StateStore.can_make_api_call().
+            self.state.record_api_failure(err_str, daemon="curator")
             return None
 
 

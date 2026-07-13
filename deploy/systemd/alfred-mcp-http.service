@@ -1,0 +1,15 @@
+[Unit]
+Description=Alfred MCP HTTP server (LAN access)
+After=alfred.service
+Wants=alfred.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/rippere/alfred-v2
+Environment="HOME=/home/rippere"
+ExecStart=/home/rippere/alfred-v2/.venv/bin/python -m alfred.mcp.server_http
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

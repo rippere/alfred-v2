@@ -1,4 +1,9 @@
-"""QueryEngine — full hybrid retrieval pipeline."""
+"""QueryEngine — retrieval pipeline (dense vector search + graph/Hopfield/rerank stages).
+
+Retrieval on the live LanceDB backend is dense-only; BM25 is used solely by
+the separate ``bm25_only`` offline path (and by the legacy Milvus backend's
+hybrid search).
+"""
 from __future__ import annotations
 
 import json
@@ -15,7 +20,7 @@ import structlog
 from alfred.config import AlfredConfig
 from alfred.query.context import SourceRef, assemble, chunk_preview
 from alfred.query.wiki import WikiFastPath, WikiHit
-from alfred.store.milvus import SearchHit
+from alfred.store.types import SearchHit
 
 if TYPE_CHECKING:
     pass
@@ -85,7 +90,9 @@ class QueryEngine:
             if not store.load():
                 raise RuntimeError(
                     f"BM25 index not found at {self.cfg.bm25_path}. "
-                    "Run: uv run python scripts/_archive/migrate_milvus.py"
+                    "Build it from the vault corpus with BM25Store.fit_and_store() + save() "
+                    "(see src/alfred/store/bm25.py), or copy bm25.pkl from an existing "
+                    "deployment's data dir."
                 )
             self._bm25 = store
         return self._bm25
@@ -125,10 +132,16 @@ class QueryEngine:
         dense_vec = self._get_embedder().embed(text)
         t["embed"] = time.perf_counter() - t0
 
-        # ── Step 2: BM25 sparse vector ─────────────────────────────────────────
-        t0 = time.perf_counter()
-        sparse_vec = self._get_bm25().encode(text)
-        t["bm25"] = time.perf_counter() - t0
+        # ── Step 2: BM25 sparse vector (legacy Milvus backend only) ──────────
+        # LanceDBStore.search() ignores its sparse argument entirely (retrieval
+        # is dense-only; BM25 serves only the separate bm25_only offline path),
+        # so encoding the query here would be dead work on every call. Only the
+        # legacy Milvus backend's hybrid_search still consumes a sparse vector.
+        sparse_vec: dict[int, float] = {}
+        if self.cfg.vector_store != "lancedb":
+            t0 = time.perf_counter()
+            sparse_vec = self._get_bm25().encode(text)
+            t["bm25"] = time.perf_counter() - t0
 
         # ── Step 3: Hopfield refinement (optional) ────────────────────────────
         if opts.use_hopfield:
@@ -136,7 +149,7 @@ class QueryEngine:
             dense_vec = self._hopfield_refine(dense_vec, opts.top_k)
             t["hopfield"] = time.perf_counter() - t0
 
-        # ── Step 4: Hybrid search ─────────────────────────────────────────────
+        # ── Step 4: Vector search (dense-only on LanceDB; hybrid on legacy Milvus) ─
         t0 = time.perf_counter()
         hits = self._get_milvus().search(
             dense_vec=dense_vec,
@@ -234,7 +247,8 @@ class QueryEngine:
     def _query_bm25_only(self, text: str, opts: QueryOptions) -> QueryResult:
         """Lightweight query path: BM25 corpus search only, no Milvus or Ollama.
 
-        Requires the BM25 index to have been built with fit_and_store() (phase4 rebuild).
+        Requires the BM25 index to have been built with BM25Store.fit_and_store()
+        so the corpus matrix is stored alongside the vectorizer.
         Returns results ranked by BM25 score then reranked by FlashRank.
         """
         t = {}
@@ -248,7 +262,8 @@ class QueryEngine:
         if not bm25.has_corpus:
             raise RuntimeError(
                 "BM25-only mode requires corpus storage. "
-                "Rebuild with scripts/_archive/phase4_rebuild_milvus.py (it calls fit_and_store)."
+                "Rebuild the index at cfg.bm25_path with BM25Store.fit_and_store() — "
+                "not fit() — so the corpus matrix is saved (see src/alfred/store/bm25.py)."
             )
         raw_hits = bm25.search(text, top_k=opts.top_k * 3)
         t["bm25"] = time.perf_counter() - t0

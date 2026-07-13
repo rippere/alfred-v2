@@ -1,0 +1,12 @@
+[Unit]
+Description=Alfred LLM Conversation Ingest
+After=graphical-session.target
+OnFailure=alfred-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/mnt/external/Projects/personal-alfred
+Environment=HOME=/home/rippere
+ExecStart=/usr/bin/python3 /mnt/external/Projects/personal-alfred/llm_ingest.py
+StandardOutput=append:/mnt/external/Projects/personal-alfred/data/llm_ingest.log
+StandardError=append:/mnt/external/Projects/personal-alfred/data/llm_ingest.log

@@ -18,8 +18,8 @@ import structlog
 
 log = structlog.get_logger()
 
-# Re-export SearchHit from milvus so importers don't have to change.
-from alfred.store.milvus import SearchHit  # noqa: F401
+# Re-export SearchHit from the shared types module so importers don't have to change.
+from alfred.store.types import SearchHit  # noqa: F401
 
 # Substrings that mark a *corrupt table* (interrupted-write damage: zero-byte
 # manifests, truncated fragments) as opposed to a transient/operational error
@@ -206,7 +206,8 @@ class LanceDBStore:
         """Insert or update a single chunk.
 
         ``sparse`` is accepted for interface compatibility but not stored —
-        BM25 ranking is handled entirely by BM25Store.
+        this backend does no sparse retrieval; BM25Store serves only the
+        separate ``bm25_only`` offline path.
         """
         import pyarrow as pa
 
@@ -237,7 +238,8 @@ class LanceDBStore:
         proportionally.
 
         Each row dict needs: ``chunk_id``, ``dense``, ``record_type``, ``name``,
-        ``chunk_index``.  ``sparse`` is accepted and ignored (BM25Store owns it).
+        ``chunk_index``.  ``sparse`` is accepted and ignored — this backend
+        stores no sparse vectors (retrieval is dense-only).
         """
         if not rows:
             return
@@ -289,11 +291,11 @@ class LanceDBStore:
         top_k: int = 8,
         include_inbox: bool = False,
     ) -> list[SearchHit]:
-        """Dense cosine search.  BM25/sparse component is handled upstream.
+        """Dense cosine search — retrieval on this backend is dense-only.
 
-        ``sparse_vec`` is accepted for interface parity but ignored here —
-        the BM25Store already does sparse scoring and the QueryEngine merges
-        results from both paths via RRF-style re-ranking.
+        ``sparse_vec`` is accepted for interface parity with MilvusStore but
+        ignored: no sparse/BM25 component contributes to this ranking.  BM25
+        is used only by the QueryEngine's separate ``bm25_only`` offline path.
         """
         results = (
             self._tbl

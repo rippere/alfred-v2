@@ -4,6 +4,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import structlog
+
+log = structlog.get_logger()
+
 
 def run_server(config_path: Path) -> None:
     """Start the FastMCP stdio server. Blocks until EOF."""
@@ -98,7 +102,8 @@ def run_server(config_path: Path) -> None:
         try:
             rec = vault_read(cfg.vault_path, page.rel_path)
             body = rec["body"]
-        except Exception:
+        except Exception as e:
+            log.debug("mcp.entity_body_read_failed", path=page.rel_path, error=str(e))
             body = ""
 
         return {

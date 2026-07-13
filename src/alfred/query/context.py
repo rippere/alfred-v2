@@ -7,7 +7,7 @@ from pathlib import Path
 import structlog
 
 from alfred.core.vault import chunk_record, parse_file
-from alfred.store.milvus import SearchHit
+from alfred.store.types import SearchHit
 
 log = structlog.get_logger()
 

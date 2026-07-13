@@ -23,18 +23,23 @@ A personal memory system. Everything you work on and learn gets captured here, i
 ## Service management
 
 ```bash
-# Status of all 5 vaults
-systemctl --user status alfred alfred-neuroscience alfred-finance alfred-personal alfred-content
+# Status of all 5 vault services
+systemctl --user status alfred alfred-neuroscience alfred-finance alfred-personal alfred-employment
 
 # Restart everything
-systemctl --user restart alfred alfred-neuroscience alfred-finance alfred-personal alfred-content alfred-mcp-http
+systemctl --user restart alfred alfred-neuroscience alfred-finance alfred-personal alfred-employment alfred-mcp-http
 
 # Tail logs (main vault)
 tail -f /home/rippere/alfred-v2/data/alfred.log
 
-# Tail logs (content vault)
-tail -f /home/rippere/alfred-v2/data-content/alfred.log
+# Tail logs (employment vault)
+tail -f /home/rippere/alfred-v2/data-employment/alfred.log
 ```
+
+**Note on `alfred-meta.service`:** being decommissioned — do not restart or re-enable it.
+It wrapped the stdio-transport meta server as a persistent daemon, but the real meta server
+is spawned per-session by the MCP client via `.mcp.json`, so the unit ran ~25s, exited 0,
+and did nothing. There is no `alfred-content.service` (see the content vault section below).
 
 ---
 
@@ -61,6 +66,13 @@ curl -s http://localhost:8765/query -H 'Content-Type: application/json' \
 
 ## Content creation workflow
 
+> **Status: dormant — pending wire-up or decommission decision.**
+> The content vault has a config (`config-content.yaml`) and a data dir (`data-content/`),
+> but **no systemd service runs it** (there is no `alfred-content.service`), and it is
+> **excluded from `config-meta.yaml`'s fan-out**, so cross-vault queries silently skip it.
+> Nothing below happens automatically until it is either wired up (service + meta fan-out
+> entry) or decommissioned. See AUDIT-2026-07-13.md, quick win #22.
+
 **Vault location:** `/mnt/external/vault-content/`
 
 **Folder structure:**
@@ -82,7 +94,7 @@ curl -s http://localhost:8765/query -H 'Content-Type: application/json' \
 
 **Querying across all vaults for content research:**
 ```
-# In Claude Code (uses meta server across all 4 main vaults)
+# In Claude Code (meta server fans out across the 5 wired vaults — content is NOT included)
 vault_query "what do I know about dopamine and decision making"
 vault_query "tribe social reels performance findings"
 ```
@@ -118,13 +130,18 @@ ls /mnt/external/obsidian-vault/inbox/
 
 ## Vault locations
 
-| Vault | Path | Config |
-|---|---|---|
-| Main (AI/software) | `/mnt/external/obsidian-vault` | `config.yaml` |
-| Neuroscience | `/mnt/external/vault-neuroscience` | `config-neuroscience.yaml` |
-| Finance | `/mnt/external/vault-finance` | `config-finance.yaml` |
-| Personal | `/mnt/external/vault-personal` | `config-personal.yaml` |
-| Content | `/mnt/external/vault-content` | `config-content.yaml` |
+| Vault | Path | Config | Service |
+|---|---|---|---|
+| Main (AI/software) | `/mnt/external/obsidian-vault` | `config.yaml` | `alfred.service` |
+| Neuroscience | `/mnt/external/vault-neuroscience` | `config-neuroscience.yaml` | `alfred-neuroscience.service` |
+| Finance | `/mnt/external/vault-finance` | `config-finance.yaml` | `alfred-finance.service` |
+| Personal | `/mnt/external/vault-personal` | `config-personal.yaml` | `alfred-personal.service` |
+| Employment | `/mnt/external/vault-employment` | `config-employment.yaml` | `alfred-employment.service` |
+| Content (dormant) | `/mnt/external/vault-content` | `config-content.yaml` | *(none — see content section above)* |
+
+Supporting units: `alfred-mcp-http.service` (HTTP API on :8765), `alfred-watchdog.timer`
+(5-min health checks), `alfred-llm-ingest.timer`, `alfred-notion-ingest.timer`.
+`alfred-meta.service` is being decommissioned (meta server is spawned per-session via `.mcp.json`).
 
 ---
 
@@ -132,13 +149,13 @@ ls /mnt/external/obsidian-vault/inbox/
 
 ```bash
 # Check if all services are running
-systemctl --user is-active alfred alfred-neuroscience alfred-finance alfred-personal alfred-content
+systemctl --user is-active alfred alfred-neuroscience alfred-finance alfred-personal alfred-employment
 
 # Service stuck? Check the log for errors
 tail -50 /home/rippere/alfred-v2/data/alfred.log | grep -i error
 
 # Nuclear restart
-systemctl --user restart alfred alfred-neuroscience alfred-finance alfred-personal alfred-content alfred-mcp-http
+systemctl --user restart alfred alfred-neuroscience alfred-finance alfred-personal alfred-employment alfred-mcp-http
 
 # Sessions not showing up? Check the inbox
 ls -la /mnt/external/obsidian-vault/inbox/

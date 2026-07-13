@@ -66,7 +66,7 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
         log.info("alfred.store", backend="milvus", uri=cfg.milvus_uri)
 
     # ── Daemon instances ───────────────────────────────────────────────────────
-    surveyor = SurveyorDaemon(cfg, state_store, events, vector_store)
+    surveyor = SurveyorDaemon(cfg, state_store, events, store=vector_store)
     janitor = JanitorDaemon(cfg, state_store, events)
     curator = CuratorDaemon(cfg, state_store, events)
     distiller = DistillerDaemon(cfg, state_store, events)
@@ -171,38 +171,67 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
         coalesce=True,
     )
 
-    # ── Log rotation every hour ────────────────────────────────────────────────
+    # ── Hourly housekeeping: log rotation + retention ──────────────────────────
     # The daemon's stdout/stderr is an O_APPEND fd pointing at data/alfred.log
     # (see cli.py `up --daemon`), so we cannot rename the inode out from under
     # the running process. copytruncate — copy contents aside, then truncate in
     # place — keeps the existing fd valid: because of O_APPEND every write seeks
     # to end-of-file atomically, so the next log line lands at the new offset 0.
-    def _rotate_log(max_bytes: int = 50 * 1024 * 1024, backups: int = 3) -> None:
+    #
+    # Retention: at most ``log_backups`` rotated generations (alfred.log.1..N)
+    # are kept — anything older is deleted — and only the newest
+    # ``state_backups`` state.json.backup-* snapshots survive each sweep.
+    def _housekeeping(
+        max_bytes: int = 50 * 1024 * 1024,
+        log_backups: int = 2,
+        state_backups: int = 3,
+    ) -> None:
         import shutil
+
+        # 1. copytruncate rotation when alfred.log exceeds max_bytes.
         log_path = cfg.data_dir / "alfred.log"
         try:
-            if not log_path.exists() or log_path.stat().st_size < max_bytes:
-                return
-            for i in range(backups - 1, 0, -1):
-                src = cfg.data_dir / f"alfred.log.{i}"
-                if src.exists():
-                    src.replace(cfg.data_dir / f"alfred.log.{i + 1}")
-            shutil.copy2(log_path, cfg.data_dir / "alfred.log.1")
-            with open(log_path, "r+") as f:
-                f.truncate(0)
-            log.info("alfred.log_rotated", max_bytes=max_bytes)
+            if log_path.exists() and log_path.stat().st_size >= max_bytes:
+                for i in range(log_backups - 1, 0, -1):
+                    src = cfg.data_dir / f"alfred.log.{i}"
+                    if src.exists():
+                        src.replace(cfg.data_dir / f"alfred.log.{i + 1}")
+                shutil.copy2(log_path, cfg.data_dir / "alfred.log.1")
+                with open(log_path, "r+") as f:
+                    f.truncate(0)
+                log.info("alfred.log_rotated", max_bytes=max_bytes)
         except Exception as e:
             log.warning("alfred.log_rotate_failed", error=str(e))
 
-    async def _rotate_log_job() -> None:
+        # 2. Delete rotated generations beyond the retention cap.
+        try:
+            for old in cfg.data_dir.glob("alfred.log.*"):
+                suffix = old.name.rsplit(".", 1)[-1]
+                if suffix.isdigit() and int(suffix) > log_backups:
+                    old.unlink()
+                    log.info("alfred.log_pruned", path=str(old))
+        except Exception as e:
+            log.warning("alfred.log_prune_failed", error=str(e))
+
+        # 3. Keep only the newest state.json.backup-* snapshots.  Names embed
+        # a YYYYMMDD-HHMMSS timestamp, so lexical order is chronological.
+        try:
+            backups = sorted(cfg.data_dir.glob("state.json.backup-*"))
+            for old in backups[: max(0, len(backups) - state_backups)]:
+                old.unlink()
+                log.info("alfred.state_backup_pruned", path=str(old))
+        except Exception as e:
+            log.warning("alfred.state_backup_prune_failed", error=str(e))
+
+    async def _housekeeping_job() -> None:
         # stat()/copy can touch a large file — keep it off the event loop.
-        await anyio.to_thread.run_sync(_rotate_log)
+        await anyio.to_thread.run_sync(_housekeeping)
 
     scheduler.add_job(
-        _rotate_log_job,
+        _housekeeping_job,
         "interval",
         hours=1,
-        id="log_rotate",
+        id="housekeeping",
         max_instances=1,
         coalesce=True,
     )

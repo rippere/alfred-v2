@@ -1,12 +1,19 @@
-"""Milvus Lite store — hybrid dense+sparse schema."""
+"""Milvus Lite store — legacy backend, superseded by LanceDBStore.
+
+MilvusStore itself implements a hybrid dense+sparse schema (RRF over dense
+cosine + sparse BM25 legs), but it is no longer the live backend: production
+runs LanceDBStore, whose retrieval is dense-only. Kept for the legacy
+``vector_store: milvus`` config path until fully removed.
+"""
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import structlog
+
+from alfred.store.types import SearchHit  # noqa: F401  — moved to types.py; re-exported for back-compat
 
 try:
     from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
@@ -35,16 +42,6 @@ def _auto_reconnect(method):
     return wrapper
 
 COLLECTION = "vault_v2"
-
-
-@dataclass
-class SearchHit:
-    chunk_id: str
-    rel_path: str
-    score: float
-    record_type: str = ""
-    name: str = ""
-    rerank_score: float = 0.0
 
 
 class MilvusStore:

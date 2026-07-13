@@ -11,6 +11,15 @@ INBOX="/mnt/external/obsidian-vault/inbox"
 WORK_DIR="/home/rippere/alfred-v2"
 CLAUDE_BIN="$(which claude 2>/dev/null || echo "")"
 
+# ── dead-man's switch heartbeat ───────────────────────────────────────────────
+# Touched at the start of EVERY run (including game-guard early exits) so a
+# separate low-frequency check (scripts/alfred-heartbeat-check.sh, run via
+# ledger-collect.service's ExecStartPre=) can alert if the watchdog itself
+# stops running — the one failure the watchdog can't report on its own.
+HEARTBEAT_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/alfred/watchdog.heartbeat"
+mkdir -p "$(dirname "$HEARTBEAT_FILE")"
+touch "$HEARTBEAT_FILE"
+
 # ── game-guard awareness ──────────────────────────────────────────────────────
 # ollama-game-guard intentionally pauses the alfred fleet while a game runs and
 # re-enforces the pause every 5s — healing mid-game just creates the recursive
@@ -37,6 +46,7 @@ declare -A SERVICES=(
     [alfred-personal]="$WORK_DIR/data-personal/alfred.pid"
     [alfred-finance]="$WORK_DIR/data-finance/alfred.pid"
     [alfred-neuroscience]="$WORK_DIR/data-neuroscience/alfred.pid"
+    [alfred-employment]="$WORK_DIR/data-employment/alfred.pid"
     [alfred-mcp-http]=""
 )
 
@@ -142,11 +152,19 @@ for svc in "${!SERVICES[@]}"; do
     fi
 
     # ── Tier 2: Claude healing agent ─────────────────────────────────────────
-    echo "[watchdog] ${svc}: tier 1 failed — escalating to Claude healer (tier 2)"
-    if _tier2_claude_heal "$svc" "$pid_file"; then
-        echo "[watchdog] ${svc}: healed by Claude (tier 2)"
-        HEALED=$((HEALED + 1))
-        continue
+    # Narrowed to alfred-finance only — the one failure signature tier 2 has
+    # actually fixed (4/46 successes overall, all alfred-finance). Every other
+    # service goes straight tier 1 → tier 3; each tier-2 run is a live costed
+    # API call.
+    if [[ "$svc" == "alfred-finance" ]]; then
+        echo "[watchdog] ${svc}: tier 1 failed — escalating to Claude healer (tier 2)"
+        if _tier2_claude_heal "$svc" "$pid_file"; then
+            echo "[watchdog] ${svc}: healed by Claude (tier 2)"
+            HEALED=$((HEALED + 1))
+            continue
+        fi
+    else
+        echo "[watchdog] ${svc}: tier 1 failed — tier 2 skipped (claude healer reserved for alfred-finance)"
     fi
 
     # ── Tier 3: inbox alert — human escalation ───────────────────────────────
