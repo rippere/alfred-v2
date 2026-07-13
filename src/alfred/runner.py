@@ -5,9 +5,13 @@ AsyncIOScheduler.  All daemons share one StateStore, one MilvusStore/LanceDBStor
 and one asyncio.Lock (via StateStore._lock) — eliminating the cross-process race
 condition that existed when each systemd service held its own vector store connection.
 
-Each daemon's periodic work is exposed as a ``tick()`` / ``structural_tick()``
-/ ``deep_tick()`` one-shot coroutine.  APScheduler fires them on the right
-interval; the daemon classes themselves are unchanged in terms of logic.
+Each daemon responsibility is exposed as its own one-shot coroutine
+(``tick()``, ``structural_tick()``, ``deep_tick()``, ``dedup_tick()``,
+``session_archive_tick()``, ``label_tick()``, ``synthesis_tick()``,
+``stubs_tick()``) and registered as a separate APScheduler job with its own
+id, ``max_instances=1``, ``coalesce=True``, and a cadence-scaled
+``misfire_grace_time`` — so a slow pass in one responsibility (e.g. the
+weekly dedup) cannot block the scheduling of any other.
 """
 from __future__ import annotations
 
@@ -19,6 +23,12 @@ import anyio
 import structlog
 
 log = structlog.get_logger()
+
+# Session archival cadence (janitor.session_archive_tick). Not config-driven:
+# the 90-day age threshold lives in the janitor; the sweep just has to run
+# often enough to keep up, and daily is plenty. (config.py is owned by another
+# workstream — new intervals live here as constants per the split design.)
+SESSION_ARCHIVE_INTERVAL_H = 24
 
 
 async def run_daemons(cfg, only: set[str] | None = None) -> None:
@@ -91,7 +101,21 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
     # ── Build APScheduler ──────────────────────────────────────────────────────
     scheduler = AsyncIOScheduler()
 
-    def _add(daemon_name: str, func, trigger: str, **trigger_kwargs) -> None:
+    # Per-job misfire grace: how long past its slot a job may still fire.
+    # Scaled to the job's cadence — a daily/weekly job losing its slot to a
+    # busy loop should still run hours later, while a 60s poll should not.
+    GRACE_FAST = 300        # sub-hourly jobs: tolerate 5-minute slippage
+    GRACE_HOURLY = 900      # hourly jobs: tolerate 15 minutes
+    GRACE_DAILY = 3600      # daily jobs: tolerate 1 hour
+    GRACE_WEEKLY = 21600    # weekly jobs: tolerate 6 hours
+
+    def _add(
+        daemon_name: str,
+        func,
+        trigger: str,
+        misfire_grace_time: int = GRACE_FAST,
+        **trigger_kwargs,
+    ) -> None:
         """Register a scheduler job only when its daemon is selected."""
         if daemon_name not in active_names:
             return
@@ -101,7 +125,7 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
             id=f"{daemon_name}_{func.__name__}",
             max_instances=1,          # never overlap a slow job with itself
             coalesce=True,            # if late, run once not many times
-            misfire_grace_time=300,   # tolerate 5-minute slippage
+            misfire_grace_time=misfire_grace_time,
             **trigger_kwargs,
         )
 
@@ -109,13 +133,20 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
     _add("surveyor", surveyor.tick, "interval", seconds=60)
     _add("surveyor", surveyor.recluster, "interval", seconds=1800)
 
-    # ── Janitor: structural sweep on config interval, LLM deep sweep per config
+    # ── Janitor: four independently-scheduled responsibilities ────────────────
+    # Each gets its own job id + grace so a slow pass in one (e.g. the O(n²)
+    # weekly dedup) can never block the hourly structural lint or vice versa.
     sweep_s = int(getattr(cfg, "janitor_sweep_interval_s", 3600))
     deep_h = int(getattr(cfg, "janitor_deep_interval_h", 24))
-    _add("janitor", janitor.structural_tick, "interval", seconds=sweep_s)
-    _add("janitor", janitor.deep_tick, "interval", hours=deep_h)
+    _add("janitor", janitor.structural_tick, "interval",
+         misfire_grace_time=GRACE_HOURLY, seconds=sweep_s)
+    _add("janitor", janitor.deep_tick, "interval",
+         misfire_grace_time=GRACE_DAILY, hours=deep_h)
+    _add("janitor", janitor.session_archive_tick, "interval",
+         misfire_grace_time=GRACE_DAILY, hours=SESSION_ARCHIVE_INTERVAL_H)
     if getattr(cfg, "janitor_dedup_enabled", False):
-        _add("janitor", janitor.dedup_tick, "interval", weeks=1)
+        _add("janitor", janitor.dedup_tick, "interval",
+             misfire_grace_time=GRACE_WEEKLY, weeks=1)
 
     # ── Distiller: nightly at 2am, with startup catch-up ─────────────────────────
     # cron, not interval: interval-24h restarts its countdown on every daemon
@@ -147,9 +178,15 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
         else:
             log.info("distiller.scheduled_skipped", reason="distiller_mode=on_demand")
 
-    # ── Consolidator: every consolidator_min_interval_s seconds ───────────────
+    # ── Consolidator: three independently-scheduled responsibilities ──────────
+    # Labeling, synthesis, and wiki-stub generation communicate only through
+    # persisted state.clusters (synthesis skips unlabeled clusters and picks
+    # them up next interval), so a slow LLM synthesis batch can no longer
+    # delay labeling or stub generation. All keep the legacy 30-min cadence.
     consolidate_s = int(getattr(cfg, "consolidator_min_interval_s", 1800))
-    _add("consolidator", consolidator.tick, "interval", seconds=consolidate_s)
+    _add("consolidator", consolidator.label_tick, "interval", seconds=consolidate_s)
+    _add("consolidator", consolidator.synthesis_tick, "interval", seconds=consolidate_s)
+    _add("consolidator", consolidator.stubs_tick, "interval", seconds=consolidate_s)
 
     # ── Curator: inbox poll every 10s ─────────────────────────────────────────
     _add("curator", curator.tick, "interval", seconds=10)

@@ -1,8 +1,55 @@
 # Alfred Redesign — The Distill Organ & Two-Lane Vault
 
-**Status:** PROPOSED — for Ben's review before any code changes
-**Date:** 2026-06-20
+**Status:** ACTIVE — reconciled 2026-07-13 against the live tree (post AUDIT-2026-07-13
+phase-1 hardening). The decisions in §7 remain locked; the core plan (Phases 1–4) is
+still unexecuted, still coherent, and still worth executing — see the reconciliation
+note below before starting.
+**Date:** 2026-06-20 (original) · 2026-07-13 (status reconciliation)
 **Goal:** Make the vault simple and worth opening for a human, *without* losing (in fact while improving) its function as queryable AI memory.
+
+---
+
+## Reconciliation note — what changed since 2026-06-20 (read before executing)
+
+Verified against the code and the live main vault on 2026-07-13
+(AUDIT-2026-07-13.md structural item #9):
+
+**Already done elsewhere — drop from this plan:**
+- **Phase 0 / §4.4 log rotation** — implemented in `src/alfred/runner.py`'s hourly
+  housekeeping job (copytruncate rotation + retention caps on rotated generations
+  and `state.json.backup-*` snapshots), deployed fleet-wide in phase-1 hardening
+  (commit 7bcbd36). `data/alfred.log` is now capped; the 105 MB figure in §1 is history.
+- **Distiller cadence** — the distiller now runs nightly (cron 2am + one-shot
+  catch-up) in **all six** vaults, and a `distiller.mode: scheduled | on_demand`
+  config plus `DistillerDaemon.trigger_sweep()` already exist — §4.1's
+  "trigger on session-end" idea has a ready hook point.
+
+**Superseded terminology — mechanism still valid, names are not:**
+- Every **Milvus** reference is now **LanceDB** (`src/alfred/store/lancedb_store.py`);
+  the migration happened in May. §4.1's dedup-on-write should query the surveyor's
+  LanceDB index; §6 step 4's re-index likewise.
+- The vault already has a janitor-managed **`_archived/`** dir (absorbed/completed
+  sessions ≥90 days → `_archived/session/`). The plan's `_archive/` lane should
+  standardize on `_archived/` rather than introduce a second archive root.
+- Cited line numbers in §4 have drifted slightly (e.g. `_EXTRACT_SYSTEM` is now
+  `distiller.py:90`); treat them as landmarks, not coordinates.
+
+**Still unimplemented — the actual remaining plan:** two-lane layout (§3.1),
+bi-modal insight notes + 7-type taxonomy (§3.2–3.3, §4.1), janitor
+resolve-to-archive for the orphan/dupe backlog (§4.2), `Home.md` + weekly digest
+(§4.3), `inbox/processed/` TTL purge + bi-temporal supersede (§4.4), the one-time
+migration (§6). `insight` is still absent from `core/schema.py` `KNOWN_TYPES`.
+
+**The diagnosed problem has worsened since June:** `inbox/processed/` grew from
+1,935 to **5,039** files; `session/` sits at 5,198. There is still no `raw/` lane,
+no `garden/`, no `Home.md`. §1's disease is live, not historical.
+
+**New context since this was written:**
+- The **Employment vault** (added 2026-06-22) postdates this doc — include it in
+  any rollout that touches shared daemon code.
+- The **Content vault** is dormant (config + data dir, no service, excluded from
+  meta fan-out) pending AUDIT quick-win #22's wire-up/decommission decision —
+  exclude it until that resolves.
 
 ---
 

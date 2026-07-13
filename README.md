@@ -60,3 +60,4 @@ and `alfred-watchdog.timer` for self-healing. See the runbook for operations.
 
 - [RUNBOOK.md](RUNBOOK.md) — day-to-day operations: services, querying, feedback, recovery
 - [AUDIT-2026-07-13.md](AUDIT-2026-07-13.md) — structural audit: known gaps and prioritized roadmap
+- [DISTILL-REDESIGN.md](DISTILL-REDESIGN.md) — ACTIVE plan: distill organ + two-lane vault (reconciled 2026-07-13; Phases 1–4 pending)

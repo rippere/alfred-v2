@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from alfred.config import AlfredConfig
+from alfred.config import AlfredConfig, _deep_merge
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -72,7 +72,12 @@ def _snapshot(cfg: AlfredConfig) -> dict:
 def test_every_yaml_key_is_consumed(config_name, tmp_path):
     src = REPO_ROOT / config_name
     assert src.exists(), f"{config_name} missing from repo root"
-    raw = yaml.safe_load(src.read_text())
+    # Vault configs are slim overrides merged over config-base.yaml at load
+    # time. Test the MERGED document so base keys are covered by the dead-key
+    # guard too. No base file is copied into tmp_path, so load() sees exactly
+    # this merged doc — same effective config as production.
+    base = yaml.safe_load((REPO_ROOT / "config-base.yaml").read_text())
+    raw = _deep_merge(base, yaml.safe_load(src.read_text()))
 
     # Load from a tmp copy so relative data_dir resolves inside tmp_path and
     # the test never touches the live data-*/ dirs.

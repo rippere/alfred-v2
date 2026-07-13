@@ -41,14 +41,30 @@ if _game_active; then
     exit 0
 fi
 
-declare -A SERVICES=(
-    [alfred]="$WORK_DIR/data/alfred.pid"
-    [alfred-personal]="$WORK_DIR/data-personal/alfred.pid"
-    [alfred-finance]="$WORK_DIR/data-finance/alfred.pid"
-    [alfred-neuroscience]="$WORK_DIR/data-neuroscience/alfred.pid"
-    [alfred-employment]="$WORK_DIR/data-employment/alfred.pid"
-    [alfred-mcp-http]=""
-)
+# ── service roster ────────────────────────────────────────────────────────────
+# Populated at runtime from config-meta.yaml via scripts/alfred-roster.sh (the
+# single source of truth — audit structural #3), so a vault added with
+# `alfred create-vault` is monitored on the next 5-minute run with no edit here.
+# If the helper or config-meta.yaml is unreadable we fall back to the hardcoded
+# roster below — the watchdog must never die from a roster parse failure.
+ROSTER_HELPER="$WORK_DIR/scripts/alfred-roster.sh"
+declare -A SERVICES=()
+if roster_out="$("$ROSTER_HELPER" watchdog 2>/dev/null)" && [[ -n "$roster_out" ]]; then
+    while IFS=$'\t' read -r roster_unit roster_pid_file; do
+        [[ -n "$roster_unit" ]] && SERVICES["$roster_unit"]="$roster_pid_file"
+    done <<< "$roster_out"
+else
+    echo "[watchdog] roster helper failed — using hardcoded fallback roster"
+    SERVICES=(
+        [alfred]="$WORK_DIR/data/alfred.pid"
+        [alfred-personal]="$WORK_DIR/data-personal/alfred.pid"
+        [alfred-finance]="$WORK_DIR/data-finance/alfred.pid"
+        [alfred-neuroscience]="$WORK_DIR/data-neuroscience/alfred.pid"
+        [alfred-employment]="$WORK_DIR/data-employment/alfred.pid"
+    )
+fi
+# Not a vault (absent from config-meta.yaml) — always in the watchdog set.
+SERVICES[alfred-mcp-http]=""
 
 _clear_stale_pid() {
     local pid_file="$1"
@@ -156,7 +172,8 @@ for svc in "${!SERVICES[@]}"; do
     # actually fixed (4/46 successes overall, all alfred-finance). Every other
     # service goes straight tier 1 → tier 3; each tier-2 run is a live costed
     # API call.
-    if [[ "$svc" == "alfred-finance" ]]; then
+    # (matches both the pre-migration named unit and the alfred@ template form)
+    if [[ "$svc" == "alfred-finance" || "$svc" == "alfred@finance" ]]; then
         echo "[watchdog] ${svc}: tier 1 failed — escalating to Claude healer (tier 2)"
         if _tier2_claude_heal "$svc" "$pid_file"; then
             echo "[watchdog] ${svc}: healed by Claude (tier 2)"

@@ -10,6 +10,9 @@ Environment="HOME=/home/rippere"
 ExecStart=/home/rippere/alfred-v2/.venv/bin/python -m alfred.mcp.server_http
 Restart=on-failure
 RestartSec=5s
+# Soft memory ceiling (throttle, not kill) — AUDIT-2026-07-13 structural #7.
+# Observed MemoryPeak 84M (2026-07-13); 1G is ample for the HTTP MCP server.
+MemoryHigh=1G
 
 [Install]
 WantedBy=default.target

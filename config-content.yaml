@@ -1,6 +1,8 @@
+# Content vault. Fleet-wide defaults live in config-base.yaml — keys here are
+# this vault's intentional deviations (deep merge, this file wins).
 vault:
   path: /mnt/external/vault-content
-  ignore_dirs:
+  ignore_dirs:                # replaces the base list wholesale
     - published
     - _archived
     - _templates
@@ -8,19 +10,9 @@ vault:
 
 data_dir: ./data-content
 
-ollama:
-  base_url: http://localhost:11434
-  embed_model: nomic-embed-text
-  llm_model: mistral:latest
-
 janitor:
-  sweep_interval_s: 7200     # every 2h — content files are shorter, quicker pass
+  sweep_interval_s: 7200      # every 2h — content files are shorter, quicker pass
   deep_interval_h: 48
-  max_bytes_per_call: 8000
-  dedup_enabled: false
-
-distiller:
-  mode: scheduled             # nightly at 2am — extracts reusable hooks/angles from what worked
 
 api_budget:
   max_calls_per_day: 100      # tighter budget — content vault is smaller
@@ -28,8 +20,3 @@ api_budget:
 
 query:
   top_k: 6
-  hopfield_beta: 2.0
-
-synthesis:
-  anthropic_model: claude-sonnet-4-6
-  openrouter_model: x-ai/grok-4.1-fast

@@ -1,37 +1,6 @@
+# Employment vault. Fleet-wide defaults live in config-base.yaml —
+# keys here override the base (deep merge, this file wins).
 vault:
   path: /mnt/external/vault-employment
-  ignore_dirs:
-    - inbox
-    - wiki
-    - _archived
-    - _templates
-    - _bases
-    - .obsidian
 
 data_dir: ./data-employment
-
-ollama:
-  base_url: http://localhost:11434
-  embed_model: nomic-embed-text
-  llm_model: mistral:latest
-
-janitor:
-  sweep_interval_s: 14400
-  deep_interval_h: 24
-  max_bytes_per_call: 8000
-  dedup_enabled: false    # disabled until dry-run gate is tested
-
-distiller:
-  mode: scheduled         # scheduled = nightly at 2am | on_demand = explicit trigger only
-
-api_budget:
-  max_calls_per_day: 500
-  warn_at_calls: 400
-
-query:
-  top_k: 8
-  hopfield_beta: 2.0
-
-synthesis:
-  anthropic_model: claude-sonnet-4-6
-  openrouter_model: x-ai/grok-4.1-fast
