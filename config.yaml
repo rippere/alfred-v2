@@ -1,42 +1,13 @@
+# Main vault (ai-systems). Fleet-wide defaults live in config-base.yaml —
+# keys here override the base (deep merge, this file wins).
 vault:
   path: /mnt/external/obsidian-vault
-  ignore_dirs:
-    - inbox
-    - wiki
-    - _archived
-    - _templates
-    - _bases
-    - .obsidian
 
 data_dir: ./data
 
-ollama:
-  base_url: http://localhost:11434
-  embed_model: nomic-embed-text
-  llm_model: mistral:latest
-
+# Explicit clustering tuning for the main vault (matches current defaults but
+# pinned deliberately — this is the largest vault and recluster cost is real).
 surveyor:
   hdbscan_min_cluster_size: 2
   hdbscan_min_samples: 1
   embed_dims: 768
-
-janitor:
-  sweep_interval_s: 14400
-  deep_interval_h: 24
-  max_bytes_per_call: 8000
-  dedup_enabled: false    # disabled until dry-run gate is tested
-
-distiller:
-  mode: scheduled         # scheduled = nightly at 2am | on_demand = explicit trigger only
-
-api_budget:
-  max_calls_per_day: 500
-  warn_at_calls: 400
-
-query:
-  top_k: 8
-  hopfield_beta: 2.0
-
-synthesis:
-  anthropic_model: claude-sonnet-4-6
-  openrouter_model: x-ai/grok-4.1-fast

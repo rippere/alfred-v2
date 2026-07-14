@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import structlog
-from alfred.store.milvus import SearchHit
+from alfred.store.types import SearchHit
 
 log = structlog.get_logger()
 

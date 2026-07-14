@@ -1,0 +1,6 @@
+# Employment vault. Fleet-wide defaults live in config-base.yaml —
+# keys here override the base (deep merge, this file wins).
+vault:
+  path: /mnt/external/vault-employment
+
+data_dir: ./data-employment

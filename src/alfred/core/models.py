@@ -85,3 +85,6 @@ class PipelineState:
     api_calls_today: int = 0
     api_calls_date: str = ""
     api_cost_usd_today: float = 0.0
+    # ISO-8601 UTC timestamp until which all API calls are paused (set when a
+    # recognized failure signature, e.g. credit exhaustion, is recorded).
+    api_paused_until: str = ""

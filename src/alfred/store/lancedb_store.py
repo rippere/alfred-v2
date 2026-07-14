@@ -18,8 +18,8 @@ import structlog
 
 log = structlog.get_logger()
 
-# Re-export SearchHit from milvus so importers don't have to change.
-from alfred.store.milvus import SearchHit  # noqa: F401
+# Re-export SearchHit from the shared types module so importers don't have to change.
+from alfred.store.types import SearchHit  # noqa: F401
 
 # Substrings that mark a *corrupt table* (interrupted-write damage: zero-byte
 # manifests, truncated fragments) as opposed to a transient/operational error
@@ -44,6 +44,58 @@ _MAX_QUARANTINES_PER_DAY = 3
 def _looks_like_corruption(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(m in msg for m in _CORRUPTION_MARKERS)
+
+
+# Journal lines that look like a process kill (OOM-killer, SIGKILL escalation,
+# unit killed).  Used by the best-effort kill-context scan below so a
+# quarantine alert arrives with its probable cause attached.
+_KILL_PATTERN = r"oom.kill|out of memory|oom_reaper|signal=KILL|SIGKILL|code=killed"
+
+
+def _recent_kill_context(hours: int = 48, max_lines: int = 20) -> str:
+    """Best-effort journal scan for kill/OOM events preceding a corruption.
+
+    Corrupt Lance tables are caused by a process dying mid-commit (OOM-killer,
+    SIGKILL, or an unclean host shutdown — the 2026-05-27 incident was a hard
+    power-off).  This grabs any kill-shaped journal lines from the last
+    ``hours`` plus the recent boot boundaries (an unclean shutdown shows up
+    only as a boot with no shutdown sequence), so the quarantine alert can be
+    *diagnosed*, not just recovered from.
+
+    Never raises and is bounded by subprocess timeouts — diagnostics must not
+    break or stall the self-heal path.
+    """
+    import subprocess
+
+    sections: list[str] = []
+    scans = (
+        ("user journal", ["journalctl", "--user", "--since", f"-{hours}h",
+                          "-o", "short-iso", "--no-pager", "-q", "-g", _KILL_PATTERN]),
+        ("kernel journal", ["journalctl", "-k", "--since", f"-{hours}h",
+                            "-o", "short-iso", "--no-pager", "-q", "-g", _KILL_PATTERN]),
+    )
+    for label, cmd in scans:
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+        except Exception:
+            continue
+        if out:
+            lines = out.splitlines()[-max_lines:]
+            sections.append(f"[{label}]\n" + "\n".join(lines))
+    # Boot boundaries: a crash/power-loss kill leaves no journal line at all —
+    # it is visible only as a boot whose predecessor ended without a shutdown.
+    try:
+        boots = subprocess.run(
+            ["journalctl", "--list-boots", "--no-pager", "-q"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if boots:
+            sections.append("[recent boots]\n" + "\n".join(boots.splitlines()[-3:]))
+    except Exception:
+        pass
+    return "\n\n".join(sections)
 
 
 class LanceDBStore:
@@ -170,23 +222,38 @@ class LanceDBStore:
 
         Without this, silent self-heal would hide a recurring data-loss bug.
         """
+        # Attach kill-context so the alert arrives diagnosed, not just healed.
+        # _recent_kill_context never raises; a failed scan just yields "".
+        kill_ctx = _recent_kill_context()
+        if kill_ctx:
+            log.info("lancedb.quarantine_kill_context", name=collection, context=kill_ctx)
         try:
             inbox = Path("/mnt/external/obsidian-vault/inbox")
             if not inbox.is_dir():
                 return
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             note = inbox / f"alfred-lancedb-corruption-{stamp}.md"
+            kill_section = (
+                f"## Kill context (journal scan, last 48h)\n\n```\n{kill_ctx}\n```\n\n"
+                if kill_ctx
+                else "## Kill context\n\nJournal scan returned nothing.\n\n"
+            )
             note.write_text(
                 "# Alfred LanceDB table auto-quarantined\n\n"
                 f"- Table: `{collection}`\n"
                 f"- Quarantined to: `{dest}`\n"
                 f"- Error: `{exc}`\n"
                 "- Action: recreated empty; surveyor will re-embed the corpus.\n"
-                "- Follow up: interrupted-write cause (OOM / SIGKILL mid-commit).\n\n"
+                "- Follow up: interrupted-write cause (OOM / SIGKILL mid-commit / "
+                "unclean shutdown) — see kill context below, and run "
+                "`scripts/alfred-oom-correlate.sh` for a 7-day correlation.\n\n"
+                f"{kill_section}"
                 "<!-- alfred:source lancedb_quarantine -->\n"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # Critical: self-heal happened but the operator was never told. Surface
+            # it loudly so a recurring data-loss bug isn't masked by a failed alert.
+            log.warning("lancedb.corruption_alert_failed", collection=collection, error=str(e))
 
     # ------------------------------------------------------------------
     # Write methods
@@ -204,7 +271,8 @@ class LanceDBStore:
         """Insert or update a single chunk.
 
         ``sparse`` is accepted for interface compatibility but not stored —
-        BM25 ranking is handled entirely by BM25Store.
+        this backend does no sparse retrieval; BM25Store serves only the
+        separate ``bm25_only`` offline path.
         """
         import pyarrow as pa
 
@@ -235,7 +303,8 @@ class LanceDBStore:
         proportionally.
 
         Each row dict needs: ``chunk_id``, ``dense``, ``record_type``, ``name``,
-        ``chunk_index``.  ``sparse`` is accepted and ignored (BM25Store owns it).
+        ``chunk_index``.  ``sparse`` is accepted and ignored — this backend
+        stores no sparse vectors (retrieval is dense-only).
         """
         if not rows:
             return
@@ -287,11 +356,11 @@ class LanceDBStore:
         top_k: int = 8,
         include_inbox: bool = False,
     ) -> list[SearchHit]:
-        """Dense cosine search.  BM25/sparse component is handled upstream.
+        """Dense cosine search — retrieval on this backend is dense-only.
 
-        ``sparse_vec`` is accepted for interface parity but ignored here —
-        the BM25Store already does sparse scoring and the QueryEngine merges
-        results from both paths via RRF-style re-ranking.
+        ``sparse_vec`` is accepted for interface parity with MilvusStore but
+        ignored: no sparse/BM25 component contributes to this ranking.  BM25
+        is used only by the QueryEngine's separate ``bm25_only`` offline path.
         """
         results = (
             self._tbl

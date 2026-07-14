@@ -1,0 +1,8 @@
+[Unit]
+Description=Alfred failure alert to vault inbox for %i
+Documentation=file:///home/rippere/alfred-v2/deploy/systemd/INSTALL.md
+
+[Service]
+Type=oneshot
+ExecStart=/home/rippere/alfred-v2/scripts/alfred-alert-inbox.sh %i
+Environment="HOME=/home/rippere"

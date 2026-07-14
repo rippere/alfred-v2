@@ -1,0 +1,13 @@
+[Unit]
+Description=Alfred Notion Page Ingest
+After=network-online.target
+Wants=network-online.target
+OnFailure=alfred-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/mnt/external/Projects/personal-alfred
+Environment=HOME=/home/rippere
+ExecStart=/usr/bin/python3 /mnt/external/Projects/personal-alfred/notion_ingest.py
+StandardOutput=append:/mnt/external/Projects/personal-alfred/data/notion_ingest.log
+StandardError=append:/mnt/external/Projects/personal-alfred/data/notion_ingest.log
