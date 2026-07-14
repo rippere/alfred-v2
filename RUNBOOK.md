@@ -24,10 +24,10 @@ A personal memory system. Everything you work on and learn gets captured here, i
 
 ```bash
 # Status of all 5 vault services
-systemctl --user status alfred alfred-neuroscience alfred-finance alfred-personal alfred-employment
+systemctl --user status alfred alfred@neuroscience alfred@finance alfred@personal alfred@employment
 
 # Restart everything
-systemctl --user restart alfred alfred-neuroscience alfred-finance alfred-personal alfred-employment alfred-mcp-http
+systemctl --user restart alfred alfred@neuroscience alfred@finance alfred@personal alfred@employment alfred-mcp-http
 
 # Tail logs (main vault)
 tail -f /home/rippere/alfred-v2/data/alfred.log
@@ -133,10 +133,10 @@ ls /mnt/external/obsidian-vault/inbox/
 | Vault | Path | Config | Service |
 |---|---|---|---|
 | Main (AI/software) | `/mnt/external/obsidian-vault` | `config.yaml` | `alfred.service` |
-| Neuroscience | `/mnt/external/vault-neuroscience` | `config-neuroscience.yaml` | `alfred-neuroscience.service` |
-| Finance | `/mnt/external/vault-finance` | `config-finance.yaml` | `alfred-finance.service` |
-| Personal | `/mnt/external/vault-personal` | `config-personal.yaml` | `alfred-personal.service` |
-| Employment | `/mnt/external/vault-employment` | `config-employment.yaml` | `alfred-employment.service` |
+| Neuroscience | `/mnt/external/vault-neuroscience` | `config-neuroscience.yaml` | `alfred@neuroscience.service` |
+| Finance | `/mnt/external/vault-finance` | `config-finance.yaml` | `alfred@finance.service` |
+| Personal | `/mnt/external/vault-personal` | `config-personal.yaml` | `alfred@personal.service` |
+| Employment | `/mnt/external/vault-employment` | `config-employment.yaml` | `alfred@employment.service` |
 | Content (dormant) | `/mnt/external/vault-content` | `config-content.yaml` | *(none — see content section above)* |
 
 Supporting units: `alfred-mcp-http.service` (HTTP API on :8765), `alfred-watchdog.timer`
@@ -149,13 +149,13 @@ Supporting units: `alfred-mcp-http.service` (HTTP API on :8765), `alfred-watchdo
 
 ```bash
 # Check if all services are running
-systemctl --user is-active alfred alfred-neuroscience alfred-finance alfred-personal alfred-employment
+systemctl --user is-active alfred alfred@neuroscience alfred@finance alfred@personal alfred@employment
 
 # Service stuck? Check the log for errors
 tail -50 /home/rippere/alfred-v2/data/alfred.log | grep -i error
 
 # Nuclear restart
-systemctl --user restart alfred alfred-neuroscience alfred-finance alfred-personal alfred-employment alfred-mcp-http
+systemctl --user restart alfred alfred@neuroscience alfred@finance alfred@personal alfred@employment alfred-mcp-http
 
 # Sessions not showing up? Check the inbox
 ls -la /mnt/external/obsidian-vault/inbox/

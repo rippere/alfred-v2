@@ -29,20 +29,14 @@ UnsetEnvironment=CLAUDECODE
 ExecStart=/home/rippere/alfred-v2/.venv/bin/alfred up --config /home/rippere/alfred-v2/config-%i.yaml
 Restart=on-failure
 RestartSec=10s
+# Soft ceiling only (throttle, don't kill) — sized from observed satellite peaks
+# (audit structural #7). The kernel reclaims above this; no OOM-kill risk added.
+MemoryHigh=2G
 # The main alfred.service additionally carries MemoryMax=6G / OOMPolicy=stop /
 # TimeoutStopSec=30 (post-incident hardening for the largest vault). The old
 # per-vault units never had those, so they are intentionally NOT set here to
 # keep migration behavior-identical. To add them per-instance later:
 #   systemctl --user edit alfred@<vault>   (drop-in override)
-#
-# Soft memory ceiling (throttle, not kill) — AUDIT-2026-07-13 structural #7.
-# A swap-thrashing memory blowup is the suspected contributor to mid-write
-# LanceDB corruption. The live per-vault units carry the same value (added
-# 2026-07-13), so migration stays behavior-identical. Observed satellite
-# MemoryPeaks 213-748M; 2G is generous headroom for a full re-embed while
-# still catching a true runaway early. NOT a hard MemoryMax — we want
-# throttling, never a SIGKILL mid-Lance-commit.
-MemoryHigh=2G
 StandardOutput=append:/home/rippere/alfred-v2/data-%i/alfred.log
 StandardError=append:/home/rippere/alfred-v2/data-%i/alfred.log
 

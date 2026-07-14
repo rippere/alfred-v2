@@ -57,10 +57,10 @@ else
     echo "[watchdog] roster helper failed — using hardcoded fallback roster"
     SERVICES=(
         [alfred]="$WORK_DIR/data/alfred.pid"
-        [alfred-personal]="$WORK_DIR/data-personal/alfred.pid"
-        [alfred-finance]="$WORK_DIR/data-finance/alfred.pid"
-        [alfred-neuroscience]="$WORK_DIR/data-neuroscience/alfred.pid"
-        [alfred-employment]="$WORK_DIR/data-employment/alfred.pid"
+        [alfred@personal]="$WORK_DIR/data-personal/alfred.pid"
+        [alfred@finance]="$WORK_DIR/data-finance/alfred.pid"
+        [alfred@neuroscience]="$WORK_DIR/data-neuroscience/alfred.pid"
+        [alfred@employment]="$WORK_DIR/data-employment/alfred.pid"
     )
 fi
 # Not a vault (absent from config-meta.yaml) — always in the watchdog set.
