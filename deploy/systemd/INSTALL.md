@@ -46,3 +46,33 @@ Required keys: `LEDGER_SUPABASE_URL`, `LEDGER_SUPABASE_ANON_KEY`,
 /home/rippere/alfred-v2/.venv/bin/alfred ledger backfill --since 2026-05-01
 /home/rippere/alfred-v2/.venv/bin/alfred ledger show --days 35
 ```
+
+## x402 tripwire watcher
+
+The timer fires `alfred tripwire check` once a month (1st, 09:00 local) and
+writes a HOLD / FLIP-TO-GO / ABANDON-WEDGE verdict note to the Alfred inbox,
+per the ADR-001 flip/abandon triggers.
+
+```bash
+cp /home/rippere/alfred-v2/deploy/systemd/alfred-tripwire.service ~/.config/systemd/user/
+cp /home/rippere/alfred-v2/deploy/systemd/alfred-tripwire.timer   ~/.config/systemd/user/
+
+systemctl --user daemon-reload
+systemctl --user enable --now alfred-tripwire.timer
+
+# verify
+systemctl --user list-timers alfred-tripwire.timer
+systemctl --user start alfred-tripwire.service   # run once now
+journalctl --user -u alfred-tripwire.service -n 50 --no-pager
+```
+
+Before the first run, fill in this month's signals:
+
+```bash
+cp /home/rippere/alfred-v2/tripwire-signals.yaml.example /home/rippere/alfred-v2/data/tripwire-signals.yaml
+$EDITOR /home/rippere/alfred-v2/data/tripwire-signals.yaml
+```
+
+The check exits non-zero (and the timer's `OnFailure=` fires an inbox alert)
+if the signals file is missing or malformed — it never silently defaults to
+HOLD on bad input.

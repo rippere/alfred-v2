@@ -451,3 +451,7 @@ def mcp(
 # Daily life-ledger KPI snapshots: `alfred ledger collect|backfill|show`.
 from alfred.ledger.cli import ledger_app  # noqa: E402
 app.add_typer(ledger_app, name="ledger")
+
+# Monthly x402 tripwire watcher: `alfred tripwire check`.
+from alfred.tripwire.cli import tripwire_app  # noqa: E402
+app.add_typer(tripwire_app, name="tripwire")
