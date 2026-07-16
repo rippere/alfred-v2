@@ -133,6 +133,20 @@ class AlfredConfig:
     hopfield_beta: float = 2.0
     graph_hops: int = 2
     graph_decay: float = 0.5
+    # DEPRECATED / UNSUPPORTED: bm25_only enables a lightweight query mode that
+    # skips Milvus/Ollama entirely and searches only the stored BM25 corpus at
+    # bm25_path. That corpus is a frozen, point-in-time snapshot — it is built
+    # solely by the archived one-off script scripts/_archive/phase4_rebuild_milvus.py
+    # and is never refreshed by the live surveyor pipeline, so any vault content
+    # added or changed after that snapshot is invisible to this path and it will
+    # silently drift stale over time. LanceDBStore (the live vector_store backend)
+    # also documents that it accepts-but-ignores sparse/BM25 vectors — LanceDB
+    # retrieval is dense-only. Wiring BM25 into the live pipeline so this flag
+    # reflects current vault state is a real feature (tracked separately, out of
+    # scope for this fix) and requires a deliberate product decision; until then,
+    # treat bm25_only as unsupported/deprecated rather than a viable production
+    # retrieval mode. QueryEngine.query() logs a runtime warning whenever this is
+    # enabled.
     bm25_only: bool = False   # lightweight mode: skip Milvus/Ollama, use stored BM25 corpus
 
     # Wiki
