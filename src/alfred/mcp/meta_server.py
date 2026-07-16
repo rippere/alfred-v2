@@ -51,16 +51,10 @@ def _query_one_vault(
     synthesis: bool,
 ) -> list[dict[str, Any]]:
     """Run a query against a single vault engine. Returns list of hit dicts."""
-    from alfred.query.engine import QueryOptions
+    from alfred.mcp.defaults import build_query_options
 
     try:
-        opts = QueryOptions(
-            top_k=top_k,
-            use_hopfield=True,
-            use_graph=True,
-            include_synthesis=synthesis,
-            include_inbox=False,
-        )
+        opts = build_query_options(top_k=top_k, include_synthesis=synthesis)
         result = engine.query(query, opts)
         hits = []
         for h in result.hits:
@@ -137,24 +131,22 @@ async def _parallel_search(
     limit: int,
 ) -> list[dict[str, Any]]:
     """Fire vault_search across all vaults in parallel."""
-    from alfred.core.vault_ops import vault_search as _vault_search
+    from alfred.mcp.tools import vault_search_impl
 
     async def run_one(vault_name: str, cfg: Any) -> list[dict[str, Any]]:
         loop = asyncio.get_event_loop()
 
         def _search():
-            results = _vault_search(
-                cfg.vault_path,
-                grep_pattern=query,
-                ignore_dirs=cfg.ignore_dirs,
+            results = vault_search_impl(
+                cfg,
+                query=query,
+                record_type=record_type,
+                status=status,
+                limit=limit,
             )
-            if record_type:
-                results = [r for r in results if r.get("type") == record_type]
-            if status:
-                results = [r for r in results if r.get("status") == status]
             for r in results:
                 r["vault"] = vault_name
-            return results[:limit]
+            return results
 
         return await loop.run_in_executor(None, _search)
 
@@ -248,36 +240,17 @@ def run_meta_server(meta_config_path: Path) -> None:
         Args:
             entity_name: Name of the entity (person, concept, project, etc.)
         """
-        from alfred.core.vault_ops import vault_read
+        from alfred.mcp.tools import vault_entity_lookup_impl
         from alfred.store.state import StateStore
 
         all_results = []
-        key = entity_name.lower()
 
         for vault_name, cfg in vault_cfgs:
             try:
-                state_store = StateStore(cfg.state_path)
-                state_store.load()
-                state = state_store.state
-                page = state.wiki_pages.get(key)
-                if not page:
+                res = vault_entity_lookup_impl(cfg, StateStore(cfg.state_path), entity_name)
+                if not res["found"]:
                     continue
-                try:
-                    rec = vault_read(cfg.vault_path, page.rel_path)
-                    body = rec["body"][:2000]
-                except Exception:
-                    body = ""
-                all_results.append({
-                    "vault": vault_name,
-                    "found": True,
-                    "entity": page.entity_name,
-                    "type": page.entity_type,
-                    "path": page.rel_path,
-                    "known_facts": page.known_facts,
-                    "related": page.related,
-                    "sources": page.sources,
-                    "body": body,
-                })
+                all_results.append({"vault": vault_name, **res})
             except Exception as e:
                 print(f"[warn] entity_lookup failed for vault '{vault_name}': {e}", file=sys.stderr)
 
@@ -288,21 +261,14 @@ def run_meta_server(meta_config_path: Path) -> None:
     @mcp.tool()
     def vault_status() -> dict[str, Any]:
         """Return statistics for all configured vaults."""
+        from alfred.mcp.tools import vault_status_impl
         from alfred.store.state import StateStore
 
         per_vault = {}
         for vault_name, cfg in vault_cfgs:
             try:
-                store = StateStore(cfg.state_path)
-                store.load()
-                per_vault[vault_name] = {
-                    "vault_path": str(cfg.vault_path),
-                    "files_tracked": store.file_count(),
-                    "files_embedded": store.embedded_count(),
-                    "chunks": store.chunk_count(),
-                    "clusters": store.cluster_count(),
-                    "wiki_pages": store.wiki_page_count(),
-                }
+                stats = vault_status_impl(StateStore(cfg.state_path))
+                per_vault[vault_name] = {"vault_path": str(cfg.vault_path), **stats}
             except Exception as e:
                 per_vault[vault_name] = {"error": str(e)}
 

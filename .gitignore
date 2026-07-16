@@ -21,3 +21,9 @@ data.backup-*/
 
 # uv cache
 .cache/
+
+# content-vault runtime data + stray tool outputs
+data-content/
+data-employment/
+openscad_mcp.log
+query_timing.txt

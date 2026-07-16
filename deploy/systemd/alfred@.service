@@ -1,0 +1,44 @@
+# alfred@.service — template unit for per-vault Alfred daemons.
+#
+# %i is the vault name: alfred@personal, alfred@finance, alfred@neuroscience,
+# alfred@employment (and alfred@content if that vault is ever wired up).
+# It maps to config-%i.yaml and data-%i/ in /home/rippere/alfred-v2.
+#
+# The MAIN vault stays on the non-template `alfred.service` — its config is
+# plain config.yaml and its data dir is data/ (no -suffix), so it does not fit
+# the %i naming scheme. Do not create an alfred@main instance.
+#
+# Replaces the copy-pasted alfred-<vault>.service units (audit structural #2).
+# Migration: deploy/migrate-to-template-units.sh (run by the main session).
+
+[Unit]
+Description=Alfred — %i vault
+After=network-online.target
+Wants=network-online.target
+# Start-rate limiting belongs in [Unit] — systemd ignores it in [Service].
+# 5 restarts / 300s -> stop, instead of an unbounded crash-loop.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+WorkingDirectory=/home/rippere/alfred-v2
+Environment="HOME=/home/rippere"
+Environment="PYTHONUNBUFFERED=1"
+UnsetEnvironment=CLAUDECODE
+ExecStart=/home/rippere/alfred-v2/.venv/bin/alfred up --config /home/rippere/alfred-v2/config-%i.yaml
+Restart=on-failure
+RestartSec=10s
+# Soft ceiling only (throttle, don't kill) — sized from observed satellite peaks
+# (audit structural #7). The kernel reclaims above this; no OOM-kill risk added.
+MemoryHigh=2G
+# The main alfred.service additionally carries MemoryMax=6G / OOMPolicy=stop /
+# TimeoutStopSec=30 (post-incident hardening for the largest vault). The old
+# per-vault units never had those, so they are intentionally NOT set here to
+# keep migration behavior-identical. To add them per-instance later:
+#   systemctl --user edit alfred@<vault>   (drop-in override)
+StandardOutput=append:/home/rippere/alfred-v2/data-%i/alfred.log
+StandardError=append:/home/rippere/alfred-v2/data-%i/alfred.log
+
+[Install]
+WantedBy=default.target

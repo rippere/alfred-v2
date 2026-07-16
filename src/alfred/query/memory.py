@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from alfred.core.models import MemoryStrength, PipelineState
-from alfred.store.milvus import SearchHit
+from alfred.store.types import SearchHit
 
 
 def adjust_scores(hits: list[SearchHit], state: PipelineState) -> list[SearchHit]:

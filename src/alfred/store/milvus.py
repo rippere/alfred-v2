@@ -1,12 +1,19 @@
-"""Milvus Lite store — hybrid dense+sparse schema."""
+"""Milvus Lite store — legacy backend, superseded by LanceDBStore.
+
+MilvusStore itself implements a hybrid dense+sparse schema (RRF over dense
+cosine + sparse BM25 legs), but it is no longer the live backend: production
+runs LanceDBStore, whose retrieval is dense-only. Kept for the legacy
+``vector_store: milvus`` config path until fully removed.
+"""
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import structlog
+
+from alfred.store.types import SearchHit  # noqa: F401  — moved to types.py; re-exported for back-compat
 
 try:
     from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
@@ -37,16 +44,6 @@ def _auto_reconnect(method):
 COLLECTION = "vault_v2"
 
 
-@dataclass
-class SearchHit:
-    chunk_id: str
-    rel_path: str
-    score: float
-    record_type: str = ""
-    name: str = ""
-    rerank_score: float = 0.0
-
-
 class MilvusStore:
     def __init__(self, uri: str, embed_dims: int = 768, collection: str = COLLECTION) -> None:
         if MilvusClient is None:
@@ -75,8 +72,10 @@ class MilvusStore:
         """Re-open the MilvusClient after the internal subprocess crashes."""
         try:
             self._client.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # Expected: the client's subprocess already crashed — we're about to
+            # reconnect. Record it at debug so it's greppable without log spam.
+            log.debug("milvus.close_failed", error=str(e))
         for attempt in range(4):
             try:
                 self._client = MilvusClient(uri=self.uri)
