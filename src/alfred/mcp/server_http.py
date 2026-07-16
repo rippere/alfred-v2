@@ -7,6 +7,11 @@ Optional auth: set ALFRED_HTTP_TOKEN in the environment to require a Bearer
 token in the Authorization header.  When the variable is unset the server
 allows unauthenticated connections (preserving local-only behaviour).
 
+If the token IS set, enforcement is all-or-nothing: the server verifies the
+auth middleware is really in the ASGI stack and exits rather than serve
+unauthenticated.  A configured-but-unenforced token is a false safety
+guarantee — it passes every config-level check while the door stands open.
+
 The stdio server (server.py) for the desktop remains unchanged.
 
 Tool bodies live in alfred.mcp.tools (shared with the stdio and meta
@@ -43,10 +48,38 @@ def _make_auth_middleware(token: str | None):
     return BearerAuthMiddleware
 
 
+def _attach_auth_middleware(app, token: str) -> None:
+    """Attach Bearer auth to *app*, or refuse to start.
+
+    A token that is configured but not enforced is worse than no token at all:
+    every config- and grep-level check passes while the server stays wide open.
+    So this does not treat "no exception was raised" as proof of attachment —
+    it reads the ASGI stack back and confirms the middleware actually landed.
+    Any failure is fatal by design.
+    """
+    AuthMiddleware = _make_auth_middleware(token)
+    try:
+        app.add_middleware(AuthMiddleware)
+    except Exception as e:  # noqa: BLE001 — any failure here must be fatal
+        raise SystemExit(
+            "ALFRED_HTTP_TOKEN is set but the Bearer-auth middleware could not be "
+            f"attached ({e!r}). Refusing to start an unauthenticated server."
+        ) from e
+
+    attached = [mw.cls for mw in getattr(app, "user_middleware", [])]
+    if AuthMiddleware not in attached:
+        raise SystemExit(
+            "ALFRED_HTTP_TOKEN is set but the Bearer-auth middleware is absent from "
+            f"the ASGI stack after add_middleware() (stack: {[c.__name__ for c in attached]}). "
+            "Refusing to start an unauthenticated server."
+        )
+
+
 def run_server(config_path: Path, host: str = "127.0.0.1", port: int = 8765) -> None:
     """Start the FastMCP HTTP/SSE server. Blocks until interrupted."""
     try:
         import fastmcp
+        import uvicorn
     except ImportError:
         raise SystemExit("fastmcp not installed. Run: uv pip install fastmcp")
 
@@ -63,24 +96,19 @@ def run_server(config_path: Path, host: str = "127.0.0.1", port: int = 8765) -> 
     mcp = fastmcp.FastMCP("alfred")
     register_tools(mcp, ToolDeps(cfg=cfg, state_store=state_store, engine=engine))
 
+    # Build the ASGI app explicitly rather than letting mcp.run() own it, so the
+    # auth middleware can be attached to a real app and verified before we bind.
+    app = mcp.http_app(transport="streamable-http")
+
     # Optional Bearer-token authentication.
-    # If ALFRED_HTTP_TOKEN is set, attach the middleware to the underlying
-    # Starlette app before starting.  FastMCP exposes the raw ASGI app via
-    # .app or ._app depending on the version — try both.
     http_token = os.environ.get("ALFRED_HTTP_TOKEN")
     if http_token:
-        AuthMiddleware = _make_auth_middleware(http_token)
-        try:
-            raw_app = getattr(mcp, "app", None) or getattr(mcp, "_app", None)
-            if raw_app is not None:
-                raw_app.add_middleware(AuthMiddleware)
-        except Exception as e:
-            # Middleware attachment failed — fall through and start without auth
-            # (safe because we're bound to loopback). Warn: a token was configured
-            # but isn't being enforced, which is a security-relevant surprise.
-            log.warning("mcp.auth_middleware_attach_failed", error=str(e))
+        _attach_auth_middleware(app, http_token)  # fatal if it cannot be enforced
+        log.info("mcp.auth_enabled", host=host, port=port)
+    else:
+        log.warning("mcp.auth_disabled", host=host, port=port)
 
-    mcp.run(transport="streamable-http", host=host, port=port)
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
