@@ -20,12 +20,11 @@ def test_adjust_scores_applies_modifier_when_strength_present():
     state = PipelineState()
     strength = MemoryStrength(rel_path="notes/a.md")
     state.memory["notes/a.md"] = strength
-    hits = [SearchHit(chunk_id="a::chunk_00", rel_path="notes/a.md", score=1.0)]
+    hits = [SearchHit(chunk_id="a::chunk_00", rel_path="notes/a.md", score=0.6)]
 
     result = adjust_scores(hits, state)
 
-    assert result[0].score == strength.score_modifier() * 1.0
-    assert result[0].score != 1.0 or strength.score_modifier() == 1.0
+    assert result[0].score == strength.score_modifier() * 0.6
 
 
 def test_adjust_scores_modifies_hits_in_place_and_returns_same_list():
