@@ -36,6 +36,34 @@ def _lock_for_path(path: Path) -> threading.RLock:
         return lock
 
 
+# Module-level registry tracking which thread currently holds the sidecar
+# flock for a given resolved path, and how many nested transaction() calls
+# deep that thread is. flock(2) locks are scoped to the open-file-description
+# that took them, not to the process or thread — so re-entering transaction()
+# on the same thread (nested `with store.transaction():`, same or a
+# different GraphStore instance pointed at the same path) would open a
+# *second*, distinct fd and call flock() on it, which blocks forever on the
+# lock this exact thread already holds via the first fd (self-deadlock).
+# This registry lets a reentrant call detect "this thread already holds the
+# flock for this path" and skip opening/locking a second fd, incrementing a
+# depth counter instead — mirroring how threading.RLock treats reentry as a
+# no-op. Access is only ever mutated while the caller already holds the
+# path's shared RLock (see transaction() below), so the dict itself only
+# needs _locks_guard to protect first-creation of an entry, same as
+# _path_locks.
+_flock_state: dict[str, dict] = {}
+
+
+def _flock_state_for_path(path: Path) -> dict:
+    key = str(Path(path).resolve())
+    with _locks_guard:
+        state = _flock_state.get(key)
+        if state is None:
+            state = {"thread_id": None, "depth": 0}
+            _flock_state[key] = state
+        return state
+
+
 class GraphStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -81,18 +109,55 @@ class GraphStore:
         so concurrent processes' load/mutate/save sequences interleave and
         lose writes just as badly as if there were no lock at all. The
         flock is acquired for the whole transaction, matching the RLock's
-        scope, and held across nested load()/save() calls the same way
-        (flock is per-open-file-description, so re-entering while already
-        holding it is a harmless no-op, not a deadlock).
+        scope.
+
+        Reentrancy is thread/process-aware, NOT a free byproduct of flock:
+        flock(2) locks are scoped to the open-file-description that took
+        them, not the process or thread that opened it. Opening a fresh fd
+        and calling flock(LOCK_EX) on it blocks until the lock is free —
+        even if the very same thread already holds LOCK_EX via a different
+        fd. So naively re-entering transaction() on the same thread (nested
+        `with store.transaction():`, same or a different GraphStore
+        instance pointed at the same path) would self-deadlock: the outer
+        call's fd holds the lock, and the inner call's new fd blocks on it
+        forever. The module-level `_flock_state` registry (keyed by
+        resolved path) tracks which thread currently holds the flock for
+        this path and how many transaction() calls deep it is; a call
+        detected as reentrant on the same thread skips opening/locking a
+        second fd and just bumps the depth counter, exactly mirroring how
+        threading.RLock treats same-thread re-entry as a no-op. The flock
+        fd is only actually opened/acquired at depth 0->1 and only
+        released/closed at depth 1->0, so cross-process exclusion (the
+        reason this lock exists at all) is untouched — a genuinely
+        different process still blocks on flock() until this one's
+        outermost transaction() exits.
         """
         with self._lock:
-            lock_fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o644)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            state = _flock_state_for_path(self.path)
+            current_thread = threading.get_ident()
+            if state["depth"] > 0 and state["thread_id"] == current_thread:
+                # Reentrant on the same thread — this thread already holds
+                # the flock for this path via an fd opened by an outer
+                # transaction() call. Track depth only; do not touch the fd.
+                state["depth"] += 1
                 try:
                     yield self
                 finally:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    state["depth"] -= 1
+                return
+
+            lock_fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                state["thread_id"] = current_thread
+                state["depth"] = 1
+                try:
+                    yield self
+                finally:
+                    state["depth"] -= 1
+                    if state["depth"] == 0:
+                        state["thread_id"] = None
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
             finally:
                 os.close(lock_fd)
 

@@ -219,3 +219,114 @@ def test_concurrent_real_subprocesses_no_lost_writes_no_crash(graph_path, tmp_pa
     )
 
     assert not list(graph_path.parent.glob(f".{graph_path.name}.*.tmp"))
+
+
+def test_nested_transaction_same_thread_same_instance_no_deadlock(graph_path):
+    """Regression: transaction() opens a brand-new fd and flock()s it on
+    every call. flock(2) is scoped to the open-file-description that took
+    it, not the process or thread — so a naive re-entry (nested
+    `with store.transaction():` on the same thread, same instance) opens a
+    *second* fd whose flock() blocks forever on the lock the outer fd
+    already holds, a self-deadlock. Runs the nested calls in a background
+    daemon thread with a hard join timeout so a regression fails fast
+    instead of hanging the whole test suite.
+    """
+    store = GraphStore(graph_path)
+    completed = threading.Event()
+
+    def body() -> None:
+        with store.transaction():
+            store.load()
+            with store.transaction():  # nested — same thread, same instance
+                store.add_edges_from_wikilinks("a.md", ["b.md"])
+            store.save()
+        completed.set()
+
+    t = threading.Thread(target=body, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    assert completed.is_set(), (
+        "nested transaction() on the same thread/instance hung — "
+        "flock self-deadlock regression"
+    )
+
+    g = pickle.loads(graph_path.read_bytes())
+    assert set(g.nodes) >= {"a.md", "b.md"}
+
+
+def test_nested_transaction_same_thread_different_instances_no_deadlock(graph_path):
+    """Same regression, but the nested call comes from a second,
+    independently-constructed GraphStore(path) — the shape surveyor.py /
+    consolidator.py actually use (each daemon builds its own instance). The
+    module-level _path_locks registry already shares the RLock across
+    instances for the same path; the flock reentry tracking must be shared
+    the same way, keyed by resolved path rather than by instance.
+    """
+    outer = GraphStore(graph_path)
+    completed = threading.Event()
+
+    def body() -> None:
+        with outer.transaction():
+            outer.load()
+            inner = GraphStore(graph_path)
+            with inner.transaction():  # nested — same thread, different instance
+                inner.load()
+                inner.add_edges_from_wikilinks("c.md", ["d.md"])
+                inner.save()
+        completed.set()
+
+    t = threading.Thread(target=body, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    assert completed.is_set(), (
+        "nested transaction() across independently-constructed instances on "
+        "the same thread hung — flock self-deadlock regression"
+    )
+
+    g = pickle.loads(graph_path.read_bytes())
+    assert set(g.nodes) >= {"c.md", "d.md"}
+
+
+def test_different_thread_still_blocks_not_a_reentrancy_bypass(graph_path):
+    """Guard against an over-eager fix that makes flock reentry global
+    instead of per-thread: a second, genuinely different thread must still
+    be blocked out while the first thread's transaction() is open — it must
+    NOT be treated as already holding the lock just because some thread does.
+    The cross-process fix from c4a4a35 depends on this: real concurrent
+    holders (other threads, other processes) must still serialize.
+    """
+    store = GraphStore(graph_path)
+    order: list[str] = []
+    first_in = threading.Event()
+    let_first_finish = threading.Event()
+
+    def first() -> None:
+        with store.transaction():
+            order.append("first-enter")
+            first_in.set()
+            let_first_finish.wait(timeout=10)
+            order.append("first-exit")
+
+    def second() -> None:
+        first_in.wait(timeout=10)
+        with store.transaction():
+            order.append("second-enter")
+
+    t1 = threading.Thread(target=first, daemon=True)
+    t2 = threading.Thread(target=second, daemon=True)
+    t1.start()
+    first_in.wait(timeout=10)
+    t2.start()
+
+    # second() must still be blocked — first() hasn't released yet.
+    t2.join(timeout=1)
+    assert t2.is_alive(), (
+        "second thread entered transaction() while the first thread still "
+        "held it — flock reentrancy tracking leaked across threads"
+    )
+
+    let_first_finish.set()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert not t1.is_alive() and not t2.is_alive()
+    assert order == ["first-enter", "first-exit", "second-enter"]
