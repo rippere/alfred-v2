@@ -115,6 +115,11 @@ class DistillerDaemon(BaseDaemon):
     def __init__(self, cfg, state, events) -> None:
         super().__init__(cfg, state, events)
         self._last_run = 0.0  # epoch 0 ensures first run fires immediately
+        # Failed topic-append count for the current/most-recent sweep. Reset at
+        # the start of each _distill_sweep() call so it reflects just that tick.
+        # Not persisted — surfaced via the distiller.sweep_done log line so a
+        # human/monitor can notice non-zero failures (audit: dropped writes).
+        self.failed_appends_this_tick = 0
 
     async def run(self) -> None:
         self.log.info("distiller.start", mode=getattr(self.cfg, "distiller_mode", "scheduled"))
@@ -156,6 +161,7 @@ class DistillerDaemon(BaseDaemon):
         now_iso = datetime.now(timezone.utc).isoformat()
         distilled_count = 0
         learn_count = 0
+        self.failed_appends_this_tick = 0
 
         for rel_path, fs in list(state.files.items()):
             if is_daemon_generated(rel_path, generated_by=fs.__dict__.get("generated_by")):
@@ -181,7 +187,12 @@ class DistillerDaemon(BaseDaemon):
             })
             if len(state.distiller_runs) > 30:
                 state.distiller_runs = state.distiller_runs[-30:]
-            self.log.info("distiller.sweep_done", files=distilled_count, learned=learn_count)
+            self.log.info(
+                "distiller.sweep_done",
+                files=distilled_count,
+                learned=learn_count,
+                failed_appends=self.failed_appends_this_tick,
+            )
             await self.save_state()
 
     async def _distill_file(self, vault_path: Path, rel_path: str) -> int:
@@ -279,8 +290,17 @@ class DistillerDaemon(BaseDaemon):
                     state.files[rel_path].learn_records_created.append(result["path"])
                 created += 1
                 self.log.debug("distiller.appended_topic", path=result["path"], title=title)
-            except VaultError:
-                pass
+            except VaultError as e:
+                # This runs after a successful, already-billed Anthropic API call —
+                # losing the write here silently would burn spend for nothing and
+                # leave zero trace. Log it and count it so it's observable instead.
+                self.failed_appends_this_tick += 1
+                self.log.warning(
+                    "distiller.topic_append_failed",
+                    path=rel_path,
+                    title=title,
+                    error=str(e),
+                )
 
         return created
 
