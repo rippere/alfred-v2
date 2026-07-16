@@ -9,6 +9,8 @@ Interface mirrors MilvusStore exactly so callers don't need to change.
 """
 from __future__ import annotations
 
+import fcntl
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -163,11 +165,54 @@ class LanceDBStore:
     def _quarantine_and_recreate(self, collection: str, exc: Exception):
         """Move a corrupt table aside (reversible) and recreate it empty.
 
-        Gated by a rolling-24h circuit breaker: a persistent corruption cause
-        would otherwise quarantine on every restart, shredding the store.  When
-        the breaker trips we re-raise so the service fails loudly for a human.
+        Cross-process coordination: without a lock, two processes opening the
+        same corrupted table both pass the corruption check and both decide to
+        quarantine. Whichever loses the ``mode="create"`` race then crashes on
+        "table already exists" instead of healing, and the two racing
+        ``_MAX_QUARANTINES_PER_DAY`` reads/moves can double-count (or miscount)
+        the breaker window. An flock on a sidecar lock file (alongside the
+        table directory, not inside it — quarantine moves the table dir itself)
+        serializes the *entire* detect-and-recreate sequence across processes.
+        The loser blocks on the lock, and once it wakes up re-checks whether
+        the table already opens cleanly (the winner having just recreated it)
+        before doing anything destructive — if so it simply joins the winner's
+        fresh table as a reader instead of re-quarantining or crashing.
         """
         base = Path(self.uri)
+        lock_path = base / f".{collection}.quarantine.lock"
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                return self._quarantine_and_recreate_locked(collection, exc, base)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+    def _quarantine_and_recreate_locked(self, collection: str, exc: Exception, base: Path):
+        """Body of :meth:`_quarantine_and_recreate`, run while holding the lock.
+
+        Re-detects corruption first: another process may have already won this
+        race and recreated the table (or fixed it some other way) while this
+        one was blocked waiting for the lock, in which case there is nothing
+        left to quarantine — just open the now-healthy table as a reader.
+        """
+        import lancedb
+
+        self._db = lancedb.connect(self.uri)
+        try:
+            tbl = self._db.open_table(collection)
+        except Exception:
+            pass
+        else:
+            log.info("lancedb.quarantine_lost_race_joined_winner", name=collection)
+            # A sibling process just recreated this table empty; treat it the
+            # same as if *we* had recreated it so callers (runner.py) still
+            # invalidate embed state and force a full re-embed.
+            self.was_recreated = True
+            return tbl
+
         cutoff = datetime.now().timestamp() - 24 * 3600
         recent = [
             p for p in base.glob(".quarantine-corrupt-*")
@@ -199,7 +244,6 @@ class LanceDBStore:
             # its creation time), so the circuit-breaker's 24h mtime window
             # would never see freshly-quarantined dirs.  Stamp it to now so the
             # breaker can actually count recent quarantines.
-            import os
             os.utime(dest, None)
         log.error(
             "lancedb.table_quarantined",
