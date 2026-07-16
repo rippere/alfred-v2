@@ -19,6 +19,7 @@ servers); this module only owns the HTTP transport + Bearer-auth specifics.
 """
 from __future__ import annotations
 
+import hmac
 import os
 from pathlib import Path
 
@@ -41,7 +42,8 @@ def _make_auth_middleware(token: str | None):
             if token is None:
                 return await call_next(request)
             auth_header = request.headers.get("Authorization", "")
-            if auth_header == f"Bearer {token}":
+            # Constant-time: a short-circuiting == leaks the token byte-by-byte via timing.
+            if hmac.compare_digest(auth_header, f"Bearer {token}"):
                 return await call_next(request)
             return Response("Unauthorized", status_code=401)
 
@@ -100,8 +102,17 @@ def run_server(config_path: Path, host: str = "127.0.0.1", port: int = 8765) -> 
     # auth middleware can be attached to a real app and verified before we bind.
     app = mcp.http_app(transport="streamable-http")
 
-    # Optional Bearer-token authentication.
+    # Optional Bearer-token authentication. Unset -> open (documented mode). But SET is
+    # all-or-nothing: a set-but-empty token must never degrade to open, because that is
+    # exactly how it happens in practice — Environment="ALFRED_HTTP_TOKEN=${SECRET}" with
+    # SECRET unset expands to "" and the operator believes the door is locked.
     http_token = os.environ.get("ALFRED_HTTP_TOKEN")
+    if http_token is not None and not http_token.strip():
+        raise SystemExit(
+            "ALFRED_HTTP_TOKEN is set but empty/whitespace. Refusing to start: a "
+            "configured-but-blank token reads as 'auth on' to every config check while "
+            "serving unauthenticated. Unset it to run open, or give it a real value."
+        )
     if http_token:
         _attach_auth_middleware(app, http_token)  # fatal if it cannot be enforced
         log.info("mcp.auth_enabled", host=host, port=port)

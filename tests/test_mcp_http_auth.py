@@ -207,3 +207,44 @@ def test_add_middleware_raising_is_fatal_not_silent(monkeypatch):
         server_http._attach_auth_middleware(_BoomApp(), TOKEN)
 
     assert "Refusing to start an unauthenticated server" in str(excinfo.value)
+
+
+def test_set_but_empty_token_is_fatal_not_open(monkeypatch, served_app):
+    """A configured-but-blank token must never degrade to an open server.
+
+    Environment="ALFRED_HTTP_TOKEN=${SECRET}" with SECRET unset expands to "".
+    A truthiness check treats that as "no auth configured" and serves wide open
+    while every config-level check reports auth is on — the same class of silent
+    false guarantee this module exists to prevent.
+    """
+    monkeypatch.setenv("ALFRED_HTTP_TOKEN", "")
+    with pytest.raises(SystemExit) as excinfo:
+        served_app()
+    assert "empty" in str(excinfo.value).lower()
+
+
+def test_whitespace_only_token_is_fatal_not_open(monkeypatch, served_app):
+    monkeypatch.setenv("ALFRED_HTTP_TOKEN", "   ")
+    with pytest.raises(SystemExit) as excinfo:
+        served_app()
+    assert "empty" in str(excinfo.value).lower()
+
+
+def test_token_comparison_is_constant_time(monkeypatch, served_app):
+    """Guards against a regression back to `==`, which leaks the token via timing."""
+    import inspect
+
+    src = inspect.getsource(server_http._make_auth_middleware)
+    assert "compare_digest" in src, "Bearer comparison must be constant-time"
+
+    # And it must still actually work.
+    monkeypatch.setenv("ALFRED_HTTP_TOKEN", TOKEN)
+    with TestClient(served_app()) as client:
+        ok = client.post(
+            "/mcp", json=INIT_BODY, headers={**INIT_HEADERS, "Authorization": f"Bearer {TOKEN}"}
+        )
+        bad = client.post(
+            "/mcp", json=INIT_BODY, headers={**INIT_HEADERS, "Authorization": "Bearer wrong"}
+        )
+    assert ok.status_code == 200
+    assert bad.status_code == 401
