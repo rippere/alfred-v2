@@ -4,7 +4,73 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import structlog
 import yaml
+
+log = structlog.get_logger()
+
+# Shared-defaults file merged UNDER each vault config (vault file wins).
+BASE_CONFIG_NAME = "config-base.yaml"
+
+# Every YAML key path AlfredConfig.load() actually consumes. Keys present in a
+# merged config but absent here are dead weight — load() warns on them (the
+# check that would have caught `distiller.stale_days` / `consolidator.*`).
+_CONSUMED_KEYS: frozenset[tuple[str, ...]] = frozenset({
+    ("vault", "path"),
+    ("vault", "ignore_dirs"),
+    ("data_dir",),
+    ("ollama", "base_url"),
+    ("ollama", "embed_model"),
+    ("ollama", "llm_model"),
+    ("surveyor", "hdbscan_min_cluster_size"),
+    ("surveyor", "hdbscan_min_samples"),
+    ("surveyor", "embed_dims"),
+    ("vector_store",),           # plain-string form
+    ("vector_store", "backend"),  # mapping form
+    ("query", "top_k"),
+    ("query", "hopfield_beta"),
+    ("query", "bm25_only"),
+    ("janitor", "sweep_interval_s"),
+    ("janitor", "deep_interval_h"),
+    ("janitor", "max_bytes_per_call"),
+    ("janitor", "dedup_enabled"),
+    ("distiller", "mode"),
+    ("api_budget", "max_calls_per_day"),
+    ("api_budget", "warn_at_calls"),
+    ("synthesis", "anthropic_model"),
+    ("synthesis", "openrouter_model"),
+})
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursive dict merge; override wins. Non-dict values (incl. lists such
+    as vault.ignore_dirs) are replaced wholesale, never concatenated."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _warn_unused_keys(raw: dict, source: Path) -> None:
+    """structlog-warn on any merged YAML leaf key that load() never consumes.
+
+    Non-fatal by design: an unknown key means silent drift (set but ignored),
+    which deserves a log line, not a crashed vault daemon."""
+    def _walk(node, prefix: tuple[str, ...]) -> None:
+        if isinstance(node, dict) and node:
+            for key, value in node.items():
+                _walk(value, prefix + (str(key),))
+        elif prefix not in _CONSUMED_KEYS:
+            log.warning(
+                "config_unused_key",
+                key=".".join(prefix),
+                file=str(source),
+                hint="set in YAML but consumed by no AlfredConfig field",
+            )
+    _walk(raw, ())
 
 
 def load_env(config_path: Path) -> None:
@@ -107,7 +173,18 @@ class AlfredConfig:
         if not path.exists():
             raise FileNotFoundError(f"Config not found: {path}")
 
-        raw = yaml.safe_load(path.read_text())
+        raw = yaml.safe_load(path.read_text()) or {}
+
+        # Deep-merge shared defaults from config-base.yaml sitting next to the
+        # loaded file, lowest precedence first:
+        #   dataclass defaults <- config-base.yaml <- the vault's own file
+        # The vault file always wins.
+        base_path = path.parent / BASE_CONFIG_NAME
+        if base_path.is_file() and path.resolve() != base_path.resolve():
+            base_raw = yaml.safe_load(base_path.read_text()) or {}
+            raw = _deep_merge(base_raw, raw)
+
+        _warn_unused_keys(raw, path)
 
         vault_path = Path(raw["vault"]["path"]).expanduser()
         data_dir_raw = raw.get("data_dir", "./data")

@@ -1,0 +1,22 @@
+# Content vault. Fleet-wide defaults live in config-base.yaml — keys here are
+# this vault's intentional deviations (deep merge, this file wins).
+vault:
+  path: /mnt/external/vault-content
+  ignore_dirs:                # replaces the base list wholesale
+    - published
+    - _archived
+    - _templates
+    - .obsidian
+
+data_dir: ./data-content
+
+janitor:
+  sweep_interval_s: 7200      # every 2h — content files are shorter, quicker pass
+  deep_interval_h: 48
+
+api_budget:
+  max_calls_per_day: 100      # tighter budget — content vault is smaller
+  warn_at_calls: 80
+
+query:
+  top_k: 6

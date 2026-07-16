@@ -1,0 +1,12 @@
+[Unit]
+Description=Sync ECC procedural instincts into the Alfred vault inbox
+OnFailure=alfred-alert@%n.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/rippere
+Environment=XDG_DATA_HOME=/home/rippere/.local/share
+ExecStart=/home/rippere/.claude/integrations/ecc-instinct-bridge/sync-instincts-to-vault.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ecc-instinct-sync

@@ -3,9 +3,14 @@ Description=Alfred life-ledger daily KPI snapshot
 Documentation=file:///home/rippere/alfred-v2/deploy/systemd/INSTALL.md
 After=network-online.target
 Wants=network-online.target
+OnFailure=alfred-alert@%n.service
 
 [Service]
 Type=oneshot
+# Dead-man's switch: verify the alfred-watchdog heartbeat is fresh before the
+# daily collect (piggybacks on this timer instead of adding a new one). The
+# check script always exits 0 so a stale heartbeat never blocks collection.
+ExecStartPre=/home/rippere/alfred-v2/scripts/alfred-heartbeat-check.sh
 # Collect today's snapshot and push it to NovaCRM (push degrades to a dry-run
 # if ~/.config/alfred-ledger/env is missing required credentials).
 ExecStart=/home/rippere/alfred-v2/.venv/bin/alfred ledger collect --push

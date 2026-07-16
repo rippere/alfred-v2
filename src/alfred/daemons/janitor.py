@@ -35,6 +35,7 @@ log = structlog.get_logger()
 SWEEP_INTERVAL = 3600.0     # structural scan every hour
 DEEP_INTERVAL = 86400.0     # LLM enrichment once per day
 DEDUP_INTERVAL = 604800.0   # dedup sweep once per week (7 days)
+ARCHIVE_INTERVAL = 86400.0  # session archival once per day
 
 
 class IssueCode(str, Enum):
@@ -56,6 +57,7 @@ class JanitorDaemon(BaseDaemon):
         self._last_sweep = float("-inf")
         self._last_deep = float("-inf")
         self._last_dedup = float("-inf")
+        self._last_archive = float("-inf")
         self._stem_index: dict[str, set[str]] = {}
 
     async def run(self) -> None:
@@ -75,6 +77,9 @@ class JanitorDaemon(BaseDaemon):
                 if dedup_enabled and now - self._last_dedup > DEDUP_INTERVAL:
                     await self._dedup_sweep()
                     self._last_dedup = now
+                if now - self._last_archive > ARCHIVE_INTERVAL:
+                    await self.session_archive_tick()
+                    self._last_archive = now
                 await asyncio.sleep(60.0)
         finally:
             await self.save_state()
@@ -102,6 +107,21 @@ class JanitorDaemon(BaseDaemon):
             await self._dedup_sweep()
         except Exception as e:
             self.log.error("janitor.dedup_tick_error", error=str(e))
+
+    async def session_archive_tick(self) -> None:
+        """One-shot session archival — called by APScheduler daily.
+
+        Moves absorbed/completed sessions older than 90 days to _archived/.
+        Split out of the structural sweep so a slow archival pass can never
+        delay the hourly structural lint (and vice versa).
+        """
+        try:
+            archived = await self._archive_sessions(self.cfg.vault_path)
+            if archived:
+                self.log.info("janitor.sessions_archived", count=archived)
+                await self.save_state()
+        except Exception as e:
+            self.log.error("janitor.session_archive_tick_error", error=str(e))
 
     # ── Stage 1: structural scan ───────────────────────────────────────────────
 
@@ -152,11 +172,6 @@ class JanitorDaemon(BaseDaemon):
         fixed = await self._autofix(issues, vault_path)
         if fixed:
             self.log.info("janitor.autofixed", count=len(fixed))
-
-        # Stage 2b: archive stale absorbed/completed sessions
-        archived = await self._archive_sessions(vault_path)
-        if archived:
-            self.log.info("janitor.sessions_archived", count=archived)
 
         # Record sweep in state
         state.janitor_sweeps.append({

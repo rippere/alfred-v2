@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from datetime import date
 from pathlib import Path
 
 import frontmatter
+import structlog
 import yaml
 
 from alfred.core.schema import (
@@ -18,9 +20,20 @@ from alfred.core.schema import (
     REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
 )
 
+log = structlog.get_logger()
+
 
 class VaultError(Exception):
     pass
+
+
+# Serializes vault file mutations (create/edit/move) within this process.
+# Daemon file I/O already hops threads via asyncio.to_thread (surveyor's
+# embedding/HDBSCAN work), so two jobs can otherwise interleave inside a
+# check-then-write or read-modify-write window and corrupt/clobber a record.
+# threading.RLock rather than asyncio.Lock because these functions are
+# synchronous and must stay so — call sites across 5 daemons depend on it.
+_write_lock = threading.RLock()
 
 
 def compute_md5(path: Path) -> str:
@@ -70,8 +83,6 @@ def vault_create(
     directory = TYPE_DIRECTORY.get(record_type, record_type)
     rel_path = f"{directory}/{name}.md"
     fp = _resolve(vault_path, rel_path)
-    if fp.exists():
-        raise VaultError(f"Already exists: {rel_path}")
 
     fm: dict = {"type": record_type}
     title_field = NAME_FIELD_BY_TYPE.get(record_type, "name")
@@ -86,8 +97,11 @@ def vault_create(
             raise VaultError(f"Invalid status {status!r} for {record_type}")
 
     final_body = body if body is not None else f"# {name}\n"
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    fp.write_text(_serialize(fm, final_body), encoding="utf-8")
+    with _write_lock:  # exists-check + write must be one atomic window
+        if fp.exists():
+            raise VaultError(f"Already exists: {rel_path}")
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(_serialize(fm, final_body), encoding="utf-8")
     return {"path": rel_path}
 
 
@@ -101,34 +115,35 @@ def vault_edit(
     body_append: str | None = None,
 ) -> dict:
     fp = _resolve(vault_path, rel_path)
-    if not fp.exists():
-        raise VaultError(f"File not found: {rel_path}")
-    fm, body = _parse(fp)
-    changed: list[str] = []
+    with _write_lock:  # hold across the full read-modify-write window
+        if not fp.exists():
+            raise VaultError(f"File not found: {rel_path}")
+        fm, body = _parse(fp)
+        changed: list[str] = []
 
-    if set_fields:
-        for k, v in set_fields.items():
-            fm[k] = v
-            changed.append(k)
-    if append_fields:
-        for k, v in append_fields.items():
-            existing = fm.get(k)
-            if existing is None:
-                fm[k] = [v] if k in LIST_FIELDS else v
-            elif isinstance(existing, list):
-                if v not in existing:
-                    existing.append(v)
-            else:
-                fm[k] = [existing, v]
-            changed.append(k)
-    if body_replace is not None:
-        body = body_replace
-        changed.append("body")
-    if body_append:
-        body = body.rstrip() + "\n\n" + body_append + "\n"
-        changed.append("body_append")
+        if set_fields:
+            for k, v in set_fields.items():
+                fm[k] = v
+                changed.append(k)
+        if append_fields:
+            for k, v in append_fields.items():
+                existing = fm.get(k)
+                if existing is None:
+                    fm[k] = [v] if k in LIST_FIELDS else v
+                elif isinstance(existing, list):
+                    if v not in existing:
+                        existing.append(v)
+                else:
+                    fm[k] = [existing, v]
+                changed.append(k)
+        if body_replace is not None:
+            body = body_replace
+            changed.append("body")
+        if body_append:
+            body = body.rstrip() + "\n\n" + body_append + "\n"
+            changed.append("body_append")
 
-    fp.write_text(_serialize(fm, body), encoding="utf-8")
+        fp.write_text(_serialize(fm, body), encoding="utf-8")
     return {"path": rel_path, "fields_changed": changed}
 
 
@@ -153,7 +168,8 @@ def _find_richest_topic_by_tag(vault_path: Path, tags: list[str]) -> str | None:
     for md_file in topic_dir.glob("*.md"):
         try:
             post = frontmatter.load(str(md_file))
-        except Exception:
+        except Exception as e:
+            log.debug("vault_ops.frontmatter_skip", path=str(md_file), where="find_richest_topic", error=str(e))
             continue
         file_tags_raw = post.metadata.get("tags", [])
         if not isinstance(file_tags_raw, list):
@@ -249,12 +265,13 @@ def vault_delete(vault_path: Path, rel_path: str) -> dict:
 def vault_move(vault_path: Path, from_path: str, to_path: str) -> dict:
     src = _resolve(vault_path, from_path)
     dst = _resolve(vault_path, to_path)
-    if not src.exists():
-        raise VaultError(f"Source not found: {from_path}")
-    if dst.exists():
-        raise VaultError(f"Destination exists: {to_path}")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src.rename(dst)
+    with _write_lock:  # exists-checks + rename must be one atomic window
+        if not src.exists():
+            raise VaultError(f"Source not found: {from_path}")
+        if dst.exists():
+            raise VaultError(f"Destination exists: {to_path}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
     return {"from": from_path, "to": to_path}
 
 
@@ -281,7 +298,8 @@ def vault_search(
         try:
             post = frontmatter.load(str(md_file))
             fm = post.metadata
-        except Exception:
+        except Exception as e:
+            log.debug("vault_ops.frontmatter_skip", path=str(md_file), where="vault_search", error=str(e))
             fm = {}
         rel_str = str(rel).replace("\\", "/")
         results.append({
@@ -303,7 +321,8 @@ def vault_context(vault_path: Path, ignore_dirs: list[str] | None = None) -> dic
             continue
         try:
             post = frontmatter.load(str(md_file))
-        except Exception:
+        except Exception as e:
+            log.debug("vault_ops.frontmatter_skip", path=str(md_file), where="vault_context", error=str(e))
             continue
         rec_type = post.metadata.get("type", "")
         if not rec_type:

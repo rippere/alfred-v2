@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from alfred.core.models import (
@@ -27,6 +28,16 @@ _PRICE_INPUT = 3.00 / 1_000_000
 _PRICE_CACHE_READ = 0.30 / 1_000_000
 _PRICE_OUTPUT = 15.00 / 1_000_000
 
+# Recognized API failure signatures → pause duration in seconds.  When a
+# daemon reports an error matching one of these substrings (via
+# record_api_failure), can_make_api_call() returns False for every daemon
+# until the pause expires — retrying is pointless until the underlying
+# condition (e.g. account credit) changes.
+_FAILURE_SIGNATURES: tuple[tuple[str, float], ...] = (
+    ("credit balance is too low", 3600.0),
+    ("balance is too low", 3600.0),
+)
+
 
 def _decode_state(raw: dict) -> PipelineState:
     state = PipelineState(
@@ -38,6 +49,7 @@ def _decode_state(raw: dict) -> PipelineState:
         api_calls_today=raw.get("api_calls_today", 0),
         api_calls_date=raw.get("api_calls_date", ""),
         api_cost_usd_today=raw.get("api_cost_usd_today", 0.0),
+        api_paused_until=raw.get("api_paused_until", ""),
     )
     for rel_path, f in raw.get("files", {}).items():
         state.files[rel_path] = FileState(**{
@@ -87,8 +99,15 @@ class StateStore:
         return self._state
 
     def save(self) -> None:
-        """Synchronous save — caller must hold self._lock when called from async context."""
-        self.path.write_text(json.dumps(asdict(self._state), indent=2))
+        """Synchronous save — caller must hold self._lock when called from async context.
+
+        Writes to a temp file in the same directory then os.replace()s it into
+        place, so a mid-write kill (OOM, SIGKILL) can never leave a truncated
+        state.json behind — the old file stays intact until the rename.
+        """
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(asdict(self._state), indent=2))
+        os.replace(tmp, self.path)
 
     async def async_save(self) -> None:
         """Async-safe save — acquires the state lock before writing."""
@@ -168,8 +187,46 @@ class StateStore:
         limit = self._cfg.api_max_calls_per_day if self._cfg is not None else 500
         return max(0, limit - state.api_calls_today)
 
+    def record_api_failure(self, error: str, daemon: str = "") -> None:
+        """Match an API error against recognized failure signatures and pause.
+
+        On a match (e.g. Anthropic credit exhaustion) a pause-until timestamp
+        is recorded in state, so can_make_api_call() gates ALL daemons — not
+        just the caller — for the pause duration.  Unrecognized errors are
+        ignored: transient faults should keep retrying on their normal cadence.
+        """
+        for signature, pause_s in _FAILURE_SIGNATURES:
+            if signature in error:
+                until = datetime.now(timezone.utc) + timedelta(seconds=pause_s)
+                self._state.api_paused_until = until.isoformat()
+                _log.warning(
+                    "alfred.api_paused",
+                    daemon=daemon,
+                    signature=signature,
+                    resume_at=self._state.api_paused_until,
+                )
+                return
+
+    def _is_paused(self, daemon: str = "") -> bool:
+        """Return True while a recorded failure pause is still in effect."""
+        paused_until = self._state.api_paused_until
+        if not paused_until:
+            return False
+        try:
+            until = datetime.fromisoformat(paused_until)
+        except ValueError:
+            self._state.api_paused_until = ""
+            return False
+        if datetime.now(timezone.utc) < until:
+            _log.debug("alfred.api_paused_skip", daemon=daemon, resume_at=paused_until)
+            return True
+        self._state.api_paused_until = ""
+        return False
+
     def can_make_api_call(self, daemon: str = "") -> bool:
-        """Return False and log when daily budget is exhausted."""
+        """Return False and log when daily budget is exhausted or a failure pause is active."""
+        if self._is_paused(daemon):
+            return False
         remaining = self.budget_remaining()
         if remaining <= 0:
             _log.warning(

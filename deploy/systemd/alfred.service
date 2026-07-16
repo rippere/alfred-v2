@@ -1,0 +1,38 @@
+[Unit]
+Description=Alfred personal AI daemon (alfred-v2)
+After=network-online.target
+Wants=network-online.target
+# Start-rate limiting belongs in [Unit] — systemd ignores it in [Service].
+# This is the real circuit breaker: 5 restarts / 300s → stop, instead of an
+# unbounded crash-loop.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+WorkingDirectory=/home/rippere/alfred-v2
+Environment="HOME=/home/rippere"
+Environment="PYTHONUNBUFFERED=1"
+UnsetEnvironment=CLAUDECODE
+ExecStart=/home/rippere/alfred-v2/.venv/bin/alfred up
+Restart=on-failure
+RestartSec=10s
+# Cap memory so a recluster/re-embed blowup (7-8 GB peak observed, with multi-GB
+# swap thrash) can't drive the box into the swap thrashing that causes mid-write
+# corruption. 6G clears normal operation (steady state ~0.6 GB) while still
+# stopping a true runaway. OOMPolicy=stop ends the unit cleanly rather than
+# SIGKILL mid-write — a kill mid Lance commit is what corrupts the table.
+MemoryMax=6G
+OOMPolicy=stop
+# Soft ceiling: throttle/reclaim BEFORE the 6G hard cap is ever in play.
+# Observed MemoryPeak 4.34G (2026-07-13, post-restart with re-embed activity);
+# 5G leaves headroom above normal peaks while keeping a 1G throttle band
+# below MemoryMax, so pressure degrades to slow instead of to a kill.
+MemoryHigh=5G
+# Give an in-flight embed/commit time to finish on stop before SIGKILL.
+TimeoutStopSec=30
+StandardOutput=append:/home/rippere/alfred-v2/data/alfred.log
+StandardError=append:/home/rippere/alfred-v2/data/alfred.log
+
+[Install]
+WantedBy=default.target

@@ -95,8 +95,8 @@ class WikiWriter:
             try:
                 rec = vault_read(self.cfg.vault_path, rel_path)
                 source_texts.append(f"[{rel_path}]:\n{rec['body'][:500]}")
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("wiki.source_read_skipped", path=rel_path, error=str(e))
 
         if not source_texts:
             return False

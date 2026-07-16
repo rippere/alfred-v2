@@ -12,6 +12,7 @@ import frontmatter
 import structlog
 
 from alfred.core.anthropic_client import get_client
+from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import VaultError, vault_append_to_topic, vault_read
 from alfred.daemons.base import BaseDaemon
 
@@ -157,10 +158,8 @@ class DistillerDaemon(BaseDaemon):
         learn_count = 0
 
         for rel_path, fs in list(state.files.items()):
-            if rel_path.startswith(("learn/", "topic/", "synthesis/")):
+            if is_daemon_generated(rel_path, generated_by=fs.__dict__.get("generated_by")):
                 continue  # daemon output — never re-distill
-            if fs.__dict__.get("generated_by") == "llm":
-                continue  # skip any file explicitly marked as LLM-generated
             if _is_stale(fs.last_distilled):
                 try:
                     created = await self._distill_file(vault_path, rel_path)
@@ -188,7 +187,8 @@ class DistillerDaemon(BaseDaemon):
     async def _distill_file(self, vault_path: Path, rel_path: str) -> int:
         try:
             rec = vault_read(vault_path, rel_path)
-        except Exception:
+        except Exception as e:
+            self.log.warning("distiller.distill_read_failed", path=rel_path, error=str(e))
             return 0
 
         fm = rec["frontmatter"]
@@ -197,10 +197,8 @@ class DistillerDaemon(BaseDaemon):
 
         if not body or len(body.strip()) < MIN_BODY_LEN:
             return 0
-        if rec_type in ("learn", "topic", "synthesis"):
-            return 0  # daemon output — never re-distill
-        if fm.get("generated_by") == "llm":
-            return 0  # LLM-generated content must not feed back into distillation
+        if is_daemon_generated(record_type=rec_type, generated_by=fm.get("generated_by")):
+            return 0  # daemon output — LLM-generated content must never feed back into distillation
 
         from datetime import date as _date, datetime as _datetime
 
@@ -304,5 +302,6 @@ def _is_stale(last_distilled: str) -> bool:
         last = datetime.fromisoformat(last_distilled)
         days = (datetime.now(timezone.utc) - last).total_seconds() / 86400
         return days >= STALE_DAYS
-    except Exception:
+    except Exception as e:
+        log.debug("distiller.stale_parse_failed", value=last_distilled, error=str(e))
         return True

@@ -7,13 +7,25 @@ Optional auth: set ALFRED_HTTP_TOKEN in the environment to require a Bearer
 token in the Authorization header.  When the variable is unset the server
 allows unauthenticated connections (preserving local-only behaviour).
 
+If the token IS set, enforcement is all-or-nothing: the server verifies the
+auth middleware is really in the ASGI stack and exits rather than serve
+unauthenticated.  A configured-but-unenforced token is a false safety
+guarantee — it passes every config-level check while the door stands open.
+
 The stdio server (server.py) for the desktop remains unchanged.
+
+Tool bodies live in alfred.mcp.tools (shared with the stdio and meta
+servers); this module only owns the HTTP transport + Bearer-auth specifics.
 """
 from __future__ import annotations
 
+import hmac
 import os
 from pathlib import Path
-from typing import Any
+
+import structlog
+
+log = structlog.get_logger()
 
 
 def _make_auth_middleware(token: str | None):
@@ -30,24 +42,53 @@ def _make_auth_middleware(token: str | None):
             if token is None:
                 return await call_next(request)
             auth_header = request.headers.get("Authorization", "")
-            if auth_header == f"Bearer {token}":
+            # Constant-time: a short-circuiting == leaks the token byte-by-byte via timing.
+            if hmac.compare_digest(auth_header, f"Bearer {token}"):
                 return await call_next(request)
             return Response("Unauthorized", status_code=401)
 
     return BearerAuthMiddleware
 
 
+def _attach_auth_middleware(app, token: str) -> None:
+    """Attach Bearer auth to *app*, or refuse to start.
+
+    A token that is configured but not enforced is worse than no token at all:
+    every config- and grep-level check passes while the server stays wide open.
+    So this does not treat "no exception was raised" as proof of attachment —
+    it reads the ASGI stack back and confirms the middleware actually landed.
+    Any failure is fatal by design.
+    """
+    AuthMiddleware = _make_auth_middleware(token)
+    try:
+        app.add_middleware(AuthMiddleware)
+    except Exception as e:  # noqa: BLE001 — any failure here must be fatal
+        raise SystemExit(
+            "ALFRED_HTTP_TOKEN is set but the Bearer-auth middleware could not be "
+            f"attached ({e!r}). Refusing to start an unauthenticated server."
+        ) from e
+
+    attached = [mw.cls for mw in getattr(app, "user_middleware", [])]
+    if AuthMiddleware not in attached:
+        raise SystemExit(
+            "ALFRED_HTTP_TOKEN is set but the Bearer-auth middleware is absent from "
+            f"the ASGI stack after add_middleware() (stack: {[c.__name__ for c in attached]}). "
+            "Refusing to start an unauthenticated server."
+        )
+
+
 def run_server(config_path: Path, host: str = "127.0.0.1", port: int = 8765) -> None:
     """Start the FastMCP HTTP/SSE server. Blocks until interrupted."""
     try:
         import fastmcp
+        import uvicorn
     except ImportError:
         raise SystemExit("fastmcp not installed. Run: uv pip install fastmcp")
 
     from alfred.config import AlfredConfig
-    from alfred.query.engine import QueryEngine, QueryOptions
+    from alfred.mcp.tools import ToolDeps, register_tools
+    from alfred.query.engine import QueryEngine
     from alfred.store.state import StateStore
-    from alfred.core.vault_ops import vault_search as _vault_search, vault_read
 
     cfg = AlfredConfig.load(config_path)
     state_store = StateStore(cfg.state_path)
@@ -55,141 +96,30 @@ def run_server(config_path: Path, host: str = "127.0.0.1", port: int = 8765) -> 
     engine = QueryEngine(cfg)
 
     mcp = fastmcp.FastMCP("alfred")
+    register_tools(mcp, ToolDeps(cfg=cfg, state_store=state_store, engine=engine))
 
-    @mcp.tool()
-    def vault_query(
-        query: str,
-        top_k: int = 8,
-        synthesis: bool = True,
-    ) -> dict[str, Any]:
-        """Full RAG query against the personal knowledge vault.
+    # Build the ASGI app explicitly rather than letting mcp.run() own it, so the
+    # auth middleware can be attached to a real app and verified before we bind.
+    app = mcp.http_app(transport="streamable-http")
 
-        Args:
-            query: Natural language question or topic
-            top_k: Number of chunks to retrieve (default 8)
-            synthesis: Include LLM synthesis of results (default True)
-        """
-        opts = QueryOptions(
-            top_k=top_k,
-            use_hopfield=True,
-            use_graph=True,
-            include_synthesis=synthesis,
-            include_inbox=False,
-        )
-        result = engine.query(query, opts)
-        sources = [
-            {"path": h.rel_path, "type": h.record_type, "score": round(h.rerank_score or h.score, 4)}
-            for h in result.hits
-        ]
-        return {
-            "answer": result.answer or "",
-            "sources": sources,
-            "wiki_hit": result.wiki_hit.rel_path if result.wiki_hit else None,
-        }
-
-    @mcp.tool()
-    def vault_search(
-        query: str | None = None,
-        record_type: str | None = None,
-        status: str | None = None,
-        limit: int = 20,
-    ) -> list[dict[str, Any]]:
-        """Text search the vault. Can filter by type or status.
-
-        Args:
-            query: Optional text substring to search for in file content
-            record_type: Optional type filter (e.g. 'person', 'project', 'note')
-            status: Optional status filter (e.g. 'active', 'done')
-            limit: Max results to return (default 20)
-        """
-        results = _vault_search(
-            cfg.vault_path,
-            grep_pattern=query,
-            ignore_dirs=cfg.ignore_dirs,
-        )
-        if record_type:
-            results = [r for r in results if r.get("type") == record_type]
-        if status:
-            results = [r for r in results if r.get("status") == status]
-        return results[:limit]
-
-    @mcp.tool()
-    def vault_entity_lookup(entity_name: str) -> dict[str, Any]:
-        """Look up a wiki entity page by name.
-
-        Args:
-            entity_name: Name of the entity (person, concept, project, etc.)
-        """
-        state_store.load()
-        state = state_store.state
-        key = entity_name.lower()
-        page = state.wiki_pages.get(key)
-        if not page:
-            return {"found": False, "entity": entity_name}
-
-        try:
-            rec = vault_read(cfg.vault_path, page.rel_path)
-            body = rec["body"]
-        except Exception:
-            body = ""
-
-        return {
-            "found": True,
-            "entity": page.entity_name,
-            "type": page.entity_type,
-            "path": page.rel_path,
-            "known_facts": page.known_facts,
-            "related": page.related,
-            "sources": page.sources,
-            "body": body[:2000],
-        }
-
-    @mcp.tool()
-    def vault_read_record(rel_path: str) -> dict[str, Any]:
-        """Read a vault record by its relative path.
-
-        Args:
-            rel_path: Relative path within the vault (e.g. 'people/Alice.md')
-        """
-        try:
-            rec = vault_read(cfg.vault_path, rel_path)
-            return {
-                "path": rec["path"],
-                "frontmatter": rec["frontmatter"],
-                "body": rec["body"][:4000],
-            }
-        except Exception as e:
-            return {"error": str(e), "path": rel_path}
-
-    @mcp.tool()
-    def vault_status() -> dict[str, Any]:
-        """Return current vault statistics."""
-        state_store.load()
-        return {
-            "files_tracked": state_store.file_count(),
-            "files_embedded": state_store.embedded_count(),
-            "chunks": state_store.chunk_count(),
-            "clusters": state_store.cluster_count(),
-            "wiki_pages": state_store.wiki_page_count(),
-        }
-
-    # Optional Bearer-token authentication.
-    # If ALFRED_HTTP_TOKEN is set, attach the middleware to the underlying
-    # Starlette app before starting.  FastMCP exposes the raw ASGI app via
-    # .app or ._app depending on the version — try both.
+    # Optional Bearer-token authentication. Unset -> open (documented mode). But SET is
+    # all-or-nothing: a set-but-empty token must never degrade to open, because that is
+    # exactly how it happens in practice — Environment="ALFRED_HTTP_TOKEN=${SECRET}" with
+    # SECRET unset expands to "" and the operator believes the door is locked.
     http_token = os.environ.get("ALFRED_HTTP_TOKEN")
+    if http_token is not None and not http_token.strip():
+        raise SystemExit(
+            "ALFRED_HTTP_TOKEN is set but empty/whitespace. Refusing to start: a "
+            "configured-but-blank token reads as 'auth on' to every config check while "
+            "serving unauthenticated. Unset it to run open, or give it a real value."
+        )
     if http_token:
-        AuthMiddleware = _make_auth_middleware(http_token)
-        try:
-            raw_app = getattr(mcp, "app", None) or getattr(mcp, "_app", None)
-            if raw_app is not None:
-                raw_app.add_middleware(AuthMiddleware)
-        except Exception:
-            # Middleware attachment failed — fall through and start without auth
-            # (safe because we're bound to loopback).
-            pass
+        _attach_auth_middleware(app, http_token)  # fatal if it cannot be enforced
+        log.info("mcp.auth_enabled", host=host, port=port)
+    else:
+        log.warning("mcp.auth_disabled", host=host, port=port)
 
-    mcp.run(transport="streamable-http", host=host, port=port)
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

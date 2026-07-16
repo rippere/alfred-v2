@@ -12,6 +12,7 @@ import httpx
 import structlog
 
 from alfred.core.anthropic_client import get_client
+from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import vault_create, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
 
@@ -62,15 +63,58 @@ class ConsolidatorDaemon(BaseDaemon):
             self.log.info("consolidator.stopped")
 
     async def tick(self) -> None:
-        """One-shot consolidation — called by APScheduler every consolidator_min_interval_s."""
+        """One-shot full consolidation (label + synthesize + stubs).
+
+        Legacy composite entry point, kept for the run() fallback loop and
+        ad-hoc invocation.  The runner now schedules label_tick /
+        synthesis_tick / stubs_tick as three independent APScheduler jobs so
+        a slow pass in one responsibility cannot block the others.
+        """
         try:
             await self._consolidate()
         except Exception as e:
             self.log.error("consolidator.tick_error", error=str(e))
 
+    async def label_tick(self) -> None:
+        """One-shot cluster-labeling pass — called by APScheduler."""
+        try:
+            await self._label_pass(self.cfg.vault_path)
+        except Exception as e:
+            self.log.error("consolidator.label_tick_error", error=str(e))
+
+    async def synthesis_tick(self) -> None:
+        """One-shot synthesis pass — called by APScheduler.
+
+        Only synthesizes clusters that already carry a label; a cluster
+        labeled after this tick fires is picked up on the next interval.
+        """
+        try:
+            await self._synthesis_pass(self.cfg.vault_path)
+        except Exception as e:
+            self.log.error("consolidator.synthesis_tick_error", error=str(e))
+
+    async def stubs_tick(self) -> None:
+        """One-shot wiki-stub generation pass — called by APScheduler."""
+        try:
+            await self._generate_wiki_stubs(self.cfg.vault_path)
+        except Exception as e:
+            self.log.error("consolidator.stubs_tick_error", error=str(e))
+
     async def _consolidate(self) -> None:
-        state = self.state.state
         vault_path = self.cfg.vault_path
+
+        # Label clusters via Ollama (Anthropic / deterministic fallbacks)
+        await self._label_pass(vault_path)
+
+        # Synthesize high-centrality clusters into synthesis/ pages
+        await self._synthesis_pass(vault_path)
+
+        # Generate wiki stub pages for all person/org records (no LLM needed)
+        await self._generate_wiki_stubs(vault_path)
+
+    async def _label_pass(self, vault_path) -> None:
+        """Label unlabeled (or stale-labeled) clusters, persisting on change."""
+        state = self.state.state
         updated = 0
 
         for key, cluster in list(state.clusters.items()):
@@ -97,12 +141,6 @@ class ConsolidatorDaemon(BaseDaemon):
         if updated:
             self.log.info("consolidator.labeled", clusters=updated)
             await self.save_state()
-
-        # Synthesize high-centrality clusters into synthesis/ pages
-        await self._synthesis_pass(vault_path)
-
-        # Generate wiki stub pages for all person/org records (no LLM needed)
-        await self._generate_wiki_stubs(vault_path)
 
     async def _synthesis_pass(self, vault_path) -> None:
         """Synthesize learn/ clusters into synthesis/ pages, ranked by graph centrality."""
@@ -189,9 +227,7 @@ class ConsolidatorDaemon(BaseDaemon):
 
         # Guard: if every source is daemon-generated content, skip synthesis.
         # Synthesizing LLM output produces compounding noise, not knowledge.
-        daemon_prefixes = ("topic/", "synthesis/", "learn/")
-        human_sources = [p for p, _, _ in learn_entries
-                         if not any(p.startswith(pfx) for pfx in daemon_prefixes)]
+        human_sources = [p for p, _, _ in learn_entries if not is_daemon_generated(p)]
         if not human_sources:
             self.log.info("consolidator.skip_all_daemon_sources",
                           cluster=cluster.label, entries=len(learn_entries))
