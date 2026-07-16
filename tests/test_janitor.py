@@ -123,6 +123,33 @@ def test_dedup_sweep_deletes_embeddings_for_removed_duplicate(tmp_path):
     assert keeper_rel in state_store.state.files
 
 
+def test_structural_sweep_deletes_embeddings_for_ghost_file(tmp_path):
+    """When _structural_sweep() prunes a state.files entry for a path that no
+    longer exists on disk (a "ghost"), it must delete that file's vector-store
+    chunks too, not just `del state.files[k]`. This is a third deletion path
+    (alongside _archive_sessions and _dedup_sweep) that runs every hour via
+    SWEEP_INTERVAL — far more often than the other two — and is reachable even
+    when Janitor runs without Surveyor, so leaving it unwired orphans
+    embeddings for any file removed from the vault by any means."""
+    daemon, state_store = _make_daemon(tmp_path, _RecordingStore())
+    store: _RecordingStore = daemon.store
+    vault_path = daemon.cfg.vault_path
+
+    ghost_rel = "notes/gone.md"
+    ghost_chunk_ids = ["notes/gone.md::chunk_00", "notes/gone.md::chunk_01"]
+    state_store.state.files[ghost_rel] = FileState(md5="ghost-md5", chunk_ids=ghost_chunk_ids)
+    # No file written to disk for ghost_rel — it's gone from the vault.
+
+    asyncio.run(daemon._structural_sweep())
+
+    assert store.delete_calls == [(ghost_rel, ghost_chunk_ids)], (
+        "structural sweep pruned a ghost state.files entry without deleting "
+        "its embeddings — this orphans LanceDB vectors for a file removed "
+        "from the vault outside of archive/dedup"
+    )
+    assert ghost_rel not in state_store.state.files
+
+
 def test_janitor_constructor_requires_store(tmp_path):
     """JanitorDaemon must take a vector-store reference like SurveyorDaemon
     does, so both daemons share the same deletion contract."""

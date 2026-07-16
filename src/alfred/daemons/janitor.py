@@ -160,7 +160,7 @@ class JanitorDaemon(BaseDaemon):
         }
         ghost_keys = [k for k in state.files if k not in live_paths]
         for k in ghost_keys:
-            del state.files[k]
+            self._delete_embeddings(state, k)
         if ghost_keys:
             self.log.info("janitor.pruned_ghosts", count=len(ghost_keys))
 
