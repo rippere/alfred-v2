@@ -139,3 +139,63 @@ def test_topic_append_success_does_not_increment_failure_counter(tmp_path, monke
 
     assert created == 1
     assert daemon.failed_appends_this_tick == 0
+
+
+def test_tick_normal_path_distills_stale_file_end_to_end(tmp_path, monkeypatch):
+    """Exercise the actual `tick()` APScheduler entry point end to end:
+    `tick()` -> `_distill_sweep()` -> `_distill_file()`, with only the
+    Anthropic client and vault I/O mocked, against a real state.files entry
+    marked stale (never distilled)."""
+    from alfred.core.models import FileState
+
+    daemon = _make_daemon(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    long_body = "z" * 300
+    monkeypatch.setattr(
+        "alfred.daemons.distiller.vault_read",
+        lambda vault_path, rel_path: {
+            "path": rel_path,
+            "frontmatter": {"type": "note"},
+            "body": long_body,
+        },
+    )
+    learnings = [{"title": "tick-learning", "body": "insight from tick", "tags": ["misc"]}]
+    monkeypatch.setattr("alfred.daemons.distiller.get_client", lambda: _FakeClient(learnings))
+
+    appended: list[str] = []
+
+    def _fake_append_to_topic(vault_path, topic_slug, title, body_text, tags=None, source=None):
+        appended.append(title)
+        return {"path": f"topic/{topic_slug}.md"}
+
+    monkeypatch.setattr("alfred.daemons.distiller.vault_append_to_topic", _fake_append_to_topic)
+
+    daemon.state.state.files["inbox/note.md"] = FileState(md5="abc123")
+
+    asyncio.run(daemon.tick())
+
+    assert appended == ["tick-learning"]
+    fs = daemon.state.state.files["inbox/note.md"]
+    assert fs.last_distilled  # stamped after successful distill
+    assert len(daemon.state.state.distiller_runs) == 1
+    assert daemon.state.state.distiller_runs[0]["learn_records_created"] == 1
+
+
+def test_tick_exception_is_caught_and_logged_not_propagated(tmp_path, monkeypatch):
+    """`tick()` must swallow any exception raised inside `_distill_sweep()`
+    and log it rather than letting it propagate."""
+    daemon = _make_daemon(tmp_path)
+
+    async def _boom() -> None:
+        raise RuntimeError("simulated distiller sweep failure")
+
+    monkeypatch.setattr(daemon, "_distill_sweep", _boom)
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.tick())  # must not raise
+
+    errors = [e for e in logs if e.get("log_level") == "error"
+              and e.get("event") == "distiller.tick_error"]
+    assert len(errors) == 1
+    assert "simulated distiller sweep failure" in errors[0]["error"]

@@ -21,6 +21,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from alfred.config import AlfredConfig
 from alfred.daemons.surveyor import SurveyorDaemon
@@ -267,3 +268,50 @@ def test_upsert_success_deletes_only_stale_chunks_after_write(tmp_path, monkeypa
     fs = state_store.state.files[rel_path]
     assert fs.md5 == "new-md5"
     assert fs.chunk_ids == ["note.md::chunk_00"]
+
+
+def test_tick_normal_path_embeds_new_file_end_to_end(tmp_path, monkeypatch):
+    """Exercise the actual `tick()` APScheduler entry point (not `_tick()` or
+    `_process_diff()` directly): a brand-new vault file should be discovered
+    by `_compute_diff()`, embedded via the mocked embedder/BM25, and recorded
+    in state with chunk_ids — with the vector store itself mocked out."""
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    (vault_path / "note.md").write_text(
+        "---\ntype: note\n---\nFresh new note body content.\n", encoding="utf-8"
+    )
+
+    cfg = AlfredConfig(vault_path=vault_path, data_dir=tmp_path / "data")
+    state_store = StateStore(tmp_path / "state.json")
+    state_store.load()
+    events: asyncio.Queue = asyncio.Queue()
+    store = _RecordingStore()
+    daemon = SurveyorDaemon(cfg, state_store, events, store=store)
+    monkeypatch.setattr(daemon, "_get_embedder", lambda: _StubEmbedder())
+    monkeypatch.setattr(daemon, "_get_bm25", lambda: _StubBM25())
+
+    asyncio.run(daemon.tick())
+
+    assert len(store.upsert_calls) == 1
+    assert "note.md" in state_store.state.files
+    assert state_store.state.files["note.md"].chunk_ids
+
+
+def test_tick_exception_is_caught_and_logged_not_propagated(tmp_path, monkeypatch):
+    """`tick()` must swallow any exception raised inside `_tick()` and log it
+    rather than letting it propagate — this is what makes it safe to register
+    directly as an APScheduler job function."""
+    daemon = _make_daemon(tmp_path)
+
+    async def _boom() -> None:
+        raise RuntimeError("simulated surveyor tick failure")
+
+    monkeypatch.setattr(daemon, "_tick", _boom)
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.tick())  # must not raise
+
+    errors = [e for e in logs if e.get("log_level") == "error"
+              and e.get("event") == "surveyor.tick_error"]
+    assert len(errors) == 1
+    assert "simulated surveyor tick failure" in errors[0]["error"]
