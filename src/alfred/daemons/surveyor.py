@@ -138,12 +138,6 @@ class SurveyorDaemon(BaseDaemon):
                 self.log.warning("surveyor.parse_failed", path=rel_path, error=str(e))
                 continue
 
-            # Delete old chunks before re-embedding
-            if rel_path in diff["changed"]:
-                old_fs = state.files.get(rel_path)
-                if old_fs:
-                    self.store.delete_file(rel_path, old_fs.chunk_ids)
-
             chunk_ids: list[str] = []
             rows: list[dict] = []
             for chunk_id, text in chunks:
@@ -173,14 +167,39 @@ class SurveyorDaemon(BaseDaemon):
                         "surveyor.upsert_failed",
                         path=rel_path, count=len(rows), error=str(e),
                     )
-                    # Leave state.files[rel_path] untouched so the old md5 is
-                    # preserved and the file is retried next tick.  Recording
-                    # md5=current here would mark it "done" with no chunks —
-                    # and for a changed file its old chunks are already gone
-                    # (deleted above), so it would silently drop from search.
+                    # Leave state.files[rel_path] (and its chunk_ids) untouched
+                    # so the old md5 is preserved and the file is retried next
+                    # tick.  Deleting the old chunks is deferred until *after*
+                    # a successful upsert (below) specifically so this failure
+                    # path never leaves state pointing at chunk_ids that have
+                    # already been removed from the vector store — recording
+                    # md5=current here, or deleting the old chunks up front,
+                    # would silently drop the file from search while state
+                    # still reports it as indexed.
                     continue
             # (rows empty → file has no embeddable content; fall through and
             # record state so we don't retry an empty file forever.)
+
+            # Only remove chunks from the *previous* version of this file once
+            # the new ones are confirmed written (or confirmed unnecessary,
+            # for the empty-rows case above) — never before, so a failed
+            # upsert can't leave state referencing chunk_ids that no longer
+            # exist in the store. chunk_ids are deterministic per index
+            # (rel_path::chunk_NN), so any id shared with the just-written
+            # `chunk_ids` was already refreshed by upsert_many's merge_insert
+            # — only the leftover ids (e.g. the file got shorter) are stale
+            # and need an explicit delete.
+            if rel_path in diff["changed"]:
+                old_fs = state.files.get(rel_path)
+                if old_fs:
+                    stale_ids = [cid for cid in old_fs.chunk_ids if cid not in chunk_ids]
+                    if stale_ids:
+                        try:
+                            self.store.delete_file(rel_path, stale_ids)
+                        except Exception as e:
+                            self.log.warning(
+                                "surveyor.delete_failed", path=rel_path, error=str(e),
+                            )
 
             now = datetime.now(timezone.utc).isoformat()
             state.files[rel_path] = FileState(

@@ -123,3 +123,147 @@ def test_recluster_job_is_sole_scheduler_path_to_recluster(tmp_path, monkeypatch
     # elsewhere, and tick()'s bound instance is the one whose _tick() we
     # proved above never calls _recluster().
     assert tick_func.__self__ is recluster_func.__self__
+
+
+class _RecordingStore:
+    """Stub vector store that records delete_file/upsert_many calls and lets
+    upsert_many be forced to fail, to exercise the changed-file error path."""
+
+    def __init__(self, fail_upsert: bool = False) -> None:
+        self.fail_upsert = fail_upsert
+        self.delete_calls: list[tuple[str, list[str] | None]] = []
+        self.upsert_calls: list[list[dict]] = []
+
+    def delete_file(self, rel_path: str, chunk_ids: list[str] | None = None) -> None:
+        self.delete_calls.append((rel_path, list(chunk_ids) if chunk_ids else chunk_ids))
+
+    def upsert_many(self, rows: list[dict]) -> None:
+        self.upsert_calls.append(rows)
+        if self.fail_upsert:
+            raise RuntimeError("simulated upsert_many failure")
+
+
+class _StubEmbedder:
+    async def embed(self, text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+
+class _StubBM25:
+    is_fitted = False
+
+    def encode(self, text: str) -> dict:
+        return {}
+
+
+def test_upsert_failure_leaves_old_chunks_available_not_dangling(tmp_path, monkeypatch):
+    """Regression coverage for the silent content-availability gap: a changed
+    file whose re-embed upsert fails must NOT have its previously-indexed
+    chunks deleted from the vector store, and state must keep claiming
+    exactly the (still-valid) old chunk_ids — never the new ones, and never
+    a dangling reference to chunks that no longer exist in the store.
+    """
+    from alfred.core.models import FileState
+
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    rel_path = "note.md"
+    (vault_path / rel_path).write_text(
+        "---\ntype: note\n---\nUpdated body content for the note.\n"
+    )
+
+    cfg = AlfredConfig(vault_path=vault_path, data_dir=tmp_path / "data")
+    state_store = StateStore(tmp_path / "state.json")
+    state_store.load()
+
+    old_chunk_ids = ["note.md::chunk_00"]
+    state_store.state.files[rel_path] = FileState(
+        md5="old-md5",
+        last_embedded="2026-01-01T00:00:00+00:00",
+        chunk_ids=old_chunk_ids,
+    )
+
+    events: asyncio.Queue = asyncio.Queue()
+    store = _RecordingStore(fail_upsert=True)
+    daemon = SurveyorDaemon(cfg, state_store, events, store=store)
+    monkeypatch.setattr(daemon, "_get_embedder", lambda: _StubEmbedder())
+    monkeypatch.setattr(daemon, "_get_bm25", lambda: _StubBM25())
+
+    diff = {
+        "new": [],
+        "changed": [rel_path],
+        "deleted": [],
+        "current": {rel_path: "new-md5"},
+    }
+
+    asyncio.run(daemon._process_diff(diff))
+
+    # upsert_many was attempted and failed — confirm the test actually
+    # exercised the failure path.
+    assert len(store.upsert_calls) == 1
+
+    # The old chunks must never have been deleted from the vector store: a
+    # failed upsert should not be able to orphan them.
+    assert store.delete_calls == [], (
+        "delete_file was called even though upsert_many failed — this "
+        "orphans the old chunk_ids that state still (correctly) references"
+    )
+
+    # State must still point at the old, still-present chunk_ids — not the
+    # new md5 (which would falsely mark the file as freshly indexed), and
+    # not an empty/dangling chunk_ids list.
+    fs = state_store.state.files[rel_path]
+    assert fs.md5 == "old-md5"
+    assert fs.chunk_ids == old_chunk_ids
+
+
+def test_upsert_success_deletes_only_stale_chunks_after_write(tmp_path, monkeypatch):
+    """On a successful re-embed, the old chunk_ids should be removed only
+    *after* the new chunks are written, and only the ids no longer produced
+    (e.g. the file got shorter) should be deleted — the shared chunk_00 id
+    must not be deleted, since delete_file would otherwise race the
+    just-completed upsert_many and strip the freshly-written row."""
+    from alfred.core.models import FileState
+
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    rel_path = "note.md"
+    (vault_path / rel_path).write_text(
+        "---\ntype: note\n---\nShort body now.\n"
+    )
+
+    cfg = AlfredConfig(vault_path=vault_path, data_dir=tmp_path / "data")
+    state_store = StateStore(tmp_path / "state.json")
+    state_store.load()
+
+    # Previously this file produced two chunks; chunk_00 will be reproduced
+    # again (deterministic id), chunk_01 is now stale.
+    old_chunk_ids = ["note.md::chunk_00", "note.md::chunk_01"]
+    state_store.state.files[rel_path] = FileState(
+        md5="old-md5",
+        last_embedded="2026-01-01T00:00:00+00:00",
+        chunk_ids=old_chunk_ids,
+    )
+
+    events: asyncio.Queue = asyncio.Queue()
+    store = _RecordingStore(fail_upsert=False)
+    daemon = SurveyorDaemon(cfg, state_store, events, store=store)
+    monkeypatch.setattr(daemon, "_get_embedder", lambda: _StubEmbedder())
+    monkeypatch.setattr(daemon, "_get_bm25", lambda: _StubBM25())
+
+    diff = {
+        "new": [],
+        "changed": [rel_path],
+        "deleted": [],
+        "current": {rel_path: "new-md5"},
+    }
+
+    asyncio.run(daemon._process_diff(diff))
+
+    # upsert_many happened before any delete_file call.
+    assert len(store.upsert_calls) == 1
+    assert len(store.delete_calls) == 1
+    assert store.delete_calls[0] == (rel_path, ["note.md::chunk_01"])
+
+    fs = state_store.state.files[rel_path]
+    assert fs.md5 == "new-md5"
+    assert fs.chunk_ids == ["note.md::chunk_00"]
