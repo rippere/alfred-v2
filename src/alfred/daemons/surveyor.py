@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,7 +16,6 @@ if TYPE_CHECKING:
     from alfred.store.state import StateStore
 
 WATCH_INTERVAL = 60.0      # seconds between filesystem polls
-CLUSTER_INTERVAL = 1800.0  # re-cluster every 30 minutes
 
 
 class SurveyorDaemon(BaseDaemon):
@@ -28,7 +26,6 @@ class SurveyorDaemon(BaseDaemon):
         self.store = store
         self._embedder = None
         self._bm25 = None
-        self._last_cluster = float("-inf")
 
     def _get_embedder(self):
         if self._embedder is None:
@@ -64,7 +61,8 @@ class SurveyorDaemon(BaseDaemon):
             self.log.error("surveyor.tick_error", error=str(e))
 
     async def recluster(self) -> None:
-        """One-shot recluster — called by APScheduler on CLUSTER_INTERVAL."""
+        """One-shot recluster — the sole trigger for `_recluster()`, called by
+        the dedicated `surveyor.recluster` APScheduler job (see runner.py)."""
         try:
             await self._recluster()
         except Exception as e:
@@ -81,10 +79,6 @@ class SurveyorDaemon(BaseDaemon):
         if diff["new"] or diff["changed"] or diff["deleted"]:
             await self._process_diff(diff)
             await self.save_state()
-
-        if time.time() - self._last_cluster > CLUSTER_INTERVAL:
-            await self._recluster()
-            self._last_cluster = time.time()
 
     def _compute_diff(self) -> dict[str, list[str]]:
         """Scan vault for new/changed/deleted files."""
