@@ -16,6 +16,7 @@ import os
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import frontmatter
 import structlog
@@ -29,6 +30,9 @@ from alfred.core.schema import (
 from alfred.core.vault import extract_wikilinks
 from alfred.core.vault_ops import VaultError, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
+
+if TYPE_CHECKING:
+    from alfred.store.lancedb_store import LanceDBStore
 
 log = structlog.get_logger()
 
@@ -52,8 +56,9 @@ class IssueCode(str, Enum):
 class JanitorDaemon(BaseDaemon):
     name = "janitor"
 
-    def __init__(self, cfg, state, events) -> None:
+    def __init__(self, cfg, state, events, store: LanceDBStore) -> None:
         super().__init__(cfg, state, events)
+        self.store = store
         self._last_sweep = float("-inf")
         self._last_deep = float("-inf")
         self._last_dedup = float("-inf")
@@ -406,6 +411,23 @@ class JanitorDaemon(BaseDaemon):
             vault_edit(vault_path, rel_path, body_replace=new_body)
             self.log.info("janitor.enriched_file", path=rel_path, chars=len(new_body))
 
+    def _delete_embeddings(self, state, rel_path: str) -> None:
+        """Delete a file's vectors from the vector store and prune its state entry.
+
+        Mirrors ``SurveyorDaemon._process_diff``'s deletion path: look up the
+        known chunk_ids (if any) before popping state, so ``store.delete_file``
+        can use the fast explicit-id delete instead of falling back to a
+        prefix scan. Used by ``_archive_sessions`` and ``_dedup_sweep`` so
+        moved/removed files never leave orphaned LanceDB embeddings behind.
+        """
+        fs = state.files.get(rel_path)
+        chunk_ids = fs.chunk_ids if fs else None
+        try:
+            self.store.delete_file(rel_path, chunk_ids)
+        except Exception as e:
+            self.log.warning("janitor.vector_delete_failed", path=rel_path, error=str(e))
+        state.files.pop(rel_path, None)
+
     # ── Dedup sweep: weekly similarity-based deduplication ────────────────────
 
     async def _dedup_sweep(self) -> None:
@@ -517,8 +539,10 @@ class JanitorDaemon(BaseDaemon):
                     try:
                         dupe_rel = str(dupe.relative_to(vault_path)).replace("\\", "/")
                         dupe.unlink()
-                        # Prune from state
-                        state.files.pop(dupe_rel, None)
+                        # Prune from state and vector store — mirrors surveyor's
+                        # deletion path so a deduped file doesn't leave orphaned
+                        # LanceDB embeddings behind.
+                        self._delete_embeddings(state, dupe_rel)
                         checked.add(str(dupe))
                         merged_count += 1
                         msg = f"merged {dupe.name} → {keeper.name} (ratio={ratio:.2f})"
@@ -598,18 +622,17 @@ class JanitorDaemon(BaseDaemon):
                 continue
 
             dest = archive_dir / md_file.name
+            rel_path = f"session/{md_file.name}"
             # If destination already exists, skip (idempotent)
             if dest.exists():
                 md_file.unlink(missing_ok=True)
-                rel_path = f"session/{md_file.name}"
-                state.files.pop(rel_path, None)
+                self._delete_embeddings(state, rel_path)
                 archived += 1
                 continue
 
             try:
                 md_file.rename(dest)
-                rel_path = f"session/{md_file.name}"
-                state.files.pop(rel_path, None)
+                self._delete_embeddings(state, rel_path)
                 archived += 1
                 self.log.debug(
                     "janitor.session_archived",

@@ -77,7 +77,7 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
 
     # ── Daemon instances ───────────────────────────────────────────────────────
     surveyor = SurveyorDaemon(cfg, state_store, events, store=vector_store)
-    janitor = JanitorDaemon(cfg, state_store, events)
+    janitor = JanitorDaemon(cfg, state_store, events, store=vector_store)
     curator = CuratorDaemon(cfg, state_store, events)
     distiller = DistillerDaemon(cfg, state_store, events)
     consolidator = ConsolidatorDaemon(cfg, state_store, events)
