@@ -8,6 +8,24 @@ Alfred v2 is a functioning, actively-used personal knowledge system, but the aud
 
 ---
 
+## Alfred-CRM Bridge (Pattern A)
+
+Tracked as its own initiative, separate from the Phase 1/2/3 audit-remediation structure above. Branch: `claude/alfred-crm-bridge-pattern-a`.
+
+**What was built** (3-step pass, all committed on the branch): a new `src/alfred/bridge/` module implementing the Alfred → NovaCRM enrichment bridge — `resolve.py` (conservative, never-guess contact-to-vault-entity resolution by exact email match, grep-then-confirm against frontmatter), `brief.py` (vault-context query + LLM brief synthesis with a content hash for CRM-side idempotency), `notes.py` (NovaCRM deal/contact note posting with duplicate-hash dedup, reusing the existing ledger auth path), `enrich_crm.py` (orchestrates fetch-active-deals → resolve → synthesize → dedup → post, with structured logging of every decision), and `cli.py` (`alfred bridge enrich [--push] [--top-k N] [--config PATH]`, dry-run by default — there is no `--dry-run` flag; omitting `--push` is what keeps it dry). 31 new unit tests across 4 test files (`test_bridge_resolve.py`, `test_bridge_notes.py`, `test_bridge_brief.py`, `test_bridge_enrich.py`), all HTTP mocked, no live network calls anywhere in the suite. Full repo suite: 154/154 passing.
+
+**Verification verdict**: adversarial review CONFIRMED_WORKING on all 5 checked claims (dry-run defaults correctly to no-write, idempotency dedup blocks reposting even under `--push`, entity resolution is conservative and never guesses on ambiguous/missing data, full test suite green, no push/deploy/systemd changes made). See commit `d7e04fb` (HEAD of the bridge work) and prior commits `34fdce8`, `9496489`.
+
+**Status: dry-run-only, NOT live.** No systemd timer/service has been installed for this bridge. `--push` has never been exercised against the real NovaCRM API in any session — every run to date has been either static/mocked tests or blocked before execution by this environment's own live-write permission guardrails (a live `alfred bridge enrich` dry-run invocation, and even mocked pytest runs of the bridge test files, were refused by the Bash auto-mode classifier in the finalize session; the code path itself is confirmed by source inspection and unit tests to be write-safe, but an actual live dry-run transcript against real vault/CRM data has not yet been captured in any session). Ben should treat the counts as unobserved until he runs it himself.
+
+**To go live, a human (Ben) needs to:**
+1. Run `.venv/bin/alfred bridge enrich` (no `--push`) interactively and review the printed decisions table — confirm resolution, brief synthesis, and dedup behavior look right against real NovaCRM deals/contacts and the real vault.
+2. Confirm `~/.config/alfred-ledger/env` has valid, working credentials (file exists on this host but its contents were never read/exercised by any automated session — unknown whether a real run reaches the live CRM or degrades to an all-zero summary for missing creds).
+3. Once satisfied with dry-run output, run `alfred bridge enrich --push` manually to perform the first real posting pass.
+4. Only after a manual `--push` pass looks correct, decide whether to wire this into a systemd timer for recurring runs — no such unit exists yet.
+
+---
+
 ## Phase 1 — Now
 
 Small, low-risk, high-value, independent fixes. Each is scoped to a disjoint (or near-disjoint) set of files so they can be built in parallel worktrees and merged with minimal conflict risk.
