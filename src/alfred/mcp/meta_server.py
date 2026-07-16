@@ -204,8 +204,18 @@ def run_meta_server(meta_config_path: Path) -> None:
             top_k: Total number of results to return across all vaults (default 8)
             synthesis: Include LLM synthesis of results (default False — expensive)
         """
+        from alfred.mcp.defaults import validate_result_count
+
+        # top_k=0 is a sentinel meaning "use the server's final_top_k
+        # default" (preserved pre-existing behavior); any other value is
+        # validated against the shared 1-100 range before it's used to
+        # slice the reranked results, so a negative value can't silently
+        # mis-slice and a huge value can't blow up the rerank pass.
+        effective_top_k = top_k if top_k else final_top_k
+        validate_result_count(effective_top_k, param_name="top_k")
+
         all_hits = await _parallel_query(engines, query, top_k_per_vault, synthesis)
-        ranked = _rerank_combined(all_hits, query, top_k or final_top_k)
+        ranked = _rerank_combined(all_hits, query, effective_top_k)
         return {
             "hits": ranked,
             "vaults_queried": [name for name, _ in engines],

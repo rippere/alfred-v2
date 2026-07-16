@@ -29,7 +29,7 @@ from typing import Any
 
 import structlog
 
-from alfred.mcp.defaults import DEFAULT_TOP_K, build_query_options
+from alfred.mcp.defaults import DEFAULT_TOP_K, build_query_options, validate_result_count
 
 log = structlog.get_logger()
 
@@ -77,6 +77,8 @@ def vault_search_impl(
 ) -> list[dict[str, Any]]:
     """Text search one vault, with optional type/status filters."""
     from alfred.core.vault_ops import vault_search as _vault_search
+
+    validate_result_count(limit, param_name="limit")
 
     results = _vault_search(
         cfg.vault_path,
