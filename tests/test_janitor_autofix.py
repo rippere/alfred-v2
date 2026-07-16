@@ -168,23 +168,42 @@ def test_fm004_wraps_scalar_list_field_in_a_list(tmp_path):
 def test_fm004_project_field_scalar_is_not_wrapped(tmp_path):
     """`project` is a documented exception in both _check_file and _autofix:
     a bare string value is accepted as-is, not flagged/wrapped, even though
-    `project` is in LIST_FIELDS."""
+    `project` is in LIST_FIELDS.
+
+    The file also carries a scalar `tags` field, a genuine FM004 violation,
+    so the note actually clears _autofix's per-file issue-code gate and the
+    FM004 loop body runs. Without that second field, `project` would be the
+    file's only non-list-typed field; _check_file's own project exception
+    means no FM004 issue is ever raised, the file never clears the gate, and
+    the loop body's project-exception check is never reached at all --
+    proving nothing about _autofix's own copy of the exception.
+    """
     daemon = _make_daemon(tmp_path)
     vault_path = daemon.cfg.vault_path
     note_dir = vault_path / "note"
     note_dir.mkdir()
     fp = note_dir / "proj-scalar.md"
     fp.write_text(
-        "---\ntype: note\ncreated: '2026-01-01'\nproject: solo-project\n---\nBody.\n",
+        "---\ntype: note\ncreated: '2026-01-01'\nproject: solo-project\ntags: solo-tag\n---\nBody.\n",
         encoding="utf-8",
     )
 
     file_issues = daemon._check_file(vault_path, "note/proj-scalar.md")
-    assert not any(i.code == IssueCode.INVALID_FIELD_TYPE.value for i in file_issues)
+    assert not any(
+        i.code == IssueCode.INVALID_FIELD_TYPE.value and "project" in i.message
+        for i in file_issues
+    )
+    assert any(
+        i.code == IssueCode.INVALID_FIELD_TYPE.value and "tags" in i.message
+        for i in file_issues
+    )
 
     fixed = _autofix_file(daemon, vault_path, "note/proj-scalar.md")
-    assert fixed == []
+    # The loop body ran (tags got wrapped), proving it reached the point
+    # where the project exception applies -- not merely skipped via the gate.
+    assert fixed == ["note/proj-scalar.md"]
     rec = vault_read(vault_path, "note/proj-scalar.md")
+    assert rec["frontmatter"]["tags"] == ["solo-tag"]
     assert rec["frontmatter"]["project"] == "solo-project"
 
 
