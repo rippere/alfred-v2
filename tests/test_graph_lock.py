@@ -86,6 +86,52 @@ def test_concurrent_save_load_no_lost_writes(graph_path):
     assert not graph_path.with_name(graph_path.name + ".tmp").exists()
 
 
+def test_independent_instances_share_lock_no_lost_writes(graph_path):
+    """Two independently-constructed GraphStore(path) instances (mirroring how
+    surveyor.py / consolidator.py each build their own) must serialize against
+    each other. Before the module-level path-keyed lock registry, each instance
+    got its own private RLock, so concurrent load/mutate/save across instances
+    was not mutually exclusive and silently dropped edges (last-writer-wins).
+    """
+    seed = GraphStore(graph_path)
+    seed.add_edges_from_wikilinks("seed.md", ["seed-target.md"])
+    seed.save()
+
+    errors: list[BaseException] = []
+
+    def worker(tid: int) -> None:
+        # Each call site constructs its own GraphStore, exactly like
+        # surveyor.py / consolidator.py do — this is the reported bug shape.
+        try:
+            for i in range(OPS_PER_WRITER):
+                store = GraphStore(graph_path)
+                with store.transaction():
+                    store.load()
+                    store.add_edges_from_wikilinks(
+                        f"t{tid}/note-{i:03d}.md", [f"t{tid}/target-{i % 7}.md"]
+                    )
+                    store.save()
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(tid,)) for tid in range(N_WRITERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"exceptions during concurrent hammering: {errors!r}"
+
+    g = pickle.loads(graph_path.read_bytes())
+    expected = {
+        f"t{tid}/note-{i:03d}.md" for tid in range(N_WRITERS) for i in range(OPS_PER_WRITER)
+    }
+    missing = expected - set(g.nodes)
+    assert not missing, f"lost writes across independent instances — {len(missing)} missing, e.g. {sorted(missing)[:5]}"
+
+    assert not graph_path.with_name(graph_path.name + ".tmp").exists()
+
+
 def test_save_is_atomic_replacement(graph_path):
     """save() must go through tmp + os.replace, leaving a loadable file."""
     store = GraphStore(graph_path)

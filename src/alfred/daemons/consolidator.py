@@ -148,51 +148,55 @@ class ConsolidatorDaemon(BaseDaemon):
 
         state = self.state.state
         graph = GraphStore(self.cfg.graph_path)
-        graph.load()
 
         SYNTHESIS_STALE_DAYS = 30  # only re-synthesize existing pages after 30 days
 
         ranked: list[tuple[str, object, int]] = []
-        for key, cluster in state.clusters.items():
-            if len(cluster.member_files) < MIN_MEMBERS:
-                continue
-            if not cluster.label:
-                continue  # not yet labeled — wait for label pass
+        # Hold the path-shared lock across load() + the degree reads below so
+        # this never observes a graph mid-mutation by a surveyor GraphStore
+        # instance operating on the same file (see GraphStore.transaction()).
+        with graph.transaction():
+            graph.load()
+            for key, cluster in state.clusters.items():
+                if len(cluster.member_files) < MIN_MEMBERS:
+                    continue
+                if not cluster.label:
+                    continue  # not yet labeled — wait for label pass
 
-            # Guard: if consolidated_chunk_id is set, verify the file exists on disk.
-            # If it exists and is fresh (< 30 days old), skip — already synthesized.
-            # If consolidated_chunk_id is set but the file is gone, allow re-synthesis.
-            if cluster.consolidated_chunk_id:
-                synthesis_path = vault_path / cluster.consolidated_chunk_id
-                if synthesis_path.exists():
+                # Guard: if consolidated_chunk_id is set, verify the file exists on disk.
+                # If it exists and is fresh (< 30 days old), skip — already synthesized.
+                # If consolidated_chunk_id is set but the file is gone, allow re-synthesis.
+                if cluster.consolidated_chunk_id:
+                    synthesis_path = vault_path / cluster.consolidated_chunk_id
+                    if synthesis_path.exists():
+                        try:
+                            mtime = synthesis_path.stat().st_mtime
+                            age_days = (time.time() - mtime) / 86400
+                            if age_days < SYNTHESIS_STALE_DAYS:
+                                continue  # fresh synthesis exists — skip
+                        except OSError:
+                            pass  # can't stat — fall through and re-synthesize
+                    else:
+                        # consolidated_chunk_id points to a missing file — reset it
+                        cluster.consolidated_chunk_id = ""
+
+                # Additional guard: even without consolidated_chunk_id, check if target
+                # synthesis file already exists on disk (race condition / state reset).
+                label_slug = "-".join((cluster.label[0] if cluster.label else "cluster").lower().split())[:60]
+                synthesis_rel = f"synthesis/{label_slug}.md"
+                if not cluster.consolidated_chunk_id and (vault_path / synthesis_rel).exists():
                     try:
-                        mtime = synthesis_path.stat().st_mtime
+                        mtime = (vault_path / synthesis_rel).stat().st_mtime
                         age_days = (time.time() - mtime) / 86400
                         if age_days < SYNTHESIS_STALE_DAYS:
-                            continue  # fresh synthesis exists — skip
+                            # File exists and is fresh — adopt it without re-synthesizing
+                            cluster.consolidated_chunk_id = synthesis_rel
+                            continue
                     except OSError:
-                        pass  # can't stat — fall through and re-synthesize
-                else:
-                    # consolidated_chunk_id points to a missing file — reset it
-                    cluster.consolidated_chunk_id = ""
+                        pass
 
-            # Additional guard: even without consolidated_chunk_id, check if target
-            # synthesis file already exists on disk (race condition / state reset).
-            label_slug = "-".join((cluster.label[0] if cluster.label else "cluster").lower().split())[:60]
-            synthesis_rel = f"synthesis/{label_slug}.md"
-            if not cluster.consolidated_chunk_id and (vault_path / synthesis_rel).exists():
-                try:
-                    mtime = (vault_path / synthesis_rel).stat().st_mtime
-                    age_days = (time.time() - mtime) / 86400
-                    if age_days < SYNTHESIS_STALE_DAYS:
-                        # File exists and is fresh — adopt it without re-synthesizing
-                        cluster.consolidated_chunk_id = synthesis_rel
-                        continue
-                except OSError:
-                    pass
-
-            degree_sum = sum(graph.get_node_degree(f) for f in cluster.member_files)
-            ranked.append((key, cluster, degree_sum))
+                degree_sum = sum(graph.get_node_degree(f) for f in cluster.member_files)
+                ranked.append((key, cluster, degree_sum))
 
         ranked.sort(key=lambda x: x[2], reverse=True)
 

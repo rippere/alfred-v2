@@ -193,9 +193,10 @@ class SurveyorDaemon(BaseDaemon):
             try:
                 from alfred.store.graph import GraphStore
                 graph = GraphStore(self.cfg.graph_path)
-                graph.load()
-                graph.add_edges_from_wikilinks(rel_path, record.wikilinks)
-                graph.save()
+                with graph.transaction():
+                    graph.load()
+                    graph.add_edges_from_wikilinks(rel_path, record.wikilinks)
+                    graph.save()
             except Exception:
                 pass
 
@@ -287,12 +288,13 @@ class SurveyorDaemon(BaseDaemon):
         try:
             from alfred.store.graph import GraphStore
             graph = GraphStore(self.cfg.graph_path)
-            graph.load()
-            cleared = graph.clear_cluster_edges()
-            self.log.debug("surveyor.cluster_edges_cleared", count=cleared)
-            for members in cluster_members.values():
-                graph.add_cluster_edges(members)
-            graph.save()
+            with graph.transaction():
+                graph.load()
+                cleared = graph.clear_cluster_edges()
+                self.log.debug("surveyor.cluster_edges_cleared", count=cleared)
+                for members in cluster_members.values():
+                    graph.add_cluster_edges(members)
+                graph.save()
         except Exception as e:
             self.log.warning("surveyor.graph_update_failed", error=str(e))
 

@@ -4,11 +4,34 @@ from __future__ import annotations
 import os
 import pickle
 import threading
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import structlog
 
 log = structlog.get_logger()
+
+# Module-level registry of per-path RLocks, keyed by resolved graph file path.
+# surveyor.py and consolidator.py each construct their own GraphStore(...) for
+# the same on-disk graph file rather than sharing one long-lived instance —
+# without this registry each instance would get its own independent RLock,
+# so a concurrent load/mutate/save sequence across instances is not mutually
+# exclusive and silently last-writer-wins, losing edges. Keying by resolved
+# path (instead of one global lock) still lets stores over distinct graph
+# files run concurrently.
+_locks_guard = threading.Lock()
+_path_locks: dict[str, threading.RLock] = {}
+
+
+def _lock_for_path(path: Path) -> threading.RLock:
+    key = str(Path(path).resolve())
+    with _locks_guard:
+        lock = _path_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _path_locks[key] = lock
+        return lock
 
 
 class GraphStore:
@@ -20,7 +43,27 @@ class GraphStore:
         # embedding/HDBSCAN work), so an asyncio.Lock alone can't cover it.
         # Reentrant because build_from_vault -> add_edges_from_wikilinks and
         # spreading_activation -> get_neighbors re-acquire under the same lock.
-        self._lock: threading.RLock = threading.RLock()
+        # Shared across all GraphStore instances pointed at the same path (see
+        # _lock_for_path) so independently-constructed instances in different
+        # daemons still serialize against each other.
+        self._lock: threading.RLock = _lock_for_path(path)
+
+    @contextmanager
+    def transaction(self) -> Iterator["GraphStore"]:
+        """Hold the path-shared lock across a multi-step load/mutate/save
+        sequence so the whole sequence is atomic relative to any other
+        GraphStore instance — including independently-constructed ones —
+        pointed at the same path.
+
+        Without this, sharing the lock alone is not enough: load(), a
+        mutation, and save() each acquire-and-release the lock separately,
+        so another instance's full load/mutate/save cycle can still
+        interleave between them and clobber this one's save (lost writes).
+        Reentrant, so nested load()/save()/mutate() calls inside the
+        `with` block re-acquire the same RLock without deadlocking.
+        """
+        with self._lock:
+            yield self
 
     def _graph(self):
         if self._g is None:
