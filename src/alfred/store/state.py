@@ -94,7 +94,16 @@ def _decode_state(raw: dict) -> PipelineState:
 def _merge_dict_field(key: str, base: dict, theirs: dict, mine: dict) -> dict:
     """Union-merge a dict-valued field: keys unknown to `mine` are kept from
     `theirs` (another writer's addition, e.g. a newly embedded file or
-    cluster); keys `mine` changed relative to `base` override theirs."""
+    cluster); keys `mine` changed relative to `base` override theirs.
+
+    Keys `mine` *removed* relative to `base` (e.g. janitor ghost-file pruning
+    or dedup deletion) are removed from the merged result too — unless
+    `theirs` independently changed that same key relative to `base` since
+    this instance loaded, i.e. a genuine concurrent edit-vs-delete conflict.
+    We resolve that conflict by keeping theirs's value: a live concurrent
+    edit wins over a stale delete, on the judgment that silently discarding
+    another writer's fresh update is worse than a deleted entry occasionally
+    reappearing (it will simply be deleted again on the next sweep)."""
     theirs_d = theirs.get(key, {}) or {}
     mine_d = mine.get(key, {}) or {}
     base_d = base.get(key, {}) or {}
@@ -102,6 +111,11 @@ def _merge_dict_field(key: str, base: dict, theirs: dict, mine: dict) -> dict:
     for k, v in mine_d.items():
         if v != base_d.get(k):
             merged[k] = v
+    for k in base_d:
+        if k in mine_d or k not in merged:
+            continue
+        if theirs_d.get(k) == base_d.get(k):
+            del merged[k]
     return merged
 
 

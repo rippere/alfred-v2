@@ -142,3 +142,65 @@ def test_concurrent_api_counter_increments_all_recorded(state_path):
         f"expected {n_writers} recorded calls, got {final.state.api_calls_today} — "
         "a concurrent save clobbered another writer's counter bump"
     )
+
+
+def test_clean_delete_with_no_concurrent_writer_actually_deletes(state_path):
+    """Adversarial-verification regression: the three-way dict-field merge
+    used to only overlay `mine`'s additions/changes onto `theirs`, never
+    `mine`'s deletions relative to `base` — so a key removed by this
+    instance (e.g. janitor ghost-file pruning) was silently resurrected on
+    the very next save, even with zero concurrent writers. This is the exact
+    reproduction from the bug report."""
+    seed = StateStore(state_path)
+    seed.load()
+    seed.state.files["ghost.md"] = FileState(md5="dead", last_embedded="2026-07-16")
+    seed.save()
+
+    store2 = StateStore(state_path)
+    store2.load()
+    assert "ghost.md" in store2.state.files
+
+    del store2.state.files["ghost.md"]
+    store2.save()
+
+    final = StateStore(state_path)
+    final.load()
+    assert final.state.files == {}, (
+        f"deleted key wrongly resurrected — expected {{}}, got {final.state.files!r}"
+    )
+
+
+def test_concurrent_edit_wins_over_stale_delete(state_path):
+    """Genuine concurrent conflict: instance A deletes key K while instance B
+    independently modifies K's value and saves first. Per the documented
+    resolution in _merge_dict_field, a live concurrent edit wins over a
+    stale delete (the deleting instance's `base` no longer reflects reality
+    for that key), so K must survive with B's value."""
+    seed = StateStore(state_path)
+    seed.load()
+    seed.state.files["shared.md"] = FileState(md5="orig", last_embedded="2026-07-16")
+    seed.save()
+
+    instance_a = StateStore(state_path)
+    instance_a.load()
+    instance_b = StateStore(state_path)
+    instance_b.load()
+
+    # A deletes the key based on its (now stale) loaded snapshot.
+    del instance_a.state.files["shared.md"]
+
+    # B independently changes the key's value and saves first.
+    instance_b.state.files["shared.md"] = FileState(md5="updated", last_embedded="2026-07-16T01:00:00Z")
+    instance_b.save()
+
+    # A's delete-based-on-stale-base then saves.
+    instance_a.save()
+
+    final = StateStore(state_path)
+    final.load()
+    assert "shared.md" in final.state.files, (
+        "concurrent edit was wrongly discarded in favor of a stale delete"
+    )
+    assert final.state.files["shared.md"].md5 == "updated", (
+        "expected theirs's (B's) concurrent edit to win over A's stale delete"
+    )
