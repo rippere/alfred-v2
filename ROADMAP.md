@@ -1,0 +1,133 @@
+# Alfred v2 — Phased Improvement Roadmap
+
+_Generated 2026-07-15 from a 5-way parallel subsystem audit (daemons/reliability, storage/query, MCP/security, operational maturity, test coverage). Branch: `claude/curator-data-loss-remedy-87wsbc`._
+
+## Executive Summary
+
+Alfred v2 is a functioning, actively-used personal knowledge system, but the audit surfaced a consistent pattern across every subsystem: **guards that look enforced but aren't**. The path-traversal check in `vault_ops._resolve()` is a string-prefix test that a real sibling directory (`vault-finance` / `vault-finance-backup-*`) already defeats. The distiller's primary write path (`vault_append_to_topic`) never acquires the `_write_lock` that `vault_create`/`vault_edit`/`vault_move` were explicitly hardened to use, so it races the janitor's dedup sweep on the exact directories it writes to. `GraphStore`'s lock lives on a short-lived per-call instance instead of the file, so concurrent daemon writes silently clobber each other's graph edges. Cross-process state (`state.json`) has no lock at all across the daemon and MCP/CLI processes, so long-running query servers can silently roll back daemon writes including API budget counters. Operationally, the fleet is caught mid-incident: legacy and migrated systemd units for two vaults are coexisting and PID-colliding tonight, invisible to the existing watchdog. Test coverage is inverted from risk: the write-path code with the worst recent incident history (a real ~10-note data loss fixed in commit `873ee06` days ago) has zero tests, while already-safer read/query paths are covered. None of this is architecturally fatal — the fixes are mostly small, mechanical, and independently shippable, which is what Phase 1 below focuses on. The single highest-leverage non-code action is enabling `loginctl linger` and fixing the live PID-collision incident, both operational rather than code changes.
+
+---
+
+## Phase 1 — Now
+
+Small, low-risk, high-value, independent fixes. Each is scoped to a disjoint (or near-disjoint) set of files so they can be built in parallel worktrees and merged with minimal conflict risk.
+
+- [ ] **P1-01-vault-ops-hardening**: Fix path-traversal boundary check and add missing write-lock coverage in `core/vault_ops.py` — `_resolve()` currently does a raw string-prefix test (`str(full).startswith(str(vault_path.resolve()))`) instead of a real path-boundary check, which a sibling directory whose name prefixes the vault name (e.g. `vault-finance` vs `vault-finance-backup-20260513-151423`, both of which exist on this host under `/mnt/external`) defeats entirely. Separately, `vault_append_to_topic()` (the distiller's primary write path) and `vault_delete()` never acquire the module's `_write_lock`, unlike `vault_create`/`vault_edit`/`vault_move` which were explicitly hardened for this exact TOCTOU class. (acceptance: `_resolve()` uses `Path.is_relative_to()` or `os.path.commonpath()` instead of string prefix comparison, and a new regression test constructs a sibling directory sharing the vault name as a prefix and asserts `VaultError` is raised when trying to escape into it; `vault_append_to_topic()` and `vault_delete()` wrap their full read-then-write (or delete) sequence in `with _write_lock:`, matching the pattern already used in `vault_edit()`; existing vault_ops tests (write new ones if none exist) pass and a concurrent-writer test (two threads calling `vault_append_to_topic`/`vault_edit` on the same path) does not lose either write.)
+
+- [ ] **P1-02-distiller-log-dropped-writes**: Stop silently dropping already-paid-for LLM extractions in `daemons/distiller.py` — the per-learning loop wraps `vault_append_to_topic(...)` in `try: ... except VaultError: pass`, so any failure (malformed YAML on the target topic file, a path-traversal rejection, a lock timeout) discards a learning that already cost a billed Anthropic API call, with zero log line and zero counter update. (acceptance: the `except VaultError` clause logs a warning via the existing structlog logger, e.g. `self.log.warning("distiller.topic_append_failed", path=rel_path, title=title, error=str(e))`, and a lightweight counter/state field records the failure count for the tick so it's visible in daemon status/logs; add or update a unit test that forces `vault_append_to_topic` to raise `VaultError` and asserts the warning is logged and the learning is not silently lost without trace.)
+
+- [ ] **P1-03-bm25-crash-safety**: Make `store/bm25.py` crash-safe on save and defensive on load, matching the pattern already applied to `StateStore` and `GraphStore` — `BM25Store.save()` writes the pickle directly with `self.path.write_bytes(pickle.dumps(payload))` with no temp-file + `os.replace()` pattern, so a process kill mid-write can leave a truncated `bm25.pkl`; `load()` has zero exception handling around `pickle.loads(...)`, so a corrupt pickle crashes any caller (`QueryEngine._get_bm25()`, `SurveyorDaemon._get_bm25()`) with a raw exception instead of a graceful "not found" signal. (acceptance: `BM25Store.save()` writes to a temp file in the same directory and calls `os.replace()` to the final path, mirroring `StateStore.save()`/`GraphStore.save()`; `BM25Store.load()` wraps `pickle.loads()` in a try/except that logs a warning and returns `False` on any unpickling error (matching the existing `if not store.load(): raise RuntimeError(...)` handling already present in callers); add a unit test that writes a corrupt/truncated file to the bm25 path and asserts `load()` returns `False` without raising, plus a test that a killed/interrupted `save()` (simulated by asserting temp-file + replace is used) never leaves a truncated file in place of a valid prior one.)
+
+- [ ] **P1-04-surveyor-recluster-dedupe**: Remove the duplicate, uncoordinated recluster trigger in `daemons/surveyor.py` — `SurveyorDaemon._tick()` independently checks `time.time() - self._last_cluster > CLUSTER_INTERVAL` and calls `self._recluster()` itself, even though `runner.py` already registers a separate APScheduler job (`surveyor.recluster`, every 1800s, `max_instances=1`) that calls the same method. Because `recluster()`'s APScheduler entry point never touches `self._last_cluster`, the two triggers run on independent ~1800s cadences and can fire concurrently, each doing an expensive vector-store `query_all` + HDBSCAN pass and writing to `state.clusters`/`state.files[...].semantic_cluster_id` from different stale snapshots — wasting compute and racing state writes. (acceptance: the internal `CLUSTER_INTERVAL` check and `self._recluster()` call are removed from `_tick()` (or `_tick()` and `recluster()` are made to consult/update a single shared `_last_cluster` guarded so only one of the two triggers ever runs at a time) — the APScheduler-registered `surveyor.recluster` job remains the sole trigger; a test or code inspection confirms `_tick()` no longer calls `_recluster()`/`self._last_cluster` bookkeeping is removed or unified; existing surveyor tests continue to pass.)
+
+- [ ] **P1-05-mcp-numeric-bounds-validation**: Clamp unbounded numeric MCP tool arguments in `mcp/tools.py` and `mcp/defaults.py` — `top_k`, `limit`, and `top_k_per_vault` are accepted as plain `int` with no range validation anywhere in the MCP tool layer. A negative `limit` silently mis-slices results (`results[:limit]` truncates from the wrong end instead of erroring) and an arbitrarily large `top_k` is a local resource-exhaustion / API-cost-amplification lever, especially via `meta_server.py`'s multi-vault fan-out plus FlashRank rerank. (acceptance: `top_k`/`limit`/`top_k_per_vault` are clamped to a documented sane range (e.g. 1-100) at the top of each `*_impl` function or centrally in `build_query_options()` in `mcp/defaults.py`, returning a clear validation error (not a silent clamp with no signal) for out-of-range input; add a unit test per affected tool asserting a negative or excessively large value is rejected/clamped with a clear error rather than silently mis-slicing or passing through unchecked.)
+
+- [ ] **P1-06-mcp-http-service-description-fix**: Correct the misleading "LAN access" description on the HTTP MCP systemd unit — `deploy/systemd/alfred-mcp-http.service` is labeled `Description=Alfred MCP HTTP server (LAN access)` and runs `python -m alfred.mcp.server_http` with no `Environment=ALFRED_HTTP_TOKEN=...` set, so auth is silently disabled (`log.warning('mcp.auth_disabled', ...)`) exactly as deployed today; it is currently saved only by `host` defaulting to `127.0.0.1` in code with no env var/CLI flag anywhere to actually deliver LAN exposure. The unit's own metadata documents an intent the code doesn't implement — a latent trap for whoever later "fixes" that gap. (acceptance: either (a) the unit's `Description=` is corrected to reflect actual localhost-only behavior (e.g. `Alfred MCP HTTP server (localhost only)`), dropping the "LAN access" claim, or (b) if LAN access is genuinely wanted, add `Environment=ALFRED_HTTP_TOKEN=...` sourced from a systemd credential/EnvironmentFile (not inline plaintext) to the unit file. Pick whichever the current deployment intent actually is (default to (a), the lower-risk documentation-only fix, unless the user specifies otherwise) and note the choice in the commit message.)
+
+---
+
+## Phase 2 — Next
+
+Structural / medium-risk improvements. Not executed in this pass — each needs its own scoped implementation pass, likely touching multiple files or introducing new cross-daemon coordination.
+
+- [ ] **GraphStore cross-daemon locking**: `GraphStore`'s `threading.RLock()` is created per-instance, not shared across the independent `GraphStore(...)` instantiations in `surveyor.py` (two call sites) and `consolidator.py`, so concurrent load/mutate/save sequences silently last-writer-wins and lose graph edges. Needs a shared lock (module-level, or a single long-lived instance injected via `runner.py`) rather than a quick file-local patch. _Rationale: critical data-loss bug, but the right fix reshapes how GraphStore is constructed/injected across 3+ call sites — too broad for Phase 1._
+
+- [ ] **Cross-process state.json locking**: No `flock`/`FileLock`/CAS scheme protects `state.json` across the daemon process and independent MCP/CLI processes that each cache their own `StateStore` snapshot; long-lived query servers can silently overwrite daemon writes (new embeds, cluster state, API budget counters) on every query-triggered save. _Rationale: needs either a real file lock or a CAS/re-merge scheme touching `store/state.py` and all 3 MCP server entry points — a coordinated design change, not a one-file patch._
+
+- [ ] **LanceDB quarantine/recreate cross-process race**: `_quarantine_and_recreate()` has no cross-process coordination; two processes racing the same corrupted table can both pass the corruption check, one loses the `mode='create'` race and crashes uninformatively instead of healing; the `_MAX_QUARANTINES_PER_DAY` circuit breaker has the same TOCTOU. _Rationale: needs an on-disk lock around the whole quarantine sequence plus retry-as-reader logic for the losing process — multi-function, needs careful testing of the corruption-simulation path._
+
+- [ ] **Janitor orphaned vector-store cleanup**: `JanitorDaemon` has no reference to the vector store, so `_archive_sessions()` and `_dedup_sweep()` permanently orphan LanceDB embeddings for moved/deleted files (surveyor's own deletion path already does this correctly). _Rationale: requires a constructor signature change in `runner.py` plus two call-site changes in `janitor.py` — small in isolation but touches daemon wiring, better done deliberately with a test for the new delete-on-archive/dedup path._
+
+- [ ] **Surveyor delete-before-upsert ordering**: In `_process_diff`, the changed-file `delete_file` call is unguarded (unlike the deleted-files loop) and, on a subsequent `upsert_many` failure, leaves `state.files[rel_path]` pointing at chunk_ids already deleted from the vector store — a silent content-availability gap reported as healthy. _Rationale: needs a behavior decision (defer delete until after successful upsert vs. mark file "missing" on failure) plus tests for both success and failure paths._
+
+- [ ] **BM25 corpus staleness / dead sparse-vector computation**: The `bm25_only` search path uses a frozen corpus only populated by an archived one-off script, never updated by the live surveyor pipeline, while `LanceDBStore.upsert_many()` silently discards the `sparse` vectors computed on every embed. _Rationale: requires deciding whether to wire BM25 into the live pipeline or formally deprecate `bm25_only` — a product decision, not just a bug fix._
+
+- [ ] **Live PID-collision incident (legacy vs template systemd units)**: `alfred-finance.service`/`alfred-neuroscience.service` (legacy, pre-migration units) coexist with the templated `alfred@finance.service`/`alfred@neuroscience.service` and are currently the ones actually running, having crash-looped through the exact PID-collision failure mode the migration was meant to eliminate. _Rationale: operational incident response (re-run migration, find what recreated the legacy files, add a drift check), not a code PR — needs direct action outside the worktree/PR flow, and is explicitly excluded from this pass's hard rules (no systemctl actions)._
+
+- [ ] **Ledger push-failure alerting gap**: `ledger-collect.service`'s `OnFailure=` alert can never fire from a NovaCRM push error because `collect()` never exits non-zero on `status == "error"`. _Rationale: small in isolated diff but needs a decision about which failure statuses are fatal vs. expected (dry-run is intentional and must stay non-fatal) — worth a deliberate pass with test coverage of the exit-code branching._
+
+- [ ] **Fleet-wide API budget visibility**: Each vault gates its own `api_calls_today`/budget independently with no aggregate daily-spend view, dashboard, or alert across the ~5-6 active vault processes. _Rationale: needs a new rollup script or a ledger metric extension — new capability, not a bug fix._
+
+- [ ] **Single-disk backup exposure**: The only "backup" of vault data (`/mnt/external/backups/benderman-home/`) lives on the same physical disk as the live data — one disk failure loses both simultaneously. _Rationale: infrastructure/ops work (new backup target, rsync/restic timer), not a code change; high priority but outside this pass's code-PR scope._
+
+- [ ] **Vault-mutation core test coverage**: `core/vault_ops.py`, `daemons/janitor.py`, and `daemons/curator.py` — the subsystem responsible for the most recent real data-loss incident (`873ee06`) — have zero unit tests beyond what P1-01 adds for the two specific guards. _Rationale: Phase 1 adds targeted regression tests for the path-traversal and lock fixes; full coverage of create/edit/move/delete, curator's dedup-key logic, and janitor's FM001-004 autofix is a larger, dedicated test-writing pass._
+
+- [ ] **LanceDB self-heal unit tests**: The corruption-marker matching, quarantine-dir naming, and `_MAX_QUARANTINES_PER_DAY` circuit-breaker logic in `store/lancedb_store.py` have no tests simulating transient-vs-corruption exceptions or breaker-tripping behavior. _Rationale: pairs naturally with the Phase 2 cross-process locking fix above — better done together once the locking behavior is also being changed._
+
+- [ ] **Daemon tick-logic test coverage**: ~2070 lines across `janitor.py`, `consolidator.py`, `curator.py`, `distiller.py`, `surveyor.py` have no tests exercising actual tick logic (only APScheduler job-registration metadata is tested); these 5 files also account for ~60 of the ~92 `except Exception` clauses in the codebase. _Rationale: large, multi-file test-writing effort requiring Anthropic-client and vault-I/O mocking — a dedicated pass, not a Phase 1 slice._
+
+- [ ] **Ledger subsystem test coverage**: `ledger/{cli,collect,config,db,push,sources}.py` (~900 lines) has zero tests, including the idempotent upsert-by-(date,metric) logic in `db.py` and the credential-presence dry-run branching in `push.py`. _Rationale: independent, well-scoped test-writing task; deferred to Phase 2 purely on prioritization, not risk — a reasonable Phase-1 candidate for a future batch._
+
+- [ ] **Retrieval/synthesis pipeline test coverage**: `query/synth.py`, `query/context.py`, `query/memory.py`, `query/wiki.py`, `wiki/writer.py`, and `embed/` (hopfield, ollama, reranker) have no direct tests despite `query/engine.py` being covered. _Rationale: needs LLM-call mocking strategy decisions before tests can be written meaningfully._
+
+---
+
+## Phase 3 — Later
+
+Strategic / long-term items: architecture changes and new capabilities.
+
+- [ ] **Unify vault mutation locking into a single coordinated primitive**: Today `_write_lock` (vault_ops), `GraphStore`'s per-instance lock, `StateStore`'s in-process asyncio.Lock, and LanceDB's implicit reliance on "multiple readers can open safely" are four different, uncoordinated concurrency models protecting different but overlapping resources (the same rel_path can be touched by vault_ops, graph edges, state.json, and the vector store nearly simultaneously). _Rationale: the individual Phase 1/2 fixes patch each primitive in isolation; a longer-term redesign (e.g. a single per-vault coordination service, or moving to a real embedded DB with transactional guarantees) would eliminate this entire bug class at the root instead of chasing individual races._
+
+- [ ] **Cross-process safe state store (replace ad hoc StateStore + GraphStore + BM25Store pickle files)**: Multiple independent processes (daemon, 3 MCP server variants, CLI, ledger) each read/write overlapping on-disk state with no unified transaction model. A move to something like SQLite (WAL mode) or a lightweight embedded KV store with real ACID semantics would remove the entire "silent lost update" bug class the audit repeatedly found across state.json, graph.pkl, and bm25.pkl. _Rationale: multi-week architectural migration touching nearly every daemon and MCP entry point — the highest-leverage long-term fix but far outside "small independent task" scope._
+
+- [ ] **True hybrid (dense + sparse) retrieval**: BM25/sparse vectors are computed on every embed but silently discarded by the LanceDB backend, and the offline `bm25_only` corpus is a frozen, never-refreshed snapshot — the system's "hybrid" framing is currently misleading (production retrieval is dense-only). Building genuine hybrid retrieval (BM25 wired into the live surveyor pipeline, or LanceDB's native sparse/FTS support if available) is a real capability improvement, not just a bug fix. _Rationale: a deliberate retrieval-quality investment, best scoped once Phase 2's BM25-staleness decision is made._
+
+- [ ] **Fleet-wide backup + disaster recovery strategy**: Beyond the immediate single-disk-exposure fix in Phase 2, a considered DR strategy (offsite/cloud target, backup retention policy, restore drill) for the vault content, state stores, and ledger DB. _Rationale: strategic infrastructure investment, not a one-off task — needs a target, retention policy, and cost/complexity tradeoff decision._
+
+- [ ] **Systemd unit lifecycle hardening / drift detection**: Beyond fixing tonight's live PID-collision incident (Phase 2), build a structural safeguard (a timer or watchdog check) that fails loudly if legacy and templated units for the same vault ever coexist again, plus an audit of what tooling still references the legacy unit names (e.g. `game-guard`'s `USER_UNITS` array). _Rationale: a small immediate incident-response item is in Phase 2; the durable "never again" safeguard is a genuine new capability worth designing deliberately rather than bolting onto the existing watchdog reactively._
+
+- [ ] **Formal trust-boundary / authorization model for MCP transports**: Today stdio transports (`server.py`, `meta_server.py`) have zero authentication (any process that can spawn them gets full read + `vault_feedback` write access across every configured vault including finance/personal), and the one guarded transport (HTTP) had its auth fix land only on that one of three copy-pasted server implementations. A deliberate access-control model (identity per client, per-tool/per-vault allowlists, shared enforcement in `tools.py`'s `register_tools` layer) would close this class of drift permanently instead of patching each surface reactively. _Rationale: genuine security architecture work, best done once, applied everywhere — not a quick Phase 1 fix._
+
+---
+
+## Appendix — Full Audit Findings by Area
+
+### Area 1: Alfred daemon subsystem reliability/data-loss audit (daemons/{base,curator,surveyor,janitor,distiller,consolidator}.py + runner.py)
+
+| Severity | Finding |
+|---|---|
+| critical | GraphStore's lock is per-instance, providing zero cross-daemon mutual exclusion — concurrent writers silently clobber each other's graph edges |
+| critical | `vault_append_to_topic()` — the distiller's every-write path — has no `_write_lock`, unlike vault_create/vault_edit/vault_move |
+| high | `SurveyorDaemon._recluster()` is effectively scheduled twice (internal tick check + independent APScheduler job), racing state/graph writes |
+| high | `distiller._distill_file` swallows `VaultError` from `vault_append_to_topic` with a bare `except VaultError: pass` — a paid-for LLM extraction is silently dropped |
+| medium | `JanitorDaemon` has no reference to the vector store, so session archival and dedup-sweep deletions permanently orphan LanceDB embeddings |
+
+### Area 2: Storage/query subsystem (src/alfred/store/, src/alfred/query/)
+
+| Severity | Finding |
+|---|---|
+| critical | Cross-process lost-update race on `state.json` between daemon and MCP/CLI query processes |
+| high | LanceDB quarantine/recreate self-heal is not safe under the concurrent daemon+CLI access it was designed to allow |
+| high | Surveyor delete-before-upsert ordering + inconsistent error handling can leave a file's content silently absent from the index while state still claims it's indexed |
+| medium | `BM25Store.save()` is not crash-safe and `load()` has zero exception handling — same corruption class already fixed for LanceDB/GraphStore/StateStore was not applied here |
+| medium | BM25 corpus is a frozen snapshot that drifts from the live vault, and its sparse vectors are silently discarded on the production (LanceDB) write path |
+
+### Area 3: MCP server / security surface audit (src/alfred/mcp/, core/vault_ops.py resolution helper)
+
+| Severity | Finding |
+|---|---|
+| critical | Path-traversal guard in `vault_ops._resolve()` is a string-prefix check, not a boundary check — bypassable via sibling directories, concretely exploitable in this deployment |
+| high | HTTP MCP transport ships auth-disabled by default, and the production systemd unit — labeled "LAN access" — never sets `ALFRED_HTTP_TOKEN` |
+| medium | No bounds/type validation on numeric MCP tool arguments (`top_k`, `limit`, `top_k_per_vault`) across all three servers |
+| medium | Zero tool-level authorization on the stdio transports — HTTP is now the only surface with any guard |
+| low | Broad except-and-swallow patterns hide failures that could mask a future broken guard |
+
+### Area 4: Operational maturity (deploy/systemd, watchdog/alerting scripts, life-KPI ledger, budget-guard logic)
+
+| Severity | Finding |
+|---|---|
+| critical | Live PID-collision crash loop right now: legacy and migrated systemd units coexist for 2 of 4 vaults; fleet is actually running on the unmigrated legacy units |
+| high | The only "backup" of the vault data lives on the same physical disk as the live data — one disk failure loses both |
+| high | Ledger's NovaCRM push failures are swallowed — the `OnFailure` alerting wired onto `ledger-collect.service` can never actually fire from a push error |
+| medium | Budget-guard is per-vault-process only — no fleet-wide daily spend visibility, cap, or alert |
+| medium | The entire fleet depends on an active login session — `loginctl enable-linger` is not set despite INSTALL.md recommending it for always-on operation |
+
+### Area 5: Test coverage and code quality audit (src/alfred vs tests/)
+
+| Severity | Finding |
+|---|---|
+| critical | Vault-mutation core (`vault_ops.py`) and the daemons that write through it have zero tests — same subsystem that caused a real data-loss incident days ago |
+| high | LanceDB corruption self-heal / quarantine-and-recreate path is destructive and completely untested |
+| high | ~26% of the codebase by line count (`daemons/`) has no logic-level tests — only job-scheduling metadata is tested |
+| medium | `ledger/` subsystem (6 files, ~900 lines) has zero test coverage |
+| medium | Retrieval/synthesis pipeline downstream of the tested query engine is untested |
