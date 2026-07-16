@@ -8,6 +8,9 @@ must guarantee readers never observe a truncated pickle.
 from __future__ import annotations
 
 import pickle
+import subprocess
+import sys
+import textwrap
 import threading
 
 import pytest
@@ -83,7 +86,7 @@ def test_concurrent_save_load_no_lost_writes(graph_path):
     assert not missing, f"lost writes — {len(missing)} nodes missing, e.g. {sorted(missing)[:5]}"
 
     # Atomic-save hygiene: no orphaned tmp file left behind.
-    assert not graph_path.with_name(graph_path.name + ".tmp").exists()
+    assert not list(graph_path.parent.glob(f".{graph_path.name}.*.tmp"))
 
 
 def test_independent_instances_share_lock_no_lost_writes(graph_path):
@@ -129,7 +132,7 @@ def test_independent_instances_share_lock_no_lost_writes(graph_path):
     missing = expected - set(g.nodes)
     assert not missing, f"lost writes across independent instances — {len(missing)} missing, e.g. {sorted(missing)[:5]}"
 
-    assert not graph_path.with_name(graph_path.name + ".tmp").exists()
+    assert not list(graph_path.parent.glob(f".{graph_path.name}.*.tmp"))
 
 
 def test_save_is_atomic_replacement(graph_path):
@@ -144,4 +147,75 @@ def test_save_is_atomic_replacement(graph_path):
     assert first != second
     g = pickle.loads(second)
     assert set(g.nodes) >= {"a.md", "b.md", "c.md", "d.md"}
-    assert not graph_path.with_name(graph_path.name + ".tmp").exists()
+    assert not list(graph_path.parent.glob(f".{graph_path.name}.*.tmp"))
+
+
+N_PROCS = 8
+OPS_PER_PROC = 20
+
+_WORKER_SCRIPT = textwrap.dedent(
+    """
+    import sys
+    from pathlib import Path
+
+    from alfred.store.graph import GraphStore
+
+    graph_path, tid, ops_per_proc = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+    for i in range(ops_per_proc):
+        store = GraphStore(Path(graph_path))
+        with store.transaction():
+            store.load()
+            store.add_edges_from_wikilinks(
+                f"p{tid}/note-{i:03d}.md", [f"p{tid}/target-{i % 7}.md"]
+            )
+            store.save()
+    """
+)
+
+
+def test_concurrent_real_subprocesses_no_lost_writes_no_crash(graph_path, tmp_path):
+    """Reproduces the cross-process gap: `alfred up --only <daemon>` lets
+    surveyor and consolidator run as genuinely separate OS processes against
+    the same graph file, each independently constructing GraphStore(path)
+    and calling transaction(): load(); mutate(); save(). threading.RLock is
+    process-local and does nothing here — before the flock sidecar lock and
+    unique per-call temp filename, this crashed with FileNotFoundError on
+    os.replace() (processes collided on the fixed "<path>.tmp" name) and
+    silently lost the majority of writes to last-writer-wins clobbering.
+    """
+    seed = GraphStore(graph_path)
+    seed.add_edges_from_wikilinks("seed.md", ["seed-target.md"])
+    seed.save()
+
+    script_path = tmp_path / "graph_worker.py"
+    script_path.write_text(_WORKER_SCRIPT)
+
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(script_path), str(graph_path), str(tid), str(OPS_PER_PROC)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for tid in range(N_PROCS)
+    ]
+
+    failures = []
+    for tid, p in enumerate(procs):
+        out, _ = p.communicate(timeout=120)
+        if p.returncode != 0:
+            failures.append(f"process {tid} exited {p.returncode}:\n{out}")
+
+    assert not failures, "subprocess crash(es) — the exact FileNotFoundError/os.replace race this test guards against:\n" + "\n\n".join(failures)
+
+    g = pickle.loads(graph_path.read_bytes())
+    expected = {
+        f"p{tid}/note-{i:03d}.md" for tid in range(N_PROCS) for i in range(OPS_PER_PROC)
+    }
+    missing = expected - set(g.nodes)
+    assert not missing, (
+        f"lost writes across real OS processes — {len(missing)}/{len(expected)} nodes missing, "
+        f"e.g. {sorted(missing)[:5]}"
+    )
+
+    assert not list(graph_path.parent.glob(f".{graph_path.name}.*.tmp"))
