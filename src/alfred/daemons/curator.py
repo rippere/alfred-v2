@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -86,16 +87,29 @@ class CuratorDaemon(BaseDaemon):
 
         for md_file in sorted(inbox_path.glob("*.md")):
             rel_str = str(md_file.relative_to(self.cfg.vault_path)).replace("\\", "/")
-            if rel_str in state.curator_processed:
-                continue
             try:
-                ingested = await self._ingest_file(md_file, processed_dir)
+                content_hash = hashlib.sha256(md_file.read_bytes()).hexdigest()[:16]
+            except OSError as e:
+                self.log.warning("curator.read_error", path=rel_str, error=str(e))
+                continue
+            # Keyed on path+content, not path alone: a path can be reused (a new
+            # note dropped under a filename an old, already-archived note used).
+            # A path-only key marks that path "done" forever and silently
+            # swallows every future drop at it — that's how curator lost ~10
+            # re-dropped notes over 3 weeks before anyone noticed.
+            process_key = f"{rel_str}#{content_hash}"
+            if process_key in state.curator_processed:
+                continue
+            if rel_str in state.curator_processed:
+                self.log.warning("curator.redrop_detected", path=rel_str)
+            try:
+                ingested = await self._ingest_file(md_file, processed_dir, content_hash)
                 if ingested:
-                    state.curator_processed[rel_str] = datetime.now(timezone.utc).isoformat()
+                    state.curator_processed[process_key] = datetime.now(timezone.utc).isoformat()
             except Exception as e:
                 self.log.warning("curator.ingest_error", path=rel_str, error=str(e))
 
-    async def _ingest_file(self, inbox_file: Path, processed_dir: Path) -> bool:
+    async def _ingest_file(self, inbox_file: Path, processed_dir: Path, content_hash: str) -> bool:
         try:
             post = frontmatter.load(str(inbox_file))
             fm = dict(post.metadata)
@@ -213,12 +227,16 @@ class CuratorDaemon(BaseDaemon):
             except Exception as e:
                 self.log.debug("curator.project_link_failed", path=created_path, error=str(e))
 
-        # Move to processed/
+        # Move to processed/. If this filename was already archived (a reused
+        # inbox path — see the process_key comment in _process_inbox),
+        # disambiguate with the content hash instead of unlinking: the source
+        # has already been ingested at this point, but deleting it here would
+        # destroy the only raw copy of the newly-recovered content with no
+        # archived fallback.
         dest = processed_dir / inbox_file.name
-        if not dest.exists():
-            inbox_file.rename(dest)
-        else:
-            inbox_file.unlink()
+        if dest.exists():
+            dest = processed_dir / f"{inbox_file.stem}.{content_hash}{inbox_file.suffix}"
+        inbox_file.rename(dest)
 
         self.emit("curator_ingested", source=inbox_file.name, type=rec_type)
         return True
