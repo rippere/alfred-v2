@@ -1,7 +1,16 @@
-"""Alfred MCP HTTP/SSE server — localhost-only transport for Claude Code clients.
+"""Alfred MCP HTTP server — streamable-http transport for Claude Code clients.
 
-This module exposes the same vault tools as server.py but over HTTP/SSE on
-127.0.0.1:8765.  Binding to loopback prevents accidental LAN exposure.
+This module exposes the same vault tools as server.py but over HTTP, by default
+on 127.0.0.1:8765.  ALFRED_HTTP_HOST/ALFRED_HTTP_PORT override that; the default
+stays loopback so widening the bind is always a deliberate act, and a
+non-loopback host without ALFRED_HTTP_TOKEN is refused outright.
+
+The deployed unit binds the Tailscale interface address specifically (never
+0.0.0.0) so the vault is reachable from the tailnet but not from the LAN.
+
+The app is mounted at /mcp (fastmcp's streamable-http default). There is no
+/query route — RUNBOOK.md and scripts/content-brief.sh still reference one and
+have been getting 404s independently of the transport change.
 
 Optional auth: set ALFRED_HTTP_TOKEN in the environment to require a Bearer
 token in the Authorization header.  When the variable is unset the server
