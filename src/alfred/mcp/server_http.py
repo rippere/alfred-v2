@@ -124,4 +124,15 @@ def run_server(config_path: Path, host: str = "127.0.0.1", port: int = 8765) -> 
 
 if __name__ == "__main__":
     _config = os.environ.get("ALFRED_CONFIG") or str(Path(__file__).parents[3] / "config.yaml")
-    run_server(Path(_config))
+    # Host/port are overridable so the unit can bind the tailnet interface for
+    # laptop access. Defaults stay loopback: widening the bind has to be a
+    # deliberate act, and it must be paired with ALFRED_HTTP_TOKEN — otherwise
+    # the vault's whole query surface is served to the network unauthenticated.
+    _host = os.environ.get("ALFRED_HTTP_HOST", "127.0.0.1")
+    _port = int(os.environ.get("ALFRED_HTTP_PORT", "8765"))
+    if _host != "127.0.0.1" and not os.environ.get("ALFRED_HTTP_TOKEN"):
+        raise SystemExit(
+            f"ALFRED_HTTP_HOST={_host} is non-loopback but ALFRED_HTTP_TOKEN is unset. "
+            "Refusing to serve the vault to the network without auth."
+        )
+    run_server(Path(_config), host=_host, port=_port)
