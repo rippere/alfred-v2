@@ -9,8 +9,9 @@ The deployed unit binds the Tailscale interface address specifically (never
 0.0.0.0) so the vault is reachable from the tailnet but not from the LAN.
 
 The app is mounted at /mcp (fastmcp's streamable-http default). There is no
-/query route — RUNBOOK.md and scripts/content-brief.sh still reference one and
-have been getting 404s independently of the transport change.
+/query route and none is planned: the two callers that used to expect one
+(RUNBOOK.md, scripts/content-brief.sh) now use the `alfred query --json` CLI,
+which runs on the same host as the vault and needs no HTTP, auth or network.
 
 Optional auth: set ALFRED_HTTP_TOKEN in the environment to require a Bearer
 token in the Authorization header.  When the variable is unset the server
