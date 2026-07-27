@@ -213,8 +213,6 @@ class QueryEngine:
             answer, backend, model = synthesize(
                 query=text,
                 context=context,
-                anthropic_model=self.cfg.anthropic_model,
-                openrouter_model=self.cfg.openrouter_model,
                 ollama_base_url=self.cfg.ollama_base_url,
                 ollama_model=self.cfg.ollama_llm_model,
             )
@@ -319,8 +317,6 @@ class QueryEngine:
             answer, backend, model = synthesize(
                 query=text,
                 context=context,
-                anthropic_model=self.cfg.anthropic_model,
-                openrouter_model=self.cfg.openrouter_model,
                 ollama_base_url=self.cfg.ollama_base_url,
                 ollama_model=self.cfg.ollama_llm_model,
             )

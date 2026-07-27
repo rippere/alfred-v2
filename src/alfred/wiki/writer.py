@@ -80,10 +80,6 @@ class WikiWriter:
 
     def enrich_page(self, entity_name: str, new_source_paths: list[str]) -> bool:
         """Call LLM to extract new facts from new sources. Returns True if updated."""
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            return False
-
         state = self.state.state
         key = entity_name.lower()
         page = state.wiki_pages.get(key)
@@ -110,17 +106,21 @@ class WikiWriter:
         )
 
         try:
-            from alfred.core.anthropic_client import get_client
-            client = get_client()
-            resp = client.messages.create(
-                model=self.cfg.anthropic_model,
+            from alfred.core.local_llm import LocalLLMUnavailable, complete_json
+            data = complete_json(
+                "You extract structured facts about an entity from source documents.",
+                prompt,
+                base_url=self.cfg.ollama_base_url,
+                model=self.cfg.ollama_llm_model,
                 max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
             )
-            raw = resp.content[0].text.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            data = json.loads(raw)
+        except LocalLLMUnavailable as e:
+            # Returning False leaves the page unenriched and its sources still
+            # pending, so the next pass retries. Distinct log event from a
+            # genuine extraction failure so a paused backend is not mistaken
+            # for a model that had nothing to add.
+            log.info("wiki.enrich_backend_unavailable", entity=entity_name, error=str(e))
+            return False
         except Exception as e:
             log.warning("wiki.enrich_error", entity=entity_name, error=str(e))
             return False

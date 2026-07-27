@@ -11,7 +11,7 @@ from datetime import date, datetime, timezone
 import httpx
 import structlog
 
-from alfred.core.anthropic_client import get_client
+from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import vault_create, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
@@ -309,31 +309,10 @@ class ConsolidatorDaemon(BaseDaemon):
             f"Return only the formatted synthesis — no preamble."
         )
 
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if anthropic_key and self.state.can_make_api_call(daemon="consolidator"):
-            try:
-                client = get_client()
-
-                def _call():
-                    resp = client.messages.create(
-                        model=self.cfg.anthropic_model,
-                        max_tokens=600,
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-                    return resp
-
-                resp = await asyncio.to_thread(_call)
-                usage = resp.usage
-                self.state.record_api_call(
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    cached_tokens=getattr(usage, "cache_read_input_tokens", 0),
-                )
-                return resp.content[0].text.strip()
-            except Exception as e:
-                self.log.warning("consolidator.claude_error", error=str(e))
-
-        # Ollama fallback
+        # Local backend only. The Anthropic leg that used to sit here was removed
+        # with the rest of the cloud chain; the Ollama path below was already the
+        # de-facto backend anyway, since the cloud call had been 400-ing on an
+        # exhausted credit balance and falling through silently.
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
@@ -423,13 +402,8 @@ class ConsolidatorDaemon(BaseDaemon):
                 error=traceback.format_exc(),
             )
 
-        # ── Fallback 1: Anthropic ─────────────────────────────────────────────
-        if not self.state.can_make_api_call(daemon="consolidator"):
-            return ""
+        # ── Fallback 1: local model ───────────────────────────────────────────
         try:
-            from alfred.core.anthropic_client import get_client
-
-            client = get_client()
             file_list_short = "\n".join(f"- {f}" for f in member_files[:10])
             fallback_prompt = (
                 f"These files are in the same knowledge cluster:\n{file_list_short}\n\n"
@@ -437,20 +411,26 @@ class ConsolidatorDaemon(BaseDaemon):
                 "Return only the label, no explanation."
             )
 
-            def _call():
-                response = client.messages.create(
-                    model=self.cfg.anthropic_model,
+            def _call() -> str:
+                return complete(
+                    "You label clusters of related documents concisely.",
+                    fallback_prompt,
+                    base_url=self.cfg.ollama_base_url,
+                    model=self.cfg.ollama_llm_model,
                     max_tokens=20,
-                    messages=[{"role": "user", "content": fallback_prompt}],
-                )
-                return response.content[0].text.strip()
+                ).strip()
 
             label = await asyncio.to_thread(_call)
             if label:
                 return label
+        except LocalLLMUnavailable as e:
+            # Deliberately non-fatal here, unlike curator/distiller: fallback 2
+            # below derives a label from filenames, so a paused backend costs
+            # label quality, not correctness, and never blocks clustering.
+            self.log.info("consolidator.label_backend_unavailable", error=str(e))
         except Exception:
             self.log.warning(
-                "consolidator.anthropic_label_error",
+                "consolidator.local_label_error",
                 error=traceback.format_exc(),
             )
 

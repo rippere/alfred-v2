@@ -75,8 +75,8 @@ def test_topic_append_failure_is_logged_counted_and_does_not_abort(tmp_path, mon
         {"title": "second-learning-succeeds", "body": "insight two", "tags": ["misc"]},
     ]
     monkeypatch.setattr(
-        "alfred.daemons.distiller.get_client",
-        lambda: _FakeClient(learnings),
+        "alfred.daemons.distiller.complete",
+        lambda *a, **kw: json.dumps(learnings),
     )
 
     calls: list[str] = []
@@ -127,7 +127,7 @@ def test_topic_append_success_does_not_increment_failure_counter(tmp_path, monke
         },
     )
     learnings = [{"title": "clean-learning", "body": "insight", "tags": ["misc"]}]
-    monkeypatch.setattr("alfred.daemons.distiller.get_client", lambda: _FakeClient(learnings))
+    monkeypatch.setattr("alfred.daemons.distiller.complete", lambda *a, **kw: json.dumps(learnings))
     monkeypatch.setattr(
         "alfred.daemons.distiller.vault_append_to_topic",
         lambda vault_path, topic_slug, title, body_text, tags=None, source=None: {
@@ -161,7 +161,7 @@ def test_tick_normal_path_distills_stale_file_end_to_end(tmp_path, monkeypatch):
         },
     )
     learnings = [{"title": "tick-learning", "body": "insight from tick", "tags": ["misc"]}]
-    monkeypatch.setattr("alfred.daemons.distiller.get_client", lambda: _FakeClient(learnings))
+    monkeypatch.setattr("alfred.daemons.distiller.complete", lambda *a, **kw: json.dumps(learnings))
 
     appended: list[str] = []
 

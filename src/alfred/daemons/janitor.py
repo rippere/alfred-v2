@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 import structlog
 
-from alfred.core.anthropic_client import get_client
+from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.schema import (
     KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
@@ -337,11 +337,6 @@ class JanitorDaemon(BaseDaemon):
 
     async def _deep_sweep(self) -> None:
         """LLM enrichment for stub records. One call per file, one template per call."""
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not anthropic_key:
-            self.log.info("janitor.deep_skip", reason="no ANTHROPIC_API_KEY")
-            return
-
         vault_path = self.cfg.vault_path
         ignore = set(self.cfg.ignore_dirs)
         state = self.state.state
@@ -359,6 +354,17 @@ class JanitorDaemon(BaseDaemon):
                 fs.open_issues = [c for c in fs.open_issues if c != IssueCode.STUB_RECORD.value]
                 enriched += 1
                 await asyncio.sleep(1.0)   # gentle rate limiting
+            except LocalLLMUnavailable as e:
+                # Stop rather than retry a dead backend per stub. The STUB_RECORD
+                # issue is only cleared on a successful enrichment, so everything
+                # unreached stays queued for the next sweep.
+                self.log.warning(
+                    "janitor.backend_unavailable",
+                    error=str(e),
+                    deferred_from=rel_path,
+                    enriched_before_stop=enriched,
+                )
+                break
             except Exception as e:
                 self.log.warning("janitor.enrich_error", path=rel_path, error=str(e))
 
@@ -395,18 +401,16 @@ class JanitorDaemon(BaseDaemon):
         if len(prompt_bytes) > self.cfg.janitor_max_bytes_per_call:
             prompt = prompt[:self.cfg.janitor_max_bytes_per_call].decode("utf-8", errors="replace")
 
-        client = get_client()
-
-        def _call():
-            resp = client.messages.create(
-                model=self.cfg.anthropic_model,
+        def _call() -> str:
+            return complete(
+                "You are a careful editor enriching a knowledge-vault record.",
+                prompt,
+                base_url=self.cfg.ollama_base_url,
+                model=self.cfg.ollama_llm_model,
                 max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
             )
-            return resp
 
-        resp = await asyncio.to_thread(_call)
-        new_body = resp.content[0].text.strip()
+        new_body = (await asyncio.to_thread(_call)).strip()
         if new_body and len(new_body) > 20:
             vault_edit(vault_path, rel_path, body_replace=new_body)
             self.log.info("janitor.enriched_file", path=rel_path, chars=len(new_body))

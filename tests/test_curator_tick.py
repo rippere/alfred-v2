@@ -58,13 +58,12 @@ class _FakeClient:
         self.messages = _FakeMessages(payload)
 
 
-def test_tick_normal_path_classifies_and_ingests_via_mocked_anthropic(tmp_path, monkeypatch):
+def test_tick_normal_path_classifies_and_ingests_via_mocked_local_llm(tmp_path, monkeypatch):
     """A note with no `type` frontmatter must be routed through the real LLM
-    classification branch — mocked Anthropic client only — and land as a
+    classification branch — mocked local backend only — and land as a
     real vault record via the actual tick() APScheduler entry point."""
     daemon, state_store = _make_daemon(tmp_path)
     vault_path = daemon.cfg.vault_path
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
     inbox_file = vault_path / "inbox" / "untyped.md"
     inbox_file.write_text("Just a raw dropped note with no frontmatter at all.\n", encoding="utf-8")
@@ -76,8 +75,8 @@ def test_tick_normal_path_classifies_and_ingests_via_mocked_anthropic(tmp_path, 
         "tags": ["misc"],
     }
     monkeypatch.setattr(
-        "alfred.daemons.curator.get_client",
-        lambda: _FakeClient(classification),
+        "alfred.daemons.curator.complete_json",
+        lambda *a, **kw: classification,
     )
 
     asyncio.run(daemon.tick())
@@ -86,7 +85,40 @@ def test_tick_normal_path_classifies_and_ingests_via_mocked_anthropic(tmp_path, 
     assert (vault_path / "inbox" / "processed" / "untyped.md").exists()
     assert (vault_path / "note" / "llm-classified-note.md").exists()
     assert len(state_store.state.curator_processed) == 1
-    assert state_store.state.api_calls_today == 1
+
+
+def test_tick_defers_whole_batch_when_backend_unavailable(tmp_path, monkeypatch):
+    """The F1 regression guard.
+
+    A down backend must leave inbox files exactly where they are. The old code
+    flattened this into "classified as nothing" and moved on, which is how the
+    inbox stalled silently behind an expired Anthropic credit balance.
+    """
+    from alfred.core.local_llm import LocalLLMUnavailable
+
+    daemon, state_store = _make_daemon(tmp_path)
+    vault_path = daemon.cfg.vault_path
+
+    first = vault_path / "inbox" / "a-untyped.md"
+    second = vault_path / "inbox" / "b-untyped.md"
+    for f in (first, second):
+        f.write_text("Raw dropped note, no frontmatter.\n", encoding="utf-8")
+
+    calls = {"n": 0}
+
+    def _down(*a, **kw):
+        calls["n"] += 1
+        raise LocalLLMUnavailable("connection refused")
+
+    monkeypatch.setattr("alfred.daemons.curator.complete_json", _down)
+
+    asyncio.run(daemon.tick())   # must not raise
+
+    assert first.exists() and second.exists(), "files must stay in inbox for retry"
+    assert not (vault_path / "inbox" / "processed" / "a-untyped.md").exists()
+    assert state_store.state.curator_processed == {}
+    # Stopped after the first failure rather than retrying a dead backend per file.
+    assert calls["n"] == 1
 
 
 def test_tick_exception_is_caught_and_logged_not_propagated(tmp_path, monkeypatch):

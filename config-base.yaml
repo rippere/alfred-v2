@@ -40,6 +40,7 @@ query:
   top_k: 8
   hopfield_beta: 2.0
 
-synthesis:
-  anthropic_model: claude-sonnet-4-6
-  openrouter_model: x-ai/grok-4.1-fast
+# Synthesis and every daemon LLM call run on ollama.llm_model above.
+# The old `synthesis:` block (anthropic_model / openrouter_model) was removed
+# with the cloud chain: Anthropic 400'd on an exhausted credit balance and
+# OpenRouter 404'd on a slug xAI deprecated, and both failures were swallowed.

@@ -4,14 +4,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import frontmatter
 import structlog
 
-from alfred.core.anthropic_client import get_client
+from alfred.core.local_llm import LocalLLMUnavailable, complete_json
 from alfred.core.schema import KNOWN_TYPES, STATUS_BY_TYPE, TYPE_DIRECTORY, correct_status, correct_type
 from alfred.core.vault_ops import VaultError, vault_create, vault_move
 from alfred.daemons.base import BaseDaemon
@@ -104,6 +103,18 @@ class CuratorDaemon(BaseDaemon):
                 ingested = await self._ingest_file(md_file, processed_dir, content_hash)
                 if ingested:
                     state.curator_processed[process_key] = datetime.now(timezone.utc).isoformat()
+            except LocalLLMUnavailable as e:
+                # Abandon the whole tick, not just this file. The backend is down
+                # for everyone, so continuing would retry it once per inbox entry
+                # and bury the one fact that matters under N identical errors.
+                # Nothing is marked processed, so the next tick picks up where
+                # this one stopped.
+                self.log.warning(
+                    "curator.backend_unavailable",
+                    error=str(e),
+                    deferred_from=rel_str,
+                )
+                return
             except Exception as e:
                 self.log.warning("curator.ingest_error", path=rel_str, error=str(e))
 
@@ -141,6 +152,11 @@ class CuratorDaemon(BaseDaemon):
             }
             self.log.debug("curator.type_from_frontmatter", type=existing_type, path=inbox_file.name)
         else:
+            # LocalLLMUnavailable propagates deliberately. A backend that is down
+            # (ollama-game-guard stops Ollama while a game runs) must leave the
+            # file in inbox/ for the next tick, NOT be recorded as "classified as
+            # nothing" — that is how the inbox silently stalled behind an expired
+            # Anthropic credit balance while every request still returned 200.
             classification = await self._classify(content_preview)
             if not classification:
                 self.log.info("curator.skip_no_classification", path=inbox_file.name)
@@ -243,50 +259,31 @@ class CuratorDaemon(BaseDaemon):
         return True
 
     async def _classify(self, content: str) -> dict | None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            return None
+        """Classify one inbox document. Returns None only when the model had
+        nothing useful to say.
 
-        if not self.state.can_make_api_call(daemon="curator"):
-            return None
-
+        Raises LocalLLMUnavailable when the backend is unreachable. That is not
+        a classification outcome and must not be flattened into None: the caller
+        leaves the file in inbox/ and retries on the next tick.
+        """
         system_text = _CLASSIFY_SYSTEM.format(types=", ".join(sorted(KNOWN_TYPES)))
         user_text = _CLASSIFY_USER_TEMPLATE.format(content=content[:3000])
 
-        try:
-            client = get_client()
-
-            def _call():
-                resp = client.messages.create(
-                    model=self.cfg.anthropic_model,
-                    max_tokens=256,
-                    system=[{
-                        "type": "text",
-                        "text": system_text,
-                        "cache_control": {"type": "ephemeral"},
-                    }],
-                    messages=[{"role": "user", "content": user_text}],
-                )
-                return resp
-
-            resp = await asyncio.to_thread(_call)
-            usage = resp.usage
-            self.state.record_api_call(
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                cached_tokens=getattr(usage, "cache_read_input_tokens", 0),
+        def _call() -> dict:
+            return complete_json(
+                system_text,
+                user_text,
+                base_url=self.cfg.ollama_base_url,
+                model=self.cfg.ollama_llm_model,
+                max_tokens=256,
             )
-            raw = resp.content[0].text.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            return json.loads(raw)
-        except Exception as e:
-            err_str = str(e)
-            self.log.warning("curator.classify_error", error=err_str)
-            # Recognized failure signatures (e.g. credit exhaustion) pause ALL
-            # daemons' API calls via StateStore.can_make_api_call().
-            self.state.record_api_failure(err_str, daemon="curator")
+
+        # LocalLLMUnavailable intentionally not caught — see docstring.
+        parsed = await asyncio.to_thread(_call)
+        if not parsed:
+            self.log.debug("curator.classify_empty")
             return None
+        return parsed
 
 
 _CONTENT_SIGNAL_TERMS = {

@@ -59,13 +59,12 @@ def test_structural_tick_normal_path_autofixes_and_records_sweep(tmp_path):
     assert sweeps[0]["autofixed"] >= 1
 
 
-def test_deep_tick_normal_path_enriches_stub_via_mocked_anthropic(tmp_path, monkeypatch):
+def test_deep_tick_normal_path_enriches_stub_via_mocked_local_llm(tmp_path, monkeypatch):
     """deep_tick() (the real APScheduler job function) must call through to
-    _deep_sweep() -> _enrich_file(), with only the Anthropic client mocked,
+    _deep_sweep() -> _enrich_file(), with only the local backend mocked,
     and clear the STUB_RECORD issue once the file has been enriched."""
     daemon = _make_daemon(tmp_path)
     vault_path = daemon.cfg.vault_path
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
     note_dir = vault_path / "note"
     note_dir.mkdir()
@@ -80,20 +79,10 @@ def test_deep_tick_normal_path_enriches_stub_via_mocked_anthropic(tmp_path, monk
 
     enriched_body = "A properly enriched body with plenty of descriptive detail about this note."
 
-    class _FakeContentBlock:
-        text = enriched_body
-
-    class _FakeResponse:
-        content = [_FakeContentBlock()]
-
-    class _FakeMessages:
-        def create(self, **kwargs):
-            return _FakeResponse()
-
-    class _FakeClient:
-        messages = _FakeMessages()
-
-    monkeypatch.setattr("alfred.daemons.janitor.get_client", lambda: _FakeClient())
+    monkeypatch.setattr(
+        "alfred.daemons.janitor.complete",
+        lambda *a, **kw: enriched_body,
+    )
 
     asyncio.run(daemon.deep_tick())
 

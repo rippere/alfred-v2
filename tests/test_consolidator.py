@@ -68,7 +68,7 @@ async def _failing_post(self, url, **kwargs):
     raise httpx.ConnectError("simulated: no local Ollama running")
 
 
-def test_label_tick_normal_path_labels_cluster_via_ollama_fallback_to_anthropic(
+def test_label_tick_normal_path_labels_cluster_via_local_llm_fallback(
     tmp_path, monkeypatch
 ):
     daemon = _make_daemon(tmp_path)
@@ -92,13 +92,11 @@ def test_label_tick_normal_path_labels_cluster_via_ollama_fallback_to_anthropic(
     # Ollama (the primary path) is unreachable in the test environment —
     # mock the HTTP call to fail fast rather than actually attempting network I/O.
     monkeypatch.setattr(httpx.AsyncClient, "post", _failing_post)
-    # Anthropic fallback succeeds with a mocked client. _label_cluster's
-    # fallback branch does a local `from alfred.core.anthropic_client import
-    # get_client` at call time, so the patch target is the origin module, not
-    # the name already bound in alfred.daemons.consolidator's namespace.
+    # Fallback 1 is now the local backend, bound at import time in the
+    # consolidator's namespace — patch it there.
     monkeypatch.setattr(
-        "alfred.core.anthropic_client.get_client",
-        lambda: _FakeAnthropicClient("fallback cluster label"),
+        "alfred.daemons.consolidator.complete",
+        lambda *a, **kw: "fallback cluster label",
     )
 
     asyncio.run(daemon.label_tick())

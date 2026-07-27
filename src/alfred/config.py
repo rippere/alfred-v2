@@ -37,8 +37,6 @@ _CONSUMED_KEYS: frozenset[tuple[str, ...]] = frozenset({
     ("distiller", "mode"),
     ("api_budget", "max_calls_per_day"),
     ("api_budget", "warn_at_calls"),
-    ("synthesis", "anthropic_model"),
-    ("synthesis", "openrouter_model"),
 })
 
 
@@ -156,9 +154,8 @@ class AlfredConfig:
     # Consolidator
     consolidator_min_interval_s: int = 1800
 
-    # Synthesis
-    anthropic_model: str = "claude-sonnet-4-6"
-    openrouter_model: str = "x-ai/grok-4.1-fast"
+    # Synthesis runs on the local model (ollama_llm_model above). The former
+    # anthropic_model / openrouter_model keys were removed with the cloud chain.
 
     @property
     def milvus_uri(self) -> str:
@@ -250,10 +247,5 @@ class AlfredConfig:
         if b := raw.get("api_budget"):
             cfg.api_max_calls_per_day = b.get("max_calls_per_day", cfg.api_max_calls_per_day)
             cfg.api_warn_at_calls = b.get("warn_at_calls", cfg.api_warn_at_calls)
-
-        # Synthesis models
-        if syn := raw.get("synthesis"):
-            cfg.anthropic_model = syn.get("anthropic_model", cfg.anthropic_model)
-            cfg.openrouter_model = syn.get("openrouter_model", cfg.openrouter_model)
 
         return cfg

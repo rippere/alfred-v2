@@ -11,7 +11,7 @@ from pathlib import Path
 import frontmatter
 import structlog
 
-from alfred.core.anthropic_client import get_client
+from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import VaultError, vault_append_to_topic, vault_read
 from alfred.daemons.base import BaseDaemon
@@ -151,11 +151,6 @@ class DistillerDaemon(BaseDaemon):
             self.log.error("distiller.tick_error", error=str(e))
 
     async def _distill_sweep(self) -> None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            self.log.info("distiller.skip", reason="no ANTHROPIC_API_KEY")
-            return
-
         vault_path = self.cfg.vault_path
         state = self.state.state
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -176,6 +171,18 @@ class DistillerDaemon(BaseDaemon):
                         await self.save_state()
                         self.log.debug("distiller.incremental_save", files=distilled_count)
                     await asyncio.sleep(1.5)
+                except LocalLLMUnavailable as e:
+                    # Stop the sweep instead of retrying a dead backend once per
+                    # file. last_distilled is only stamped on success (line
+                    # above), so everything not yet reached stays stale and the
+                    # next sweep resumes from here.
+                    self.log.warning(
+                        "distiller.backend_unavailable",
+                        error=str(e),
+                        deferred_from=rel_path,
+                        distilled_before_stop=distilled_count,
+                    )
+                    break
                 except Exception as e:
                     self.log.warning("distiller.file_error", path=rel_path, error=str(e))
 
@@ -231,32 +238,19 @@ class DistillerDaemon(BaseDaemon):
             body=body[:2000],
         )
 
-        if not self.state.can_make_api_call(daemon="distiller"):
-            return 0
-
-        client = get_client()
-
-        def _call():
-            resp = client.messages.create(
-                model=self.cfg.anthropic_model,
+        def _call() -> str:
+            return complete(
+                _EXTRACT_SYSTEM,
+                user_text,
+                base_url=self.cfg.ollama_base_url,
+                model=self.cfg.ollama_llm_model,
+                json_mode=True,
                 max_tokens=512,
-                system=[{
-                    "type": "text",
-                    "text": _EXTRACT_SYSTEM,
-                    "cache_control": {"type": "ephemeral"},
-                }],
-                messages=[{"role": "user", "content": user_text}],
             )
-            return resp
 
-        resp = await asyncio.to_thread(_call)
-        usage = resp.usage
-        self.state.record_api_call(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cached_tokens=getattr(usage, "cache_read_input_tokens", 0),
-        )
-        raw = resp.content[0].text.strip()
+        # LocalLLMUnavailable propagates to the sweep, which defers the rest of
+        # the batch rather than recording every record as "nothing to distill".
+        raw = (await asyncio.to_thread(_call)).strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
