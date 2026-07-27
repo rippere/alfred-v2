@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from alfred.core.provenance import is_daemon_generated_raw
-from alfred.core.vault import VaultRecord, chunk_record, parse_file
+from alfred.core.vault import VaultRecord, chunk_record, is_sync_conflict, parse_file
 from alfred.daemons.base import BaseDaemon, DaemonEvent
 
 if TYPE_CHECKING:
@@ -89,6 +89,8 @@ class SurveyorDaemon(BaseDaemon):
         for md_file in vault_path.rglob("*.md"):
             rel = md_file.relative_to(vault_path)
             if any(part in ignore for part in rel.parts):
+                continue
+            if is_sync_conflict(md_file):
                 continue
             rel_str = str(rel).replace("\\", "/")
             try:

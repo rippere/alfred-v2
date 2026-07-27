@@ -15,6 +15,7 @@ import frontmatter
 import structlog
 import yaml
 
+from alfred.core.vault import is_sync_conflict
 from alfred.core.schema import (
     KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
@@ -291,6 +292,8 @@ def vault_search(
         rel = md_file.relative_to(vault_path)
         if any(part in ignore for part in rel.parts):
             continue
+        if is_sync_conflict(md_file):
+            continue
         if grep_pattern:
             try:
                 if not re.search(re.escape(grep_pattern), md_file.read_text(encoding="utf-8"), re.IGNORECASE):
@@ -320,6 +323,8 @@ def vault_context(vault_path: Path, ignore_dirs: list[str] | None = None) -> dic
     for md_file in vault_path.rglob("*.md"):
         rel = md_file.relative_to(vault_path)
         if any(p in ignore for p in rel.parts):
+            continue
+        if is_sync_conflict(md_file):
             continue
         try:
             post = frontmatter.load(str(md_file))

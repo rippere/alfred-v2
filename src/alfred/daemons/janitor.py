@@ -27,7 +27,7 @@ from alfred.core.schema import (
     REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
     correct_status, correct_type,
 )
-from alfred.core.vault import extract_wikilinks
+from alfred.core.vault import extract_wikilinks, is_sync_conflict
 from alfred.core.vault_ops import VaultError, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
 
@@ -141,6 +141,8 @@ class JanitorDaemon(BaseDaemon):
             rel = md_file.relative_to(vault_path)
             if any(part in ignore for part in rel.parts):
                 continue
+            if is_sync_conflict(md_file):
+                continue
             rel_str = str(rel).replace("\\", "/")
             try:
                 file_issues = self._check_file(vault_path, rel_str)
@@ -153,10 +155,15 @@ class JanitorDaemon(BaseDaemon):
         state = self.state.state
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # Prune ghost state entries (files deleted from vault but still in state.files)
+        # Prune ghost state entries (files deleted from vault but still in state.files).
+        # Conflict copies are excluded from live_paths deliberately: any that were
+        # indexed before the filter existed now read as ghosts and get their state
+        # entry and embeddings dropped here, which is exactly the cleanup wanted.
+        # The files themselves are never touched — only the index.
         live_paths = {
             str(md_file.relative_to(vault_path)).replace("\\", "/")
             for md_file in vault_path.rglob("*.md")
+            if not is_sync_conflict(md_file)
         }
         ghost_keys = [k for k in state.files if k not in live_paths]
         for k in ghost_keys:
@@ -199,6 +206,10 @@ class JanitorDaemon(BaseDaemon):
         """
         index: dict[str, set[str]] = {}
         for md_file in vault_path.rglob("*.md"):
+            # A conflict copy is not a legitimate wikilink target — registering
+            # one lets a broken link resolve to a stale duplicate and read as fixed.
+            if is_sync_conflict(md_file):
+                continue
             rel = md_file.relative_to(vault_path)
             rel_str = str(rel).replace("\\", "/")
             stem = md_file.stem
@@ -463,11 +474,24 @@ class JanitorDaemon(BaseDaemon):
         merged_count = 0
         merge_log: list[str] = []
 
-        # Group all markdown files by their parent directory
+        # Group all markdown files by their parent directory.
+        #
+        # Conflict copies are excluded, and this exclusion is load-bearing, not
+        # tidiness. A conflict lives in the same directory as its original and
+        # is near-identical to it: measured against the live vault, all 129
+        # conflict/original pairs scored above this sweep's 0.85 threshold, with
+        # a median similarity of 1.000. Keeper selection below is "longer body
+        # wins", which has no notion of which file is the live one — in 9 of
+        # those pairs the conflict was longer, so enabling this sweep would have
+        # deleted the real note and promoted a June-22 copy in its place.
+        # Conflict resolution belongs to scripts/reconcile_conflicts.py, which
+        # is dry-run by default and shows its work.
         dir_files: dict[str, list[Path]] = {}
         for md_file in vault_path.rglob("*.md"):
             rel = md_file.relative_to(vault_path)
             if any(part in ignore for part in rel.parts):
+                continue
+            if is_sync_conflict(md_file):
                 continue
             dir_key = str(rel.parent)
             dir_files.setdefault(dir_key, []).append(md_file)
