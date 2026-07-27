@@ -13,6 +13,16 @@ RETRY_BASE = 2.0
 THROTTLE = 0.15   # seconds between sequential embed calls
 
 
+class EmbeddingBackendUnavailable(RuntimeError):
+    """The embedding backend could not be reached.
+
+    Distinct from embed() returning None, which means "skip this one chunk, the
+    text is too long" — a permanent property of the input. Callers must treat
+    this as "the work is undone" and leave their state untouched, exactly as
+    alfred.core.local_llm.LocalLLMUnavailable does for completions.
+    """
+
+
 class OllamaEmbedder:
     def __init__(self, base_url: str, model: str) -> None:
         self.url = f"{base_url}/api/embeddings"
@@ -48,7 +58,16 @@ class OllamaEmbedder:
                 log.warning("ollama.embed_retry", attempt=attempt + 1, error=str(e), delay=delay)
                 await asyncio.sleep(delay)
         log.error("ollama.embed_failed", retries=MAX_RETRIES)
-        return None
+        # Raise rather than return None. None already means "skip this chunk,
+        # it is too long" — a legitimate, permanent property of the text. A
+        # dead backend is neither, and conflating the two let the surveyor
+        # treat an outage as "this file has no embeddable content": it deleted
+        # the file's existing vectors as stale, wrote FileState(chunk_ids=[]),
+        # and because the md5 then matched, _compute_diff never looked at the
+        # file again. Silent, permanent loss of that file from search.
+        raise EmbeddingBackendUnavailable(
+            f"Ollama embeddings at {self.url} unreachable after {MAX_RETRIES} retries"
+        )
 
     async def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
         results = []

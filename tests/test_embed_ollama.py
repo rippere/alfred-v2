@@ -14,7 +14,7 @@ import asyncio
 import httpx
 import pytest
 
-from alfred.embed.ollama import MAX_RETRIES, OllamaEmbedder
+from alfred.embed.ollama import MAX_RETRIES, EmbeddingBackendUnavailable, OllamaEmbedder
 
 
 class _FakeResponse:
@@ -102,7 +102,17 @@ def test_embed_retries_on_connect_error_then_succeeds():
     assert len(fake_client.post_calls) == 2
 
 
-def test_embed_exhausts_retries_and_returns_none():
+def test_embed_exhausts_retries_and_raises():
+    """Retry exhaustion raises; it must NOT return None.
+
+    This assertion was inverted until 2026-07-26, and the old contract is what
+    made the surveyor destructive: None already meant "skip this chunk, the text
+    is too long", so an outage was indistinguishable from a file with nothing to
+    embed. The surveyor then deleted the file's existing vectors as stale and
+    recorded FileState(md5=current, chunk_ids=[]) — after which the md5 matched
+    and the file was never re-examined. It even logged `surveyor.embedded
+    chunks=0` on the way out.
+    """
     embedder = OllamaEmbedder("http://localhost:11434", "nomic-embed-text")
     fake_client = _FakeAsyncClient(
         exceptions=[httpx.TimeoutException("slow")] * MAX_RETRIES,
@@ -110,9 +120,9 @@ def test_embed_exhausts_retries_and_returns_none():
     )
     embedder._http = fake_client
 
-    result = asyncio.run(embedder.embed("hi"))
+    with pytest.raises(EmbeddingBackendUnavailable):
+        asyncio.run(embedder.embed("hi"))
 
-    assert result is None
     assert len(fake_client.post_calls) == MAX_RETRIES
 
 

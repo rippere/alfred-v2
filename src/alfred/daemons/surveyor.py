@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from alfred.core.provenance import is_daemon_generated_raw
+from alfred.embed.ollama import EmbeddingBackendUnavailable
 from alfred.core.vault import VaultRecord, chunk_record, is_sync_conflict, parse_file
 from alfred.daemons.base import BaseDaemon, DaemonEvent
 
@@ -142,22 +143,42 @@ class SurveyorDaemon(BaseDaemon):
 
             chunk_ids: list[str] = []
             rows: list[dict] = []
-            for chunk_id, text in chunks:
-                # Sanitize chunk_id to avoid Milvus apostrophe bug
-                safe_id = chunk_id.replace("'", "’")
-                dense = await embedder.embed(text)
-                if dense is None:
-                    continue
-                sparse = bm25.encode(text) if bm25.is_fitted else {}
-                rows.append({
-                    "chunk_id": safe_id,
-                    "dense": dense,
-                    "sparse": sparse,
-                    "record_type": record.record_type,
-                    "name": record.frontmatter.get("name", rel_path),
-                    "chunk_index": len(chunk_ids),
-                })
-                chunk_ids.append(safe_id)
+            try:
+                for chunk_id, text in chunks:
+                    # Sanitize chunk_id to avoid Milvus apostrophe bug
+                    safe_id = chunk_id.replace("'", "’")
+                    dense = await embedder.embed(text)
+                    if dense is None:
+                        continue
+                    sparse = bm25.encode(text) if bm25.is_fitted else {}
+                    rows.append({
+                        "chunk_id": safe_id,
+                        "dense": dense,
+                        "sparse": sparse,
+                        "record_type": record.record_type,
+                        "name": record.frontmatter.get("name", rel_path),
+                        "chunk_index": len(chunk_ids),
+                    })
+                    chunk_ids.append(safe_id)
+            except EmbeddingBackendUnavailable as e:
+                # Abandon the whole tick before the delete-and-record block
+                # below. Falling through would read an empty `rows` as "this
+                # file has no embeddable content", delete its existing vectors
+                # as stale, and write FileState(md5=current, chunk_ids=[]) —
+                # after which the md5 matches and _compute_diff never revisits
+                # it. That is silent, permanent removal from search.
+                #
+                # Returning (not continuing) leaves every file this tick has
+                # not reached untouched in state, so the next tick redoes the
+                # remainder. Files already committed above keep their state:
+                # _tick still saves.
+                self.log.warning(
+                    "surveyor.embedder_unavailable",
+                    error=str(e),
+                    deferred_from=rel_path,
+                    indexed_before_stop=len(state.files),
+                )
+                return
             # One batched commit per file instead of one per chunk — collapses
             # ~N manifest writes into a single Lance commit, shrinking the
             # interrupted-write corruption window that crash-looped the daemon.
