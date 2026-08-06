@@ -500,3 +500,7 @@ def mcp(
 # Daily life-ledger KPI snapshots: `alfred ledger collect|backfill|show`.
 from alfred.ledger.cli import ledger_app  # noqa: E402
 app.add_typer(ledger_app, name="ledger")
+
+# Deal/contact brief enrichment: `alfred bridge enrich [--push]`.
+from alfred.bridge.cli import bridge_app  # noqa: E402
+app.add_typer(bridge_app, name="bridge")
