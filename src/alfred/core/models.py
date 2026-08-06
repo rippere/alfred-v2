@@ -6,6 +6,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+# Days of stability=1.0 memory that decay to R≈0.37 (1/e). Scales the whole
+# retention curve: at the default, a file accessed once and untouched for a
+# year sits near R≈0.02, while a file accessed ~50 times (stability 5.0)
+# takes ~5x longer to reach the same point. Tuned so "forgotten" means
+# genuinely cold, not merely quiet for a month.
+RETENTION_SCALE_DAYS = 90.0
+
+
 @dataclass
 class MemoryStrength:
     rel_path: str
@@ -26,6 +34,30 @@ class MemoryStrength:
         raw = self.stability * math.exp(-0.1 * days_ago / max(self.stability, 1.0))
         return max(0.5, min(1.5, raw))
 
+    def retrievability(self, now: datetime | None = None) -> float:
+        """Ebbinghaus retrievability R = exp(-t / (S * RETENTION_SCALE_DAYS)),
+        in [0, 1] — the probability this file is still "remembered".
+
+        Distinct from score_modifier(), which is a bounded *ranking* nudge in
+        [0.5, 1.5] and deliberately never reaches zero: a stale file should
+        rank lower, not vanish from results. retrievability() is the honest
+        decay curve, unclamped at the bottom, and it is what the retention
+        (forgetting) decision reads. Keeping them separate means tuning the
+        forget threshold can't quietly distort search ranking.
+
+        A file that has never been accessed returns 0.0 — no retrieval
+        evidence at all is the weakest possible memory, not a neutral one.
+        Callers that care about age-since-embed rather than age-since-access
+        must supply that themselves; this type only knows about access.
+        """
+        if not self.last_accessed:
+            return 0.0
+        now = now or datetime.now(timezone.utc)
+        last = datetime.fromisoformat(self.last_accessed)
+        days_ago = max(0.0, (now - last).total_seconds() / 86400)
+        stability_days = max(self.stability, 1.0) * RETENTION_SCALE_DAYS
+        return math.exp(-days_ago / stability_days)
+
 
 @dataclass
 class FileState:
@@ -38,6 +70,15 @@ class FileState:
     open_issues: list[str] = field(default_factory=list)
     learn_records_created: list[str] = field(default_factory=list)
     last_distilled: str = ""
+    # ISO-8601 UTC timestamp at which this file's vectors were evicted by the
+    # janitor's forget sweep. The FileState entry itself (crucially its md5)
+    # is KEPT: the surveyor decides what to re-embed by diffing md5, so an
+    # entry that is popped instead of flagged comes back as "new" on the very
+    # next tick and re-embeds — which is exactly how the vector store grew
+    # back before. Empty string means "not forgotten". Editing the file
+    # changes its md5 and it re-embeds normally, which is the intended way
+    # back in.
+    forgotten: str = ""
 
 
 @dataclass

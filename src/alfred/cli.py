@@ -510,6 +510,97 @@ def create_vault(
 
 
 @app.command()
+def forget(
+    config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually evict. Without this, nothing is changed."
+    ),
+    limit: int = typer.Option(25, "--limit", "-n", help="Rows to show in the preview"),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Show (or apply) the Ebbinghaus retention sweep — evict vectors for files
+    whose memory has decayed.
+
+    Dry run by default. The source notes are never touched: only the vector
+    embeddings are evicted, and editing a file re-embeds it normally, so this
+    is reclaimable storage rather than lost content.
+    """
+    import asyncio
+    import json as _json
+    from datetime import datetime, timezone
+    from rich import box
+    from rich.table import Table
+
+    from alfred.daemons.janitor import JanitorDaemon
+    from alfred.store.state import StateStore
+
+    cfg = _load(config)
+    store = StateStore(cfg.state_path, cfg=cfg)
+    store.load()
+
+    from alfred.store.lancedb_store import LanceDBStore
+    vector_store = LanceDBStore(
+        uri=getattr(cfg, "lancedb_uri", str(cfg.data_dir / "lancedb")),
+        collection=cfg.milvus_collection,
+        dims=cfg.embed_dims,
+    )
+    janitor = JanitorDaemon(cfg, store, asyncio.Queue(), store=vector_store)
+
+    candidates = janitor.forget_candidates()
+    total_chunks = sum(c["chunks"] for c in candidates)
+
+    if json_out:
+        console.print_json(_json.dumps({
+            "candidates": len(candidates),
+            "chunks": total_chunks,
+            "applied": False,
+            "rows": candidates[:limit],
+        }))
+        if not apply:
+            return
+
+    if not json_out:
+        console.print(
+            f"[bold]{len(candidates)}[/bold] file(s) below the retention threshold "
+            f"([dim]R < {cfg.janitor_forget_retrievability}, embedded ≥ "
+            f"{cfg.janitor_forget_min_age_days}d ago[/dim]) — "
+            f"[bold]{total_chunks}[/bold] chunk(s) of vectors"
+        )
+        if candidates:
+            t = Table(box=box.SIMPLE, padding=(0, 2))
+            t.add_column("file", style="dim", overflow="fold")
+            t.add_column("R", justify="right")
+            t.add_column("age (d)", justify="right")
+            t.add_column("reads", justify="right")
+            t.add_column("chunks", justify="right")
+            for c in candidates[:limit]:
+                t.add_row(
+                    c["rel_path"], f"{c['retrievability']:.4f}", str(c["age_days"]),
+                    str(c["access_count"]), str(c["chunks"]),
+                )
+            console.print(t)
+            if len(candidates) > limit:
+                console.print(f"[dim]… and {len(candidates) - limit} more[/dim]")
+
+    if not apply:
+        if not json_out:
+            console.print("\n[dim]Dry run — nothing changed. Re-run with --apply to evict.[/dim]")
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cap = int(getattr(cfg, "janitor_forget_max_per_sweep", 500))
+    selected = candidates[:cap]
+    evicted = sum(1 for c in selected if janitor._forget_file(c["rel_path"], now_iso))
+    store.save()
+    console.print(
+        f"[green]evicted[/green] {evicted} file(s), "
+        f"{sum(c['chunks'] for c in selected)} chunk(s)"
+        + (f" — {len(candidates) - len(selected)} deferred past the per-sweep cap"
+           if len(candidates) > len(selected) else "")
+    )
+
+
+@app.command()
 def mcp(
     config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
 ):

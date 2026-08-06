@@ -41,6 +41,7 @@ SWEEP_INTERVAL = 3600.0     # structural scan every hour
 DEEP_INTERVAL = 86400.0     # LLM enrichment once per day
 DEDUP_INTERVAL = 604800.0   # dedup sweep once per week (7 days)
 ARCHIVE_INTERVAL = 86400.0  # session archival once per day
+FORGET_INTERVAL = 86400.0   # Ebbinghaus retention sweep once per day
 
 
 class IssueCode(str, Enum):
@@ -64,6 +65,7 @@ class JanitorDaemon(BaseDaemon):
         self._last_deep = float("-inf")
         self._last_dedup = float("-inf")
         self._last_archive = float("-inf")
+        self._last_forget = float("-inf")
         self._stem_index: dict[str, set[str]] = {}
 
     async def run(self) -> None:
@@ -86,6 +88,10 @@ class JanitorDaemon(BaseDaemon):
                 if now - self._last_archive > ARCHIVE_INTERVAL:
                     await self.session_archive_tick()
                     self._last_archive = now
+                forget_enabled = getattr(self.cfg, "janitor_forget_enabled", False)
+                if forget_enabled and now - self._last_forget > FORGET_INTERVAL:
+                    await self.forget_tick()
+                    self._last_forget = now
                 await asyncio.sleep(60.0)
         finally:
             await self.save_state()
@@ -443,6 +449,136 @@ class JanitorDaemon(BaseDaemon):
         except Exception as e:
             self.log.warning("janitor.vector_delete_failed", path=rel_path, error=str(e))
         state.files.pop(rel_path, None)
+
+    # ── Forget sweep: Ebbinghaus retention ────────────────────────────────────
+
+    def forget_candidates(self, now: datetime | None = None) -> list[dict]:
+        """Files whose memory has decayed past the retention threshold.
+
+        Pure and side-effect free so `alfred forget --dry-run` and the sweep
+        itself can never disagree about what would be evicted — the dry run
+        calls exactly the function the sweep does.
+
+        A file qualifies only if ALL of:
+          * it currently has vectors (chunk_ids non-empty) and isn't already
+            forgotten — otherwise there is nothing to reclaim;
+          * it was embedded at least forget_min_age_days ago. This is the
+            cold-start guard: with no query history every file looks
+            unaccessed, and without an age floor the first sweep would evict
+            the entire store;
+          * its Ebbinghaus retrievability is below the threshold. Never-
+            accessed files score 0.0 and so pass on age alone — which is the
+            intent, since "embedded 6 months ago and never once retrieved"
+            is the exact profile of dead weight.
+
+        Returned newest-decay-last (weakest memory first) so the per-sweep cap
+        evicts the coldest files rather than an arbitrary slice.
+        """
+        now = now or datetime.now(timezone.utc)
+        min_age_days = float(getattr(self.cfg, "janitor_forget_min_age_days", 180))
+        threshold = float(getattr(self.cfg, "janitor_forget_retrievability", 0.02))
+        state = self.state.state
+
+        candidates: list[dict] = []
+        for rel_path, fs in state.files.items():
+            if fs.forgotten or not fs.chunk_ids:
+                continue
+            if not fs.last_embedded:
+                continue
+            try:
+                embedded_at = datetime.fromisoformat(fs.last_embedded)
+            except ValueError as e:
+                record_failure(
+                    "janitor.forget_timestamp_unparsable", error=e, path=rel_path
+                )
+                continue
+            if embedded_at.tzinfo is None:
+                embedded_at = embedded_at.replace(tzinfo=timezone.utc)
+            age_days = (now - embedded_at).total_seconds() / 86400
+            if age_days < min_age_days:
+                continue
+
+            strength = state.memory.get(rel_path)
+            r = strength.retrievability(now) if strength else 0.0
+            if r >= threshold:
+                continue
+            candidates.append({
+                "rel_path": rel_path,
+                "retrievability": r,
+                "age_days": round(age_days, 1),
+                "chunks": len(fs.chunk_ids),
+                "access_count": strength.access_count if strength else 0,
+            })
+
+        candidates.sort(key=lambda c: (c["retrievability"], -c["age_days"]))
+        return candidates
+
+    def _forget_file(self, rel_path: str, now_iso: str) -> bool:
+        """Evict one file's vectors, keeping its FileState entry.
+
+        Deliberately NOT _delete_embeddings(), which pops the state entry.
+        Popping is right for a file that is genuinely gone; here the file
+        still exists in the vault, and an entry popped from state comes back
+        as "new" on the surveyor's next diff and is immediately re-embedded.
+        That round trip is precisely how the vector store regrew. Keeping the
+        entry (md5 intact, chunk_ids cleared, forgotten stamped) makes the
+        eviction stick until the file is actually edited.
+        """
+        state = self.state.state
+        fs = state.files.get(rel_path)
+        if fs is None:
+            return False
+        try:
+            self.store.delete_file(rel_path, fs.chunk_ids)
+        except Exception as e:
+            record_failure("janitor.forget_vector_delete_failed", error=e, path=rel_path)
+            return False
+        fs.chunk_ids = []
+        fs.last_embedded = ""
+        fs.forgotten = now_iso
+        return True
+
+    async def _forget_sweep(self) -> None:
+        if not getattr(self.cfg, "janitor_forget_enabled", False):
+            return
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        cap = int(getattr(self.cfg, "janitor_forget_max_per_sweep", 500))
+
+        candidates = self.forget_candidates(now)
+        if not candidates:
+            self.log.info("janitor.forget_sweep_done", evicted=0, candidates=0)
+            return
+
+        selected = candidates[:cap]
+        evicted = 0
+        chunks_freed = 0
+        for i, c in enumerate(selected):
+            if i % 20 == 0:
+                await asyncio.sleep(0)  # yield; this can be a long list
+            if self._forget_file(c["rel_path"], now_iso):
+                evicted += 1
+                chunks_freed += c["chunks"]
+
+        # A cap that silently truncates reads as "that's all there was", so
+        # say plainly how many were left for the next sweep.
+        self.log.info(
+            "janitor.forget_sweep_done",
+            evicted=evicted,
+            chunks_freed=chunks_freed,
+            candidates=len(candidates),
+            deferred=max(0, len(candidates) - len(selected)),
+        )
+        await self.save_state()
+
+    async def forget_tick(self) -> None:
+        """One-shot retention sweep — called by APScheduler daily if enabled."""
+        if not getattr(self.cfg, "janitor_forget_enabled", False):
+            return
+        try:
+            await self._forget_sweep()
+        except Exception as e:
+            self.log.error("janitor.forget_tick_error", error=str(e))
 
     # ── Dedup sweep: weekly similarity-based deduplication ────────────────────
 

@@ -152,6 +152,11 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
     if getattr(cfg, "janitor_dedup_enabled", False):
         _add("janitor", janitor.dedup_tick, "interval",
              misfire_grace_time=GRACE_WEEKLY, weeks=1)
+    # Retention sweep only when explicitly enabled — it evicts vectors, so it
+    # stays opt-in and is not registered at all when off.
+    if getattr(cfg, "janitor_forget_enabled", False):
+        _add("janitor", janitor.forget_tick, "interval",
+             misfire_grace_time=GRACE_DAILY, days=1)
 
     # ── Distiller: nightly at 2am, with startup catch-up ─────────────────────────
     # cron, not interval: interval-24h restarts its countdown on every daemon

@@ -34,6 +34,10 @@ _CONSUMED_KEYS: frozenset[tuple[str, ...]] = frozenset({
     ("janitor", "deep_interval_h"),
     ("janitor", "max_bytes_per_call"),
     ("janitor", "dedup_enabled"),
+    ("janitor", "forget_enabled"),
+    ("janitor", "forget_retrievability"),
+    ("janitor", "forget_min_age_days"),
+    ("janitor", "forget_max_per_sweep"),
     ("distiller", "mode"),
     ("api_budget", "max_calls_per_day"),
     ("api_budget", "warn_at_calls"),
@@ -109,6 +113,20 @@ class AlfredConfig:
     janitor_deep_interval_h: int = 24
     janitor_max_bytes_per_call: int = 8000
     janitor_dedup_enabled: bool = False
+    # Retention (forgetting) sweep. OFF by default: it evicts vectors, and an
+    # eviction policy that turns itself on unannounced against 28 GB of
+    # embeddings is not something a config default should decide for you.
+    # `alfred forget` (dry-run by default) is the way to see what it would do.
+    janitor_forget_enabled: bool = False
+    # Evict below this Ebbinghaus retrievability. 0.02 ≈ untouched for ~1 year
+    # at stability 1.0 — deliberately deep in the tail.
+    janitor_forget_retrievability: float = 0.02
+    # Never evict a file embedded more recently than this, regardless of
+    # retrievability. Guards the cold-start case where nothing has been
+    # queried yet and every file therefore looks unaccessed.
+    janitor_forget_min_age_days: int = 180
+    # Cap per sweep so a first run can't evict the entire store in one pass.
+    janitor_forget_max_per_sweep: int = 500
 
     # Distiller
     distiller_mode: str = "on_demand"   # "scheduled" | "on_demand"
@@ -238,6 +256,16 @@ class AlfredConfig:
             cfg.janitor_deep_interval_h = j.get("deep_interval_h", cfg.janitor_deep_interval_h)
             cfg.janitor_max_bytes_per_call = j.get("max_bytes_per_call", cfg.janitor_max_bytes_per_call)
             cfg.janitor_dedup_enabled = j.get("dedup_enabled", cfg.janitor_dedup_enabled)
+            cfg.janitor_forget_enabled = j.get("forget_enabled", cfg.janitor_forget_enabled)
+            cfg.janitor_forget_retrievability = j.get(
+                "forget_retrievability", cfg.janitor_forget_retrievability
+            )
+            cfg.janitor_forget_min_age_days = j.get(
+                "forget_min_age_days", cfg.janitor_forget_min_age_days
+            )
+            cfg.janitor_forget_max_per_sweep = j.get(
+                "forget_max_per_sweep", cfg.janitor_forget_max_per_sweep
+            )
 
         # Distiller mode
         if d := raw.get("distiller"):
