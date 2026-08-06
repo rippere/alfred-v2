@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone
 import httpx
 import structlog
 
+from alfred.core.failures import record_failure
 from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import vault_create, vault_edit, vault_read
@@ -126,8 +127,14 @@ class ConsolidatorDaemon(BaseDaemon):
                     age_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600
                     if age_h < 24:
                         continue  # labeled recently enough
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Unparsable last_labeled defeats the 24h guard, so this
+                    # cluster gets re-labeled (an LLM call) every single tick.
+                    record_failure(
+                        "consolidator.label_timestamp_unparsable",
+                        error=e,
+                        value=cluster.last_labeled,
+                    )
 
             try:
                 label = await self._label_cluster(cluster.member_files, vault_path)
@@ -174,8 +181,15 @@ class ConsolidatorDaemon(BaseDaemon):
                             age_days = (time.time() - mtime) / 86400
                             if age_days < SYNTHESIS_STALE_DAYS:
                                 continue  # fresh synthesis exists — skip
-                        except OSError:
-                            pass  # can't stat — fall through and re-synthesize
+                        except OSError as e:
+                            # Can't stat — fall through and re-synthesize (an
+                            # LLM call). Cheap to do once, expensive if it's
+                            # every tick, so count it.
+                            record_failure(
+                                "consolidator.synthesis_stat_failed",
+                                error=e,
+                                path=str(synthesis_path),
+                            )
                     else:
                         # consolidated_chunk_id points to a missing file — reset it
                         cluster.consolidated_chunk_id = ""
@@ -192,8 +206,12 @@ class ConsolidatorDaemon(BaseDaemon):
                             # File exists and is fresh — adopt it without re-synthesizing
                             cluster.consolidated_chunk_id = synthesis_rel
                             continue
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        record_failure(
+                            "consolidator.synthesis_stat_failed",
+                            error=e,
+                            path=str(vault_path / synthesis_rel),
+                        )
 
                 degree_sum = sum(graph.get_node_degree(f) for f in cluster.member_files)
                 ranked.append((key, cluster, degree_sum))
@@ -223,8 +241,10 @@ class ConsolidatorDaemon(BaseDaemon):
                 body = rec["body"].strip()
                 if body:
                     learn_entries.append((rel_path, name, body))
-            except Exception:
-                pass
+            except Exception as e:
+                # Member silently missing from the synthesis prompt — the
+                # resulting summary is quietly built from partial input.
+                record_failure("consolidator.member_read_failed", error=e, path=rel_path)
 
         if not learn_entries:
             return

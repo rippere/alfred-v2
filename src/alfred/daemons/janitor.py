@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 import structlog
 
+from alfred.core.failures import record_failure
 from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.schema import (
     KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
@@ -467,8 +468,11 @@ class JanitorDaemon(BaseDaemon):
                 if elapsed < DEDUP_INTERVAL:
                     self.log.debug("janitor.dedup_skip", reason="ran recently", elapsed_h=round(elapsed/3600, 1))
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                # A malformed last_dedup makes the interval guard fall through,
+                # so dedup runs every tick instead of daily — expensive, and
+                # invisible without a count.
+                record_failure("janitor.dedup_timestamp_unparsable", error=e, value=last_run_iso)
 
         self.log.info("janitor.dedup_sweep.start")
         merged_count = 0
@@ -513,7 +517,9 @@ class JanitorDaemon(BaseDaemon):
                 try:
                     post_a = frontmatter.load(str(fa))
                     body_a = post_a.content.strip()
-                except Exception:
+                except Exception as e:
+                    # Unparsable file is silently exempt from dedup forever.
+                    record_failure("janitor.frontmatter_parse_failed", error=e, path=str(fa))
                     continue
                 if len(body_a) < 30:
                     continue
@@ -524,7 +530,8 @@ class JanitorDaemon(BaseDaemon):
                     try:
                         post_b = frontmatter.load(str(fb))
                         body_b = post_b.content.strip()
-                    except Exception:
+                    except Exception as e:
+                        record_failure("janitor.frontmatter_parse_failed", error=e, path=str(fb))
                         continue
                     if len(body_b) < 30:
                         continue
@@ -635,7 +642,10 @@ class JanitorDaemon(BaseDaemon):
             try:
                 post = frontmatter.load(str(md_file))
                 status = str(post.metadata.get("status", "")).lower()
-            except Exception:
+            except Exception as e:
+                # Session file never gets archived — it accumulates forever
+                # with nothing reporting that it was skipped.
+                record_failure("janitor.session_parse_failed", error=e, path=str(md_file))
                 continue
 
             if status not in {"absorbed", "completed"}:
@@ -643,7 +653,8 @@ class JanitorDaemon(BaseDaemon):
 
             try:
                 age_days = (now_ts - md_file.stat().st_mtime) / 86400
-            except OSError:
+            except OSError as e:
+                record_failure("janitor.session_stat_failed", error=e, path=str(md_file))
                 continue
 
             if age_days < SESSION_ARCHIVE_DAYS:

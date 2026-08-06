@@ -13,6 +13,8 @@ from pathlib import Path
 
 import frontmatter
 import structlog
+
+from alfred.core.failures import record_failure
 import yaml
 
 from alfred.core.vault import is_sync_conflict
@@ -298,7 +300,10 @@ def vault_search(
             try:
                 if not re.search(re.escape(grep_pattern), md_file.read_text(encoding="utf-8"), re.IGNORECASE):
                     continue
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError) as e:
+                # File is silently excluded from the grep result set — the
+                # caller sees a shorter match list, not an error.
+                record_failure("vault.grep_read_failed", error=e, path=str(rel))
                 continue
         try:
             post = frontmatter.load(str(md_file))

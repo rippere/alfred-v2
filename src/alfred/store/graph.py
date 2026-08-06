@@ -12,6 +12,8 @@ from typing import Iterator
 
 import structlog
 
+from alfred.core.failures import record_failure
+
 log = structlog.get_logger()
 
 # Module-level registry of per-path RLocks, keyed by resolved graph file path.
@@ -344,7 +346,10 @@ class GraphStore:
                         self.add_edges_from_wikilinks(rel_str, links)
                     else:
                         self._g.add_node(rel_str)
-                except (OSError, UnicodeDecodeError):
+                except (OSError, UnicodeDecodeError) as e:
+                    # File is missing from the rebuilt graph entirely — its
+                    # links vanish and nothing says the rebuild was partial.
+                    record_failure("graph.rebuild_read_failed", error=e, path=rel_str)
                     continue
 
             log.info("graph.built", nodes=self._g.number_of_nodes(), edges=self._g.number_of_edges())

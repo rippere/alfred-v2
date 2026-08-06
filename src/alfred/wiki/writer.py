@@ -9,6 +9,7 @@ from pathlib import Path
 import frontmatter
 import structlog
 
+from alfred.core.failures import record_failure
 from alfred.core.vault_ops import VaultError, vault_create, vault_edit, vault_read
 from alfred.store.state import StateStore
 
@@ -62,8 +63,13 @@ class WikiWriter:
                 set_fields={"entity_type": entity_type},
                 body=f"# {entity_name}\n\n",
             )
-        except VaultError:
-            pass
+        except VaultError as e:
+            # vault_create raises when the file already exists — that's the
+            # idempotent path (page on disk, absent from state), not a
+            # failure. Anything else genuinely failed to create the page, and
+            # we'd otherwise register it in state as though it were written.
+            if not (self.cfg.vault_path / rel_path).exists():
+                record_failure("wiki.page_create_failed", error=e, path=rel_path)
 
         from alfred.core.models import WikiPage
         now = datetime.now(timezone.utc).isoformat()

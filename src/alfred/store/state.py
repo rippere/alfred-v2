@@ -9,6 +9,7 @@ from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from alfred.core.failures import drain_failures, restore_failures
 from alfred.core.models import (
     ClusterState,
     FileState,
@@ -52,6 +53,7 @@ def _decode_state(raw: dict) -> PipelineState:
         api_calls_date=raw.get("api_calls_date", ""),
         api_cost_usd_today=raw.get("api_cost_usd_today", 0.0),
         api_paused_until=raw.get("api_paused_until", ""),
+        error_counts=raw.get("error_counts", {}),
     )
     for rel_path, f in raw.get("files", {}).items():
         state.files[rel_path] = FileState(**{
@@ -163,6 +165,25 @@ def _merge_counters(base: dict, theirs: dict, mine: dict) -> tuple[int, float]:
     return calls, cost
 
 
+def _merge_error_counts(base: dict, theirs: dict, mine: dict) -> dict[str, int]:
+    """Additively merge the swallowed-failure counters, CRDT-style, for the
+    same reason as _merge_counters: two processes each swallowing an error
+    must produce a total of two, not one. A plain dict-field merge would take
+    whichever side changed the key and discard the other's increment.
+
+    Unlike the API counters there is no date rollover to guard — error_counts
+    is monotonic for the life of the state file."""
+    theirs_d = theirs.get("error_counts", {}) or {}
+    mine_d = mine.get("error_counts", {}) or {}
+    base_d = base.get("error_counts", {}) or {}
+    merged = dict(theirs_d)
+    for key, mine_v in mine_d.items():
+        delta = mine_v - base_d.get(key, 0)
+        if delta:
+            merged[key] = merged.get(key, 0) + delta
+    return merged
+
+
 def _merge_pipeline_state(base: dict, theirs: dict, mine: dict) -> dict:
     """Three-way merge of the on-disk PipelineState dict shape. `base` is the
     snapshot this StateStore instance last loaded, `theirs` is the freshest
@@ -177,6 +198,7 @@ def _merge_pipeline_state(base: dict, theirs: dict, mine: dict) -> dict:
     for f in ("distiller_runs", "janitor_sweeps"):
         merged[f] = _merge_list_field(f, base, theirs, mine)
     merged["api_calls_today"], merged["api_cost_usd_today"] = _merge_counters(base, theirs, mine)
+    merged["error_counts"] = _merge_error_counts(base, theirs, mine)
     return merged
 
 
@@ -236,6 +258,15 @@ class StateStore:
         concurrent writes from another (e.g. the daemon recording new embeds
         or cluster state) — both survive the merge.
         """
+        # Fold any failures swallowed since the last save into the state we're
+        # about to write, so a handler whose body is `pass` still leaves a
+        # durable count. Drained (read-and-zero) so repeated saves can't double
+        # count; restored below if the write fails, so a disk error doesn't
+        # also erase the record of the earlier errors.
+        drained = drain_failures()
+        for _key, _n in drained.items():
+            self._state.error_counts[_key] = self._state.error_counts.get(_key, 0) + _n
+
         lock_fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o644)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -263,10 +294,12 @@ class StateStore:
                 # more than once, i.e. the daemon. See test_state_lock.py.
                 self._state = _decode_state(merged)
                 self._base_raw = copy.deepcopy(merged)
+                drained = {}  # committed to disk; nothing to put back
             finally:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
+            restore_failures(drained)
 
     async def async_save(self) -> None:
         """Async-safe save — acquires the state lock before writing."""

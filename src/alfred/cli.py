@@ -69,8 +69,25 @@ def status(
     state_table.add_row("curator processed", str(len(store.state.curator_processed)))
     state_table.add_row("distiller runs", str(len(store.state.distiller_runs)))
     state_table.add_row("last run", store.state.last_run or "never")
+    # Swallowed failures — the whole point of error_counts is that this row
+    # reads a real number instead of nothing at all when handlers have been
+    # quietly eating errors. Red when non-zero so it can't be skimmed past.
+    _errors = store.state.error_counts
+    _total_errors = sum(_errors.values())
+    state_table.add_row(
+        "swallowed errors",
+        "0" if not _total_errors else f"[red]{_total_errors}[/red]",
+    )
     console.print("[bold]State[/bold]")
     console.print(state_table)
+    if _errors:
+        err_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        err_table.add_column(style="dim")
+        err_table.add_column(justify="right")
+        for _key, _count in sorted(_errors.items(), key=lambda kv: -kv[1]):
+            err_table.add_row(_key, str(_count))
+        console.print("[bold]Swallowed errors[/bold] [dim](cumulative)[/dim]")
+        console.print(err_table)
 
     # Vault check
     vault_ok = cfg.vault_path.exists()
@@ -229,8 +246,12 @@ def _query_result_as_dict(cfg, result) -> dict:
                 if end != -1:
                     raw = raw[end + 4:]
             preview = raw.strip()[:400]
-        except OSError:
-            pass    # a hit whose file moved still deserves its path in the output
+        except OSError as e:
+            # A hit whose file moved still deserves its path in the output —
+            # but a run of these means the index has drifted from the vault,
+            # which is worth being able to count.
+            from alfred.core.failures import record_failure
+            record_failure("cli.preview_read_failed", error=e, path=h.rel_path)
         hits.append({
             "rel_path": h.rel_path,
             "name": h.name,

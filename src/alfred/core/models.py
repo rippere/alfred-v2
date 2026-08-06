@@ -88,3 +88,10 @@ class PipelineState:
     # ISO-8601 UTC timestamp until which all API calls are paused (set when a
     # recognized failure signature, e.g. credit exhaustion, is recorded).
     api_paused_until: str = ""
+    # Cumulative count of swallowed failures, keyed by the stable dotted key
+    # passed to alfred.core.failures.record_failure (e.g.
+    # {"janitor.autofix_failed": 3}). Drained into here by StateStore.save()
+    # so a handler whose body is `pass` still leaves a countable trace, and
+    # "zero errors" becomes a checkable claim rather than an absence of
+    # evidence. Monotonic — never reset by normal operation.
+    error_counts: dict[str, int] = field(default_factory=dict)

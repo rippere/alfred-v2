@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from alfred.core.failures import record_failure
 from alfred.core.provenance import is_daemon_generated_raw
 from alfred.embed.ollama import EmbeddingBackendUnavailable
 from alfred.core.vault import VaultRecord, chunk_record, is_sync_conflict, parse_file
@@ -100,7 +101,11 @@ class SurveyorDaemon(BaseDaemon):
                 if is_daemon_generated_raw(raw):
                     continue
                 current[rel_str] = hashlib.md5(raw).hexdigest()
-            except OSError:
+            except OSError as e:
+                # An unreadable file drops silently out of `current`, which the
+                # caller reads as "this file no longer exists" — a transient
+                # read error is indistinguishable from a deletion.
+                record_failure("surveyor.file_read_failed", error=e, path=rel_str)
                 continue
 
         known = self.state.state.files
@@ -239,8 +244,11 @@ class SurveyorDaemon(BaseDaemon):
                     graph.load()
                     graph.add_edges_from_wikilinks(rel_path, record.wikilinks)
                     graph.save()
-            except Exception:
-                pass
+            except Exception as e:
+                # The file stays indexed but its wikilinks never reach the
+                # graph, so related-note lookups quietly degrade with nothing
+                # anywhere indicating why.
+                record_failure("surveyor.graph_update_failed", error=e, path=rel_path)
 
             self.log.info("surveyor.embedded", path=rel_path, chunks=len(chunk_ids))
 

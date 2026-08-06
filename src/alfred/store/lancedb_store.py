@@ -18,6 +18,8 @@ from typing import Any
 
 import structlog
 
+from alfred.core.failures import record_failure
+
 log = structlog.get_logger()
 
 # Re-export SearchHit from the shared types module so importers don't have to change.
@@ -81,7 +83,10 @@ def _recent_kill_context(hours: int = 48, max_lines: int = 20) -> str:
             out = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=10,
             ).stdout.strip()
-        except Exception:
+        except Exception as e:
+            # Diagnostic section silently missing from the crash report, which
+            # then reads as "no evidence of a kill" rather than "couldn't look".
+            record_failure("lancedb.diagnostic_scan_failed", error=e, scan=label)
             continue
         if out:
             lines = out.splitlines()[-max_lines:]
@@ -95,8 +100,8 @@ def _recent_kill_context(hours: int = 48, max_lines: int = 20) -> str:
         ).stdout.strip()
         if boots:
             sections.append("[recent boots]\n" + "\n".join(boots.splitlines()[-3:]))
-    except Exception:
-        pass
+    except Exception as e:
+        record_failure("lancedb.diagnostic_scan_failed", error=e, scan="list-boots")
     return "\n\n".join(sections)
 
 

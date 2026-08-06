@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from alfred.core.failures import record_failure
 from alfred.core.vault_ops import VaultError, vault_read, vault_search
 
 PERSON_GLOB = "person/*.md"
@@ -87,7 +88,11 @@ def resolve_contact_to_entity(
     for candidate in candidates:
         try:
             record = vault_read(vault_path, candidate["path"])
-        except VaultError:
+        except VaultError as e:
+            # An unreadable candidate silently drops out of the match set, so
+            # a contact can fail to resolve and the caller sees "no match"
+            # rather than "one candidate couldn't be read".
+            record_failure("bridge.candidate_read_failed", error=e, path=candidate["path"])
             continue
         fm_email = _normalize_email(record["frontmatter"].get("email"))
         if fm_email and fm_email == target:
