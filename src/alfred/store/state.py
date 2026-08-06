@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import fcntl
 import json
 import os
@@ -251,8 +252,17 @@ class StateStore:
                 # Fold the merge result back into memory so this instance
                 # reflects the other writer's changes too, and so the next
                 # save() diffs against this save rather than a stale base.
+                #
+                # The base MUST be a deep copy: _decode_state passes the
+                # dict/list-valued fields (curator_processed, distiller_runs,
+                # janitor_sweeps) through by reference, so sharing `merged`
+                # between _state and _base_raw made every later mutation
+                # retroactively rewrite the base it was about to be diffed
+                # against — the merge then saw "unchanged" and dropped the
+                # write entirely. Only bites a long-lived instance that saves
+                # more than once, i.e. the daemon. See test_state_lock.py.
                 self._state = _decode_state(merged)
-                self._base_raw = merged
+                self._base_raw = copy.deepcopy(merged)
             finally:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:

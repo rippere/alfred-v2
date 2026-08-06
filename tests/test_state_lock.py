@@ -170,6 +170,60 @@ def test_clean_delete_with_no_concurrent_writer_actually_deletes(state_path):
     )
 
 
+def test_long_lived_instance_second_save_persists_curator_processed(state_path):
+    """Aliasing regression: save() decoded the merged dict back into memory
+    while ALSO keeping that same dict as the next save's merge `base`.
+    _decode_state passes `curator_processed` (and the two list fields)
+    through by reference, so state.curator_processed and
+    _base_raw["curator_processed"] were the SAME object — every later
+    mutation retroactively rewrote the base it was about to be diffed
+    against, so the merge saw "unchanged" and dropped the write.
+
+    This is the daemon's shape, not the tests above: ONE long-lived store
+    that saves more than once. The curator dedup guard reads
+    curator_processed to decide whether a file was already handled, so
+    dropping these writes means silent reprocessing."""
+    store = StateStore(state_path)
+    store.load()
+    store.save()  # establishes _base_raw aliased to the in-memory state
+
+    store.state.curator_processed["inbox/note.md"] = "2026-08-06T00:00:00Z"
+    store.state.distiller_runs.append({"run": 1, "files": 3})
+    store.save()
+
+    final = StateStore(state_path)
+    final.load()
+    assert final.state.curator_processed == {"inbox/note.md": "2026-08-06T00:00:00Z"}, (
+        f"curator_processed write silently dropped — got "
+        f"{final.state.curator_processed!r}"
+    )
+    assert final.state.distiller_runs == [{"run": 1, "files": 3}], (
+        f"distiller_runs append silently dropped — got {final.state.distiller_runs!r}"
+    )
+
+
+def test_long_lived_instance_repeated_saves_accumulate(state_path):
+    """Same aliasing defect across many saves on one instance. files/clusters
+    /memory/wiki_pages are rebuilt into fresh dataclasses by _decode_state so
+    they were never aliased, but curator_processed was, and nothing tested
+    it. Ten sequential saves must leave ten entries on disk."""
+    store = StateStore(state_path)
+    store.load()
+
+    for i in range(10):
+        store.state.curator_processed[f"inbox/n{i}.md"] = f"2026-08-06T00:00:{i:02d}Z"
+        store.state.files[f"docs/n{i}.md"] = FileState(md5=f"m{i}", last_embedded="2026-08-06")
+        store.save()
+
+    final = StateStore(state_path)
+    final.load()
+    assert len(final.state.curator_processed) == 10, (
+        f"expected 10 curator_processed entries, got "
+        f"{len(final.state.curator_processed)}: {final.state.curator_processed!r}"
+    )
+    assert len(final.state.files) == 10, f"expected 10 files, got {len(final.state.files)}"
+
+
 def test_concurrent_edit_wins_over_stale_delete(state_path):
     """Genuine concurrent conflict: instance A deletes key K while instance B
     independently modifies K's value and saves first. Per the documented
