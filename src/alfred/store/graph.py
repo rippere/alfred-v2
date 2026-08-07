@@ -7,7 +7,7 @@ import pickle
 import tempfile
 import threading
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterator
 
 import structlog
@@ -54,6 +54,46 @@ def _lock_for_path(path: Path) -> threading.RLock:
 # needs _locks_guard to protect first-creation of an entry, same as
 # _path_locks.
 _flock_state: dict[str, dict] = {}
+
+
+# Wikilink targets are raw link text. Obsidian omits the .md extension for
+# notes ([[note/foo]]) and keeps the real extension for everything else
+# ([[diagram.png]]), so "has a suffix" alone cannot tell a note from an
+# attachment — a note legitimately named "alfred-v2.0-plan" parses as suffix
+# ".0-plan". Only these suffixes are treated as real, non-note files; anything
+# else gets .md appended.
+_ATTACHMENT_SUFFIXES: frozenset[str] = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif",
+    ".pdf", ".canvas", ".base", ".txt", ".csv", ".json", ".yaml", ".yml",
+    ".mp3", ".wav", ".m4a", ".ogg", ".flac",
+    ".mp4", ".mov", ".webm", ".mkv",
+    ".zip", ".tar", ".gz", ".docx", ".xlsx", ".pptx", ".html",
+})
+
+
+def normalize_node(name: str) -> str:
+    """Normalize a wikilink target into the same key space as a vault rel_path.
+
+    add_edges_from_wikilinks used to add sources as `note/foo.md` (a rel_path)
+    but targets as the raw link text `note/foo`, so 6,897 files existed in
+    graph.pkl as two unconnected nodes. The link-text half held every inbound
+    edge and had out-degree 0, which made it a dead end: spreading activation
+    (engine.py) died at hop 2, and the chunk_id synthesized from it
+    (f"{rel_path}::chunk_00") matched nothing in LanceDB. Normalizing both
+    ends into rel_path space collapses the two halves back into one node.
+
+    Returns "" for a target that normalizes to nothing; callers skip those.
+    """
+    n = name.replace("\\", "/").strip()
+    # Defensive: WIKILINK_RE already strips #headings and |aliases, but the
+    # graph is also fed by callers that do not go through it.
+    n = n.split("#", 1)[0].split("|", 1)[0].strip()
+    n = n.lstrip("/")
+    if not n:
+        return ""
+    if PurePosixPath(n).suffix.lower() in _ATTACHMENT_SUFFIXES:
+        return n
+    return n if n.lower().endswith(".md") else n + ".md"
 
 
 def _flock_state_for_path(path: Path) -> dict:
@@ -223,15 +263,75 @@ class GraphStore:
             return self._graph().number_of_edges()
 
     def add_edges_from_wikilinks(self, source_rel_path: str, targets: list[str]) -> None:
+        """Add wikilink edges from a file to its link targets.
+
+        Both ends are normalized into rel_path space (see normalize_node), so
+        a target written as `note/foo` lands on the same node as the source
+        `note/foo.md` instead of forking the file into two.
+        """
         with self._lock:
             g = self._graph()
-            g.add_node(source_rel_path)
-            for t in targets:
+            source = normalize_node(source_rel_path)
+            if not source:
+                return
+            g.add_node(source)
+            for raw in targets:
+                t = normalize_node(raw)
+                if not t or t == source:      # a self-link adds no traversable edge
+                    continue
                 g.add_node(t)
-                if not g.has_edge(source_rel_path, t):
-                    g.add_edge(source_rel_path, t, weight=1.0, edge_type="wikilink")
+                if not g.has_edge(source, t):
+                    g.add_edge(source, t, weight=1.0, edge_type="wikilink")
                 else:
-                    g[source_rel_path][t]["weight"] += 0.1   # reinforce repeated links
+                    g[source][t]["weight"] += 0.1   # reinforce repeated links
+
+    def merge_link_text_nodes(self) -> int:
+        """Collapse legacy raw-link-text nodes into their rel_path node.
+
+        One-shot migration for a graph.pkl built before add_edges_from_wikilinks
+        normalized its targets. Every node whose name is not already normalized
+        (`note/foo`) is merged into its normalized form (`note/foo.md`),
+        carrying its in- and out-edges across and summing weights where an edge
+        already exists. Returns the number of nodes merged away.
+
+        Idempotent: a second run finds nothing left to merge.
+        """
+        with self._lock:
+            g = self._graph()
+            mapping = {
+                node: normalize_node(node)
+                for node in list(g.nodes())
+                if isinstance(node, str) and normalize_node(node) not in ("", node)
+            }
+            for old, new in mapping.items():
+                if not g.has_node(old):
+                    continue
+                g.add_node(new)
+                for _, target, data in list(g.out_edges(old, data=True)):
+                    dest = mapping.get(target, target)
+                    if dest == new:
+                        continue          # self-loop once both ends normalize
+                    self._merge_edge(g, new, dest, data)
+                for source, _, data in list(g.in_edges(old, data=True)):
+                    src = mapping.get(source, source)
+                    if src == new:
+                        continue
+                    self._merge_edge(g, src, new, data)
+                g.remove_node(old)
+            if mapping:
+                log.info("graph.link_text_nodes_merged", merged=len(mapping),
+                         nodes=g.number_of_nodes(), edges=g.number_of_edges())
+            return len(mapping)
+
+    @staticmethod
+    def _merge_edge(g, u: str, v: str, data: dict) -> None:
+        """Add edge u->v, summing weight into an existing edge rather than
+        overwriting it — merging two halves of a split node must not silently
+        discard the link strength one of them accumulated."""
+        if g.has_edge(u, v):
+            g[u][v]["weight"] = g[u][v].get("weight", 1.0) + data.get("weight", 1.0)
+        else:
+            g.add_edge(u, v, **data)
 
     def clear_cluster_edges(self) -> int:
         """Remove all cluster-type edges. Returns count removed."""

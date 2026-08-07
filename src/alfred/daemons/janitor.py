@@ -24,8 +24,8 @@ import structlog
 from alfred.core.failures import record_failure
 from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.schema import (
-    KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
-    REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
+    DIRECTORY_TO_TYPE, KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
+    REQUIRED_FIELDS, STATUS_BY_TYPE,
     correct_status, correct_type,
 )
 from alfred.core.vault import extract_wikilinks, is_sync_conflict
@@ -345,11 +345,37 @@ class JanitorDaemon(BaseDaemon):
         return fixed
 
     def _infer_type(self, rel_path: str) -> str:
+        """Infer a record type from the directory a file sits in.
+
+        Walks the containing directories deepest-first so nested layouts
+        resolve to the nearest meaningful directory: `_archived/session/x.md`
+        is a session, and `session/2026/x.md` is still a session.
+
+        Two lookups per directory part, in order:
+
+        1. The directory name *is* a record type — this is the case for
+           directories TYPE_DIRECTORY does not point at because they
+           consolidate elsewhere on write (`decision/`, `assumption/`,
+           `constraint/`, `contradiction/`, `input/` all sit on disk but
+           TYPE_DIRECTORY routes them to topic/). Inverting TYPE_DIRECTORY
+           inferred nothing at all for those.
+        2. DIRECTORY_TO_TYPE, the collision-resolved inverse, for directories
+           whose name differs from the type (`ideas/` -> idea, `drafts/` ->
+           script, `hooks/` -> hook).
+
+        Returns "" when nothing resolves, which leaves `type` unset rather
+        than stamping a guess.
+        """
         parts = rel_path.replace("\\", "/").split("/")
         if len(parts) < 2:
             return ""
-        dir_to_type = {v: k for k, v in TYPE_DIRECTORY.items()}
-        return dir_to_type.get(parts[0], "")
+        for part in reversed(parts[:-1]):     # directories only, nearest first
+            if part in KNOWN_TYPES:
+                return part
+            resolved = DIRECTORY_TO_TYPE.get(part)
+            if resolved:
+                return resolved
+        return ""
 
     # ── Stage 3: LLM enrichment (stub records, per-file, per-type prompt) ────
 

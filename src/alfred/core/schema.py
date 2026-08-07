@@ -61,6 +61,35 @@ TYPE_DIRECTORY: dict[str, str] = {
     "learn": "topic",
 }
 
+
+def _build_directory_to_type() -> dict[str, str]:
+    """Directory name -> canonical record type.
+
+    TYPE_DIRECTORY is many-to-one (session/ <- session, conversation,
+    ai-dialogue; topic/ <- topic, decision, assumption, constraint,
+    contradiction, learn), so a plain `{v: k for k, v in ...}` inversion is
+    lossy: it keeps whichever type happened to be *declared last* and silently
+    resolves session/ to "ai-dialogue" and topic/ to "learn". Both are legacy
+    read-path-only types that are never written, so autofix was stamping the
+    two largest content types in the vault with the wrong value.
+
+    Resolve collisions explicitly: a directory whose name is itself a record
+    type maps to that type. Directories with a single contributing type
+    (ideas/ <- idea, drafts/ <- script, hooks/ <- hook) map to it unambiguously.
+    """
+    out: dict[str, str] = {}
+    for record_type, directory in TYPE_DIRECTORY.items():
+        if out.get(directory) == directory:
+            continue          # already resolved to the self-named canonical type
+        if directory not in out or record_type == directory:
+            out[directory] = record_type
+    return out
+
+
+# Directory name -> canonical record type. Use this instead of inverting
+# TYPE_DIRECTORY at the call site.
+DIRECTORY_TO_TYPE: dict[str, str] = _build_directory_to_type()
+
 LIST_FIELDS: set[str] = {
     "tags", "aliases", "related", "relationships", "participants",
     "outputs", "depends_on", "blocked_by", "based_on", "supports",

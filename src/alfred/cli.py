@@ -600,6 +600,93 @@ def forget(
     )
 
 
+@app.command("graph-repair")
+def graph_repair(
+    config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually rewrite graph.pkl. Without this, nothing is changed."
+    ),
+    limit: int = typer.Option(15, "--limit", "-n", help="Sample rows to show in the preview"),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Merge legacy raw-link-text nodes in graph.pkl into their rel_path node.
+
+    A graph built before wikilink targets were normalized holds each linked
+    file twice — once as `note/foo.md` (the source side) and once as
+    `note/foo` (the link-text side). The link-text half collects every inbound
+    edge but has no outbound edges, so it is a dead end that halves graph-hop
+    recall. This merges the two halves, carrying edges across and summing
+    weights.
+
+    Dry run by default. Idempotent — a second run reports 0 to merge.
+    """
+    import json as _json
+    import shutil
+
+    from alfred.store.graph import GraphStore, normalize_node
+
+    cfg = _load(config)
+    graph = GraphStore(cfg.graph_path)
+    if not graph.load():
+        console.print(f"[yellow]no graph at[/yellow] {cfg.graph_path} — nothing to repair")
+        raise typer.Exit(0)
+
+    g = graph._graph()
+    before_nodes, before_edges = g.number_of_nodes(), g.number_of_edges()
+    candidates = [
+        n for n in g.nodes()
+        if isinstance(n, str) and normalize_node(n) not in ("", n)
+    ]
+    # A candidate that already has a normalized twin is a genuine split file;
+    # one without is a link to a note that does not exist (yet).
+    split = [n for n in candidates if g.has_node(normalize_node(n))]
+
+    if json_out:
+        console.print_json(_json.dumps({
+            "nodes": before_nodes, "edges": before_edges,
+            "unnormalized": len(candidates), "split_files": len(split),
+            "applied": False, "sample": candidates[:limit],
+        }))
+    else:
+        console.print(
+            f"graph [bold]{before_nodes}[/bold] nodes / [bold]{before_edges}[/bold] edges — "
+            f"[bold]{len(candidates)}[/bold] un-normalized node(s), of which "
+            f"[bold]{len(split)}[/bold] duplicate a file that already exists as a .md node"
+        )
+        for n in candidates[:limit]:
+            marker = "[red]split[/red]" if g.has_node(normalize_node(n)) else "[dim]dangling[/dim]"
+            console.print(f"  {marker}  {n}  ->  {normalize_node(n)}")
+        if len(candidates) > limit:
+            console.print(f"[dim]  … and {len(candidates) - limit} more[/dim]")
+
+    if not apply:
+        if not json_out:
+            console.print("\n[dim]Dry run — nothing changed. Re-run with --apply to merge.[/dim]")
+        return
+
+    if not candidates:
+        console.print("[green]nothing to merge[/green]")
+        return
+
+    # graph.pkl is the only copy of the wikilink topology and a full rebuild
+    # costs a vault-wide re-read, so keep a restorable copy before rewriting.
+    backup = cfg.graph_path.with_name(cfg.graph_path.name + ".pre-repair")
+    shutil.copy2(cfg.graph_path, backup)
+
+    with graph.transaction():
+        graph.load()                      # re-read under the lock, not the preview copy
+        merged = graph.merge_link_text_nodes()
+        graph.save()
+
+    g = graph._graph()
+    console.print(
+        f"[green]merged[/green] {merged} node(s) — "
+        f"{before_nodes} -> {g.number_of_nodes()} nodes, "
+        f"{before_edges} -> {g.number_of_edges()} edges\n"
+        f"[dim]backup: {backup}[/dim]"
+    )
+
+
 @app.command()
 def mcp(
     config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
