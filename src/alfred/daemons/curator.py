@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -13,7 +12,7 @@ import structlog
 
 from alfred.core.local_llm import LocalLLMUnavailable, complete_json
 from alfred.core.schema import KNOWN_TYPES, STATUS_BY_TYPE, TYPE_DIRECTORY, correct_status, correct_type
-from alfred.core.vault_ops import VaultError, vault_create, vault_edit, vault_move
+from alfred.core.vault_ops import VaultError, vault_create, vault_move
 from alfred.daemons.base import BaseDaemon
 
 log = structlog.get_logger()
@@ -45,71 +44,6 @@ Note content:
 ---
 {content}
 ---"""
-
-
-# A recurring feed marks its drops with `<!-- alfred:source <key> -->`. The key
-# is a STABLE IDENTITY for the feed, not for any one drop: every sync of the
-# ECC instinct bridge carries `ecc-instincts`, and each is a fresh full snapshot
-# that should REPLACE the previous record rather than sit beside it.
-#
-# Nothing consumed this marker before, and the record name came from the drop's
-# heading. The instinct bridge titles its heading "ECC Procedural Instincts
-# (N)" where N is the instinct count, so every change to N slugged to a new
-# filename and minted a new ~1.2 MB record: 24 near-identical snapshots holding
-# 92,327 of 122,911 chunks — 81.5% of the vector index — for one feed.
-_SOURCE_KEY_RE = re.compile(r"<!--\s*alfred:source\s+([A-Za-z0-9._:-]+)\s*-->")
-
-# Cap the directory scan that resolves a source_key. Feed records live in the
-# type's own directory, which is small (note/ is ~450 files); this only guards
-# against a pathological directory making every ingest walk the vault.
-_SOURCE_KEY_SCAN_LIMIT = 5000
-
-
-def _extract_source_key(fm: dict, body: str) -> str:
-    """Return the feed identity for a drop, or "" if it declares none.
-
-    Frontmatter `source_key` wins over the inline HTML-comment marker so a
-    producer can be explicit; the marker is the established convention and
-    keeps working untouched.
-    """
-    declared = fm.get("source_key")
-    if isinstance(declared, str) and declared.strip():
-        return declared.strip()
-    m = _SOURCE_KEY_RE.search(body)
-    return m.group(1) if m else ""
-
-
-def _find_by_source_key(vault_path: Path, rec_type: str, key: str) -> str | None:
-    """Find an existing record for this feed, by frontmatter `source_key`.
-
-    Scans only the directory the type routes to. A feed whose type changes
-    between syncs will not be matched and gets a new record — correct, since a
-    record cannot move between type directories in place.
-    """
-    directory = TYPE_DIRECTORY.get(rec_type, rec_type)
-    type_dir = vault_path / directory
-    if not type_dir.is_dir():
-        return None
-    for i, fp in enumerate(sorted(type_dir.glob("*.md"))):
-        if i >= _SOURCE_KEY_SCAN_LIMIT:
-            log.warning("curator.source_key_scan_truncated", directory=directory, key=key)
-            break
-        try:
-            # Read only the frontmatter block — these records reach 1.2 MB and
-            # parsing every body would make each ingest an O(vault) text load.
-            with fp.open("r", encoding="utf-8", errors="replace") as fh:
-                if fh.readline().rstrip("\n") != "---":
-                    continue
-                for line in fh:
-                    if line.rstrip("\n") == "---":
-                        break
-                    name, _, value = line.partition(":")
-                    if name.strip() == "source_key" and value.strip().strip("\"'") == key:
-                        return str(fp.relative_to(vault_path)).replace("\\", "/")
-        except OSError as e:
-            log.debug("curator.source_key_scan_read_failed", path=str(fp), error=str(e))
-            continue
-    return None
 
 
 def _json_default(obj):
@@ -268,33 +202,6 @@ class CuratorDaemon(BaseDaemon):
             set_fields["tags"] = tags
 
         record_body = body.strip() or classification.get("summary", "")
-
-        # A drop from a recurring feed REPLACES that feed's record instead of
-        # creating a sibling. Without this, a feed either accumulates one record
-        # per title change (what the ECC instinct bridge did, 24 times) or —
-        # once its title stabilises — collides forever and lands in
-        # `curator.duplicate_skip` below, silently discarding every update.
-        source_key = _extract_source_key(fm, body)
-        if source_key:
-            set_fields["source_key"] = source_key
-            existing = _find_by_source_key(self.cfg.vault_path, rec_type, source_key)
-            if existing:
-                vault_edit(
-                    self.cfg.vault_path,
-                    existing,
-                    set_fields=set_fields,
-                    body_replace=record_body or None,
-                )
-                self.log.info(
-                    "curator.source_key_updated",
-                    path=existing, source_key=source_key, source=inbox_file.name,
-                )
-                dest = processed_dir / inbox_file.name
-                if dest.exists():
-                    dest = processed_dir / f"{inbox_file.stem}.{content_hash}{inbox_file.suffix}"
-                inbox_file.rename(dest)
-                self.emit("curator_ingested", source=inbox_file.name, type=rec_type)
-                return True
 
         try:
             result = vault_create(
