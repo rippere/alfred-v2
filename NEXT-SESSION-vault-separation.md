@@ -124,13 +124,81 @@ The cheapest possible test of whether navigation was ever the real problem.
 
 Rollback: revert one JSON key, delete one note.
 
-### Step 2 — Fix Bugs 1 and 2
+### Step 2 — Fix Bugs 1 and 2 ✅ DONE 2026-08-07 (`68260ba`)
 
-Self-contained, valuable regardless of what happens to folders. Add regression tests.
+Both fixed, 59 regression tests, applied to the live graph:
 
-### Step 3 — Deal with the 22 monster files (Bug 3)
+```
+before  nodes 25845  edges 99685  .md 17043  non-.md 8802  dead-ends 8865
+after   nodes 18948  edges 99366  .md 18942  non-.md    6  dead-ends 2069
+2-hop reachable over 400 seeds: 3615 -> 37182  (10.3x)
+```
 
-Biggest single lever on retrieval quality. Cheap to test: exclude, re-query, compare.
+`alfred graph-repair` (dry-run default) is the repair tool; it is idempotent.
+Remaining gap: bare `[[Name]]` links normalize to root-level `Name.md`, not
+`person/Name.md` — ~1,900 nodes still dangle. That is basename resolution, a
+separate feature, not this bug.
+
+### Step 3 — The monster files: growth STOPPED, cleanup NOT done
+
+**Root cause found.** They are not 22 unrelated files. They are 24 snapshots of
+ONE feed. `~/.claude/integrations/ecc-instinct-bridge/sync-instincts-to-vault.sh`
+titled its heading `# ECC Procedural Instincts (N)` with N the instinct count;
+the curator slugs the record filename from the H1, so every change to N minted a
+new ~1.2 MB record. 101,576 of 168,605 chunks — **60% of the index** — for one
+feed. With no ANN index (`_indices/` is empty), all of it is brute-force scanned
+on every query.
+
+**Fixed (`36fe293`):** `<!-- alfred:source <key> -->` was documented as the dedup
+convention but nothing in the curator ever read it. It does now — a drop with a
+`source_key` replaces that feed's record in place. Bridge heading stabilised;
+`-834` stamped with `source_key`. **No 25th snapshot will be created.**
+
+**Still to do — the 23 stale snapshots are still on disk.** Do NOT repeat the
+2026-08-07 attempt:
+
+- The purge script issued 24 separate `delete_file` calls, each an `IN` clause
+  over ~4,000 chunk ids, against **39,979 fragments / 31,440 manifests**. It hit
+  **23 GB RSS and was OOM-killed** (`journalctl -k`, 12:24:11), thrashing 24 GB
+  of swap and freezing the desktop for ~10 s at a stretch. Steam was OOM-killed
+  three minutes earlier; the box was already at the edge.
+- Correct approach: **ONE** predicate delete (`id LIKE 'note/ecc-procedural-instincts-%'`),
+  under `systemd-run --scope -p MemoryMax=4G` so a bad estimate kills the script
+  and not the desktop.
+- **Quiesce properly first.** There are **five** Alfred instances (`config.yaml`
+  + neuroscience/finance/personal/employment). `alfred down` signals only the
+  main one, and it ignores SIGTERM while mid-embed-batch. Verify by PID, not by
+  timers and not by the pidfile — `data/alfred.pid` is stale.
+
+**Known inconsistency, benign but real:** `note/ecc-procedural-instincts-668.md`
+(possibly 1-2 more) had its vectors deleted before the OOM, but `state.json`
+still lists 3,716 chunks. md5 is unchanged so the surveyor will never re-embed
+it — that note is **silently unsearchable**. Resolves itself when the purge
+completes; fixing it separately needs the daemon down.
+
+### Step 3b — LanceDB compaction: DO NOT run it blind
+
+Earlier guidance in this doc treated compaction as a safe reclaim. On measured
+evidence it is not, on this box, today:
+
+- `compact_files()` on 39,979 fragments is strictly heavier than the delete that
+  just OOM-killed at 23 GB. Measure it under a `MemoryMax` cap first.
+- Order matters: purge the snapshots, THEN compact. Compacting first compacts
+  garbage.
+- `compact_files()` then `cleanup_old_versions()` — the first shrinks future
+  manifests, only the second reclaims the 25 GB.
+- Safe on this codebase's identity model: rows are keyed on the string `id`
+  column via `merge_insert("id")`, not implicit `_rowid`, and nothing calls
+  `checkout` (no time travel to lose). `_indices/` is empty, so there is no ANN
+  index to invalidate — and compaction is therefore also a straight query
+  speedup.
+
+**Separately: ~42k orphan vectors.** `store.count()` reported 168,605 while
+`state.json` tracked 122,911. Those are rows whose files are gone but whose
+vectors were never deleted. Compaction does NOT reclaim them (live rows, not old
+versions) and the Ebbinghaus sweep cannot see them (it works from tracked
+files). Needs its own reaper. Note the hazard: deleting the .md files without
+their vectors makes orphan chunks surface as results pointing at missing notes.
 
 ### Step 4 — File-level retention for the exhaust
 
