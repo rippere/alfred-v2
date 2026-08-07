@@ -9,9 +9,12 @@ Interface mirrors MilvusStore exactly so callers don't need to change.
 """
 from __future__ import annotations
 
+import ctypes
 import fcntl
+import gc
 import os
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,24 @@ import structlog
 from alfred.core.failures import record_failure
 
 log = structlog.get_logger()
+
+# glibc hands freed heap back to the process's per-thread arenas, not to the
+# OS, so a long delete sweep ratchets RSS upward even when every individual
+# call is small — this box has 16 cores, so up to 128 arenas. That ratchet, not
+# any single delete, is what reached 23 GB and got OOM-killed on 2026-08-07:
+# three deletes committed fine while climbing and the fourth crossed the
+# ceiling. Measured on a scratch table: malloc_trim(0) after each delete held
+# growth to +31 MB over 8 calls versus +1,764 MB without it — 57x.
+# (MALLOC_ARENA_MAX=2 achieves the same, but only if set before the process
+# starts, so it cannot be applied from inside a running daemon.)
+def _release_freed_memory() -> None:
+    gc.collect()
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass          # non-glibc (musl) — the sweep is still correct, just heavier
 
 # Re-export SearchHit from the shared types module so importers don't have to change.
 from alfred.store.types import SearchHit  # noqa: F401
@@ -399,9 +420,123 @@ class LanceDBStore:
             safe = rel_path.replace("'", "\\'")
             self._tbl.delete(f"starts_with(id, '{safe}::')")
 
+    # Ceiling for one delete_ids() sweep, in MB. Not a per-call peak — the cost
+    # that matters is the RUNNING SUM, because glibc returns freed arena space
+    # to the process, not the OS. 3.0 GB leaves a wide margin under the 23 GB
+    # that OOM-killed this box, and _release_freed_memory() should keep a
+    # compacted store nowhere near it.
+    RSS_CEILING_MB = 3072.0
+
+    @staticmethod
+    def _rss_mb() -> float:
+        """Current RSS in MB, or 0.0 where /proc is unavailable."""
+        try:
+            with open("/proc/self/status", "r") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024.0
+        except OSError:
+            pass
+        return 0.0
+
+    def delete_ids(self, chunk_ids: list[str], batch: int = 500) -> int:
+        """Delete explicit chunk ids in bounded batches.  Returns ids submitted.
+
+        Why this exists instead of one big ``id IN (...)``: on 2026-08-07 a
+        bulk delete reached 23 GB RSS and was OOM-killed.  Measured cause is
+        that DataFusion plans the predicate against *every* fragment, so peak
+        memory is proportional to ``fragment_count x predicate_terms`` — about
+        3.6e-4 MB per pair.  At the live store's 10,274 fragments a single
+        3,700-term IN clause budgets ~13.7 GB before glibc arena growth
+        ratchets it higher across successive calls.  500 terms keeps one call
+        under ~2 GB even uncompacted, which is why the batch is small and not
+        tunable upward without re-measuring.
+
+        Ids containing an apostrophe are skipped rather than interpolated:
+        ``_safe_chunk_id`` (core/vault.py) strips ``'`` when minting ids, so
+        such a row cannot legitimately exist, and quoting it into SQL would be
+        an injection rather than a delete.
+        """
+        submitted = 0
+        pending: list[str] = []
+
+        def _flush() -> bool:
+            """Delete one batch. Returns False when the sweep must stop."""
+            nonlocal submitted, pending
+            self._delete_id_batch(pending)
+            submitted += len(pending)
+            pending = []
+            # Batching bounds each call's PEAK, but the sweep pays the SUM:
+            # nothing is released between calls, so a long sweep climbs even
+            # though every individual delete is small. _delete_id_batch calls
+            # malloc_trim, but if RSS still crosses the ceiling something is
+            # retaining memory we don't understand — stop rather than march
+            # toward another OOM. The ids not yet submitted stay in the store
+            # and the next sweep retries them.
+            rss = self._rss_mb()
+            if rss and rss > self.RSS_CEILING_MB:
+                record_failure(
+                    "lancedb.delete_ids_rss_ceiling",
+                    error=MemoryError(f"RSS {rss:.0f}MB > ceiling {self.RSS_CEILING_MB:.0f}MB"),
+                    submitted=submitted,
+                )
+                log.warning(
+                    "lancedb.delete_ids_aborted_rss",
+                    rss_mb=round(rss, 1), ceiling_mb=self.RSS_CEILING_MB, submitted=submitted,
+                )
+                return False
+            return True
+
+        for cid in chunk_ids:
+            if "'" in cid:
+                record_failure(
+                    "lancedb.delete_ids_quote_in_id", error=ValueError(cid), chunk_id=cid
+                )
+                continue
+            pending.append(cid)
+            if len(pending) >= batch and not _flush():
+                return submitted
+        if pending:
+            _flush()
+        return submitted
+
+    def _delete_id_batch(self, ids: list[str]) -> None:
+        ids_sql = ", ".join(f"'{cid}'" for cid in ids)
+        self._tbl.delete(f"id IN ({ids_sql})")
+        _release_freed_memory()
+
     # ------------------------------------------------------------------
     # Read methods
     # ------------------------------------------------------------------
+
+    def iter_ids(self, batch_size: int = 4096):
+        """Stream every stored chunk id, one at a time, id column only.
+
+        Peak memory is set by the projection, NOT by row count: measured on
+        the live store (157,233 rows / 10,274 fragments) this is ~301 MB peak
+        and 2.1 s, versus 4,181 MB and 145 s for ``query_all()``, which calls
+        ``to_arrow()`` and therefore materialises all 483 MB of vectors before
+        its ``select()`` can drop them.  Projection pushdown was confirmed by
+        an IO counter, not inferred: 49 MB read for the id column vs 465 MB
+        with the vector column included.
+
+        ``limit(None)`` is already the builder default, but it is spelled out
+        so a future refactor cannot silently reintroduce the default-10 limit
+        that ``search()`` applies on other paths.
+
+        ``batch_size`` is a ceiling, not a memory knob — Lance will not merge
+        a batch across fragments, so on the live store the effective batch is
+        ~15 rows.  Marginal memory tracks fragment count (~13 KB/fragment),
+        which is the number to watch if this ever grows.
+        """
+        reader = (
+            self._tbl.search()
+            .select(["id"])
+            .limit(None)
+            .to_batches(batch_size=batch_size)
+        )
+        for batch in reader:
+            yield from batch.column(0).to_pylist()
 
     def search(
         self,

@@ -69,6 +69,34 @@ def status(
     state_table.add_row("curator processed", str(len(store.state.curator_processed)))
     state_table.add_row("distiller runs", str(len(store.state.distiller_runs)))
     state_table.add_row("last run", store.state.last_run or "never")
+    # Orphan vectors: store rows minus state-tracked chunk_ids. Deliberately
+    # computed from count_rows() (a manifest read, no scan) rather than the
+    # real reap diff, which needs a full id scan plus a vault walk — status
+    # must stay instant. That makes this an UPPER BOUND, not the reapable
+    # count: most of the delta is files embedded but not yet state-saved
+    # (measured 2026-08-07: 33,922 delta, of which 5 rows were genuinely
+    # reapable). Labelled as such so nobody reads it as "rows to delete".
+    try:
+        # Deliberately NOT LanceDBStore(...): its constructor mkdirs, takes a
+        # quarantine lock, create_table(mode="create")s when the table is
+        # absent, and on a corruption-shaped open error quarantines and
+        # RECREATES the table — then status would discard was_recreated, so the
+        # runner's re-embed invalidation never fires. An operator running
+        # `alfred status` to diagnose a broken store could empty it. A status
+        # command must only read.
+        import lancedb as _lancedb
+        _db = _lancedb.connect(getattr(cfg, "lancedb_uri", str(cfg.data_dir / "lancedb")))
+        if cfg.milvus_collection not in _db.table_names():
+            raise FileNotFoundError(f"table {cfg.milvus_collection!r} not present")
+        _delta = _db.open_table(cfg.milvus_collection).count_rows() - store.chunk_count()
+        state_table.add_row(
+            "orphan vectors",
+            f"{max(0, _delta)} [dim]upper bound — `alfred reap` for the real count[/dim]",
+        )
+    except Exception as e:  # vector store absent or unopenable — not fatal for status
+        from alfred.core.failures import record_failure
+        record_failure("cli.status_orphan_count_failed", error=e)
+        state_table.add_row("orphan vectors", "[yellow]unavailable[/yellow]")
     # Swallowed failures — the whole point of error_counts is that this row
     # reads a real number instead of nothing at all when handlers have been
     # quietly eating errors. Red when non-zero so it can't be skimmed past.
@@ -644,6 +672,130 @@ def forget(
         + (f" — {len(candidates) - len(selected)} deferred past the per-sweep cap"
            if len(candidates) > len(selected) else "")
     )
+
+
+@app.command()
+def reap(
+    config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually delete. Without this, nothing is changed."
+    ),
+    limit: int = typer.Option(25, "--limit", "-n", help="Rows to show in the preview"),
+    max_rows: Optional[int] = typer.Option(
+        None, "--max-rows", help="Per-sweep row cap (default: janitor.reap_max_rows_per_sweep)"
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Show (or apply) the orphan reap — delete vector rows whose note is gone.
+
+    A row is reaped only if its rel_path is absent from state.json AND its
+    .md is absent from the vault. Both, never either: state.json lags the
+    vault by up to 25 files (the surveyor's save interval), and on 2026-08-07
+    that lag covered 2,892 files / 45,352 rows whose notes were all still
+    present. A state-only reaper would have deleted 29% of the index.
+
+    Dry run by default.
+    """
+    import asyncio
+    import json as _json
+    from rich import box
+    from rich.table import Table
+
+    from alfred.daemons.janitor import JanitorDaemon
+    from alfred.store.state import StateStore
+
+    cfg = _load(config)
+    store = StateStore(cfg.state_path, cfg=cfg)
+    store.load()
+
+    from alfred.store.lancedb_store import LanceDBStore
+    vector_store = LanceDBStore(
+        uri=getattr(cfg, "lancedb_uri", str(cfg.data_dir / "lancedb")),
+        collection=cfg.milvus_collection,
+        dims=cfg.embed_dims,
+    )
+    janitor = JanitorDaemon(cfg, store, asyncio.Queue(), store=vector_store)
+
+    plan = janitor.reap_plan(max_rows=max_rows)
+
+    if plan.aborted:
+        if json_out:
+            console.print_json(_json.dumps({"aborted": plan.aborted, "applied": False}))
+        else:
+            console.print(f"[red]aborted:[/red] {plan.aborted}")
+        raise typer.Exit(1)
+
+    if json_out:
+        console.print_json(_json.dumps({
+            "store_rows": plan.store_rows,
+            "store_paths": plan.store_paths,
+            "reapable_paths": plan.reapable_paths,
+            "reapable_rows": plan.reapable_rows,
+            "deferred": len(plan.deferred),
+            "malformed": plan.malformed_count,
+            "untracked_but_present": plan.untracked_but_present,
+            "untracked_but_present_rows": plan.untracked_but_present_rows,
+            "applied": False,
+            "rows": [{"rel_path": p, "chunks": n} for p, n in plan.orphans[:limit]],
+        }))
+        if not apply:
+            return
+
+    if not json_out:
+        console.print(
+            f"[bold]{plan.reapable_paths}[/bold] orphaned file(s) — "
+            f"[bold]{plan.reapable_rows}[/bold] row(s) of "
+            f"{plan.store_rows} in the store"
+        )
+        if plan.orphans:
+            t = Table(box=box.SIMPLE, padding=(0, 2))
+            t.add_column("file", style="dim", overflow="fold")
+            t.add_column("chunks", justify="right")
+            for p, n in plan.orphans[:limit]:
+                t.add_row(p, str(n))
+            console.print(t)
+            if len(plan.orphans) > limit:
+                console.print(f"[dim]… and {len(plan.orphans) - limit} more[/dim]")
+        # Never hide this: it is the number the safe definition is protecting.
+        console.print(
+            f"[dim]retained: {plan.untracked_but_present} file(s) / "
+            f"{plan.untracked_but_present_rows} row(s) absent from state.json but "
+            f"still present in the vault (state lags by up to 25 files)[/dim]"
+        )
+        if plan.deferred:
+            console.print(
+                f"[yellow]deferred:[/yellow] {len(plan.deferred)} file(s) / "
+                f"{sum(n for _, n in plan.deferred)} row(s) past the per-sweep cap "
+                f"— re-run, or raise --max-rows"
+            )
+        if plan.malformed_count:
+            console.print(
+                f"[yellow]{plan.malformed_count}[/yellow] id(s) did not parse as "
+                f"'<rel_path>::chunk_NN' and were left alone, e.g. "
+                f"{plan.malformed[:3]}"
+            )
+
+    if not apply:
+        if not json_out:
+            console.print("\n[dim]Dry run — nothing changed. Re-run with --apply to delete.[/dim]")
+        return
+
+    from alfred.store.reaper import execute_plan
+    deleted = execute_plan(
+        vector_store,
+        store.state,
+        cfg.vault_path,
+        plan,
+        batch_size=int(getattr(cfg, "janitor_reap_scan_batch_size", 4096)),
+        delete_batch=int(getattr(cfg, "janitor_reap_delete_batch", 500)),
+    )
+    # record_failure() only reaches state.error_counts via StateStore.save() ->
+    # drain_failures(). Without this save, reap.vector_delete_failed,
+    # reap.malformed_chunk_id and lancedb.delete_ids_quote_in_id are logged and
+    # then lost, and `alfred status` keeps reporting "swallowed errors 0" while
+    # deletes are silently failing. `alfred forget` already saves here.
+    store.save()
+    console.print(f"[green]reaped[/green] {deleted} row(s)")
 
 
 @app.command("graph-repair")

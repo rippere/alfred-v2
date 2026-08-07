@@ -38,6 +38,10 @@ _CONSUMED_KEYS: frozenset[tuple[str, ...]] = frozenset({
     ("janitor", "forget_retrievability"),
     ("janitor", "forget_min_age_days"),
     ("janitor", "forget_max_per_sweep"),
+    ("janitor", "reap_enabled"),
+    ("janitor", "reap_max_rows_per_sweep"),
+    ("janitor", "reap_scan_batch_size"),
+    ("janitor", "reap_delete_batch"),
     ("distiller", "mode"),
     ("api_budget", "max_calls_per_day"),
     ("api_budget", "warn_at_calls"),
@@ -127,6 +131,25 @@ class AlfredConfig:
     janitor_forget_min_age_days: int = 180
     # Cap per sweep so a first run can't evict the entire store in one pass.
     janitor_forget_max_per_sweep: int = 500
+    # Orphan reap sweep. OFF by default for the same reason as forget: it
+    # deletes vectors, and unlike forget it deletes rows state.json does not
+    # even know about, so a bug here is invisible to every other consistency
+    # check. `alfred reap` (dry-run by default) is how you look first.
+    janitor_reap_enabled: bool = False
+    # Rows per sweep. The cap is blast radius, not memory — delete batching
+    # bounds memory independently. Deliberately small: on the live store the
+    # true reapable count measured 5 rows, so a sweep wanting thousands is
+    # itself the signal that something changed.
+    janitor_reap_max_rows_per_sweep: int = 5000
+    # Enumeration batch ceiling. Lance will not merge a batch across
+    # fragments, so on a fragmented store the effective batch is far smaller
+    # and this knob barely moves peak memory (measured flat 183-184 MB from
+    # 1024 to 200000). Left configurable only for a future compacted store.
+    janitor_reap_scan_batch_size: int = 4096
+    # Predicate terms per delete call. Peak scales as fragments x terms
+    # (~3.6e-4 MB/pair); 500 x the live 10,274 fragments is ~1.9 GB, which
+    # fits the 4G cap the daemons run under. Do not raise without measuring.
+    janitor_reap_delete_batch: int = 500
 
     # Distiller
     distiller_mode: str = "on_demand"   # "scheduled" | "on_demand"
@@ -265,6 +288,16 @@ class AlfredConfig:
             )
             cfg.janitor_forget_max_per_sweep = j.get(
                 "forget_max_per_sweep", cfg.janitor_forget_max_per_sweep
+            )
+            cfg.janitor_reap_enabled = j.get("reap_enabled", cfg.janitor_reap_enabled)
+            cfg.janitor_reap_max_rows_per_sweep = j.get(
+                "reap_max_rows_per_sweep", cfg.janitor_reap_max_rows_per_sweep
+            )
+            cfg.janitor_reap_scan_batch_size = j.get(
+                "reap_scan_batch_size", cfg.janitor_reap_scan_batch_size
+            )
+            cfg.janitor_reap_delete_batch = j.get(
+                "reap_delete_batch", cfg.janitor_reap_delete_batch
             )
 
         # Distiller mode

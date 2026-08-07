@@ -157,6 +157,11 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
     if getattr(cfg, "janitor_forget_enabled", False):
         _add("janitor", janitor.forget_tick, "interval",
              misfire_grace_time=GRACE_DAILY, days=1)
+    # Orphan reap, same rule: it deletes vector rows, so it is not registered
+    # at all unless explicitly enabled.
+    if getattr(cfg, "janitor_reap_enabled", False):
+        _add("janitor", janitor.reap_tick, "interval",
+             misfire_grace_time=GRACE_DAILY, days=1)
 
     # ── Distiller: nightly at 2am, with startup catch-up ─────────────────────────
     # cron, not interval: interval-24h restarts its countdown on every daemon

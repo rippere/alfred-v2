@@ -42,6 +42,7 @@ DEEP_INTERVAL = 86400.0     # LLM enrichment once per day
 DEDUP_INTERVAL = 604800.0   # dedup sweep once per week (7 days)
 ARCHIVE_INTERVAL = 86400.0  # session archival once per day
 FORGET_INTERVAL = 86400.0   # Ebbinghaus retention sweep once per day
+REAP_INTERVAL = 86400.0     # orphan-vector reap once per day
 
 
 class IssueCode(str, Enum):
@@ -66,6 +67,7 @@ class JanitorDaemon(BaseDaemon):
         self._last_dedup = float("-inf")
         self._last_archive = float("-inf")
         self._last_forget = float("-inf")
+        self._last_reap = float("-inf")
         self._stem_index: dict[str, set[str]] = {}
 
     async def run(self) -> None:
@@ -92,6 +94,10 @@ class JanitorDaemon(BaseDaemon):
                 if forget_enabled and now - self._last_forget > FORGET_INTERVAL:
                     await self.forget_tick()
                     self._last_forget = now
+                reap_enabled = getattr(self.cfg, "janitor_reap_enabled", False)
+                if reap_enabled and now - self._last_reap > REAP_INTERVAL:
+                    await self.reap_tick()
+                    self._last_reap = now
                 await asyncio.sleep(60.0)
         finally:
             await self.save_state()
@@ -605,6 +611,90 @@ class JanitorDaemon(BaseDaemon):
             await self._forget_sweep()
         except Exception as e:
             self.log.error("janitor.forget_tick_error", error=str(e))
+
+    # ── Reap sweep: orphaned vector rows ──────────────────────────────────────
+
+    def reap_plan(self, max_rows: int | None = None):
+        """What the reap sweep would delete.  Side-effect free.
+
+        Same contract as ``forget_candidates``: `alfred reap` and the sweep
+        call exactly this, so a dry run and the real thing can never disagree
+        about what would go.
+        """
+        from alfred.store.reaper import build_plan
+
+        cap = int(
+            max_rows
+            if max_rows is not None
+            else getattr(self.cfg, "janitor_reap_max_rows_per_sweep", 5000)
+        )
+        return build_plan(
+            self.store,
+            self.state.state,
+            self.cfg.vault_path,
+            max_rows=cap,
+            batch_size=int(getattr(self.cfg, "janitor_reap_scan_batch_size", 4096)),
+        )
+
+    async def _reap_sweep(self) -> None:
+        if not getattr(self.cfg, "janitor_reap_enabled", False):
+            return
+        from alfred.store.reaper import execute_plan
+
+        plan = await asyncio.to_thread(self.reap_plan)
+        if plan.aborted:
+            # Not an error the sweep can fix — an unmounted vault or a state
+            # file that disagrees with the disk.  Loud, and nothing deleted.
+            self.log.warning("janitor.reap_sweep_aborted", reason=plan.aborted)
+            return
+        if not plan.orphans:
+            self.log.info(
+                "janitor.reap_sweep_done",
+                deleted=0,
+                store_rows=plan.store_rows,
+                untracked_but_present=plan.untracked_but_present,
+            )
+            return
+
+        deleted = await asyncio.to_thread(
+            execute_plan,
+            self.store,
+            self.state.state,
+            self.cfg.vault_path,
+            plan,
+            int(getattr(self.cfg, "janitor_reap_scan_batch_size", 4096)),
+            int(getattr(self.cfg, "janitor_reap_delete_batch", 500)),
+        )
+        # untracked_but_present is reported every sweep on purpose: it is the
+        # count of rows a naive "not in state.json" reaper would have deleted
+        # (2,892 files / 45,352 rows on the live store as of 2026-08-07), and
+        # keeping it in the log is how a regression in the vault check shows
+        # up as a number instead of as missing data.
+        self.log.info(
+            "janitor.reap_sweep_done",
+            deleted=deleted,
+            paths=len(plan.orphans),
+            deferred=len(plan.deferred),
+            malformed=plan.malformed_count,
+            store_rows=plan.store_rows,
+            untracked_but_present=plan.untracked_but_present,
+        )
+        # Flush record_failure() counters into state.error_counts — they only
+        # arrive there via StateStore.save() -> drain_failures(). Relying on
+        # another daemon to save first works in a full run and silently loses
+        # every reap failure when the janitor runs alone (`alfred up --only
+        # janitor`).
+        await self.save_state()
+
+    async def reap_tick(self) -> None:
+        """One-shot orphan reap — called by APScheduler daily if enabled."""
+        if not getattr(self.cfg, "janitor_reap_enabled", False):
+            return
+        try:
+            await self._reap_sweep()
+        except Exception as e:
+            self.log.error("janitor.reap_tick_error", error=str(e))
+            record_failure("janitor.reap_tick_error", error=e)
 
     # ── Dedup sweep: weekly similarity-based deduplication ────────────────────
 
