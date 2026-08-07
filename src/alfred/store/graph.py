@@ -327,11 +327,23 @@ class GraphStore:
     def _merge_edge(g, u: str, v: str, data: dict) -> None:
         """Add edge u->v, summing weight into an existing edge rather than
         overwriting it — merging two halves of a split node must not silently
-        discard the link strength one of them accumulated."""
-        if g.has_edge(u, v):
-            g[u][v]["weight"] = g[u][v].get("weight", 1.0) + data.get("weight", 1.0)
-        else:
+        discard the link strength one of them accumulated.
+
+        edge_type must widen to "wikilink" whenever either side is one. Summing
+        a wikilink's weight into a pre-existing *cluster* edge and leaving
+        edge_type="cluster" hands the merged edge to clear_cluster_edges(),
+        which surveyor._recluster() calls on every clustering pass — so the
+        wikilink is deleted at the next recluster, and only a source re-embed
+        could restore it. That is md5-gated, so in practice: never. This
+        mislabelled 241 live edges before it was caught.
+        """
+        if not g.has_edge(u, v):
             g.add_edge(u, v, **data)
+            return
+        existing = g[u][v]
+        existing["weight"] = existing.get("weight", 1.0) + data.get("weight", 1.0)
+        if "wikilink" in (data.get("edge_type"), existing.get("edge_type")):
+            existing["edge_type"] = "wikilink"
 
     def clear_cluster_edges(self) -> int:
         """Remove all cluster-type edges. Returns count removed."""

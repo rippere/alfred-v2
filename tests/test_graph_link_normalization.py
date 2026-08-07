@@ -181,6 +181,36 @@ def test_merge_preserves_edge_type(store):
     assert g["note/alpha.md"]["note/beta.md"]["edge_type"] == "wikilink"
 
 
+def test_merge_into_a_cluster_edge_widens_to_wikilink(store):
+    """Regression: summing a wikilink's weight into a pre-existing CLUSTER edge
+    while leaving edge_type='cluster' hands the merged edge to
+    clear_cluster_edges(), which surveyor._recluster() calls on every pass — so
+    the wikilink is deleted at the next recluster, and only an md5-gated source
+    re-embed could restore it. This mislabelled 241 live edges."""
+    g = store._graph()
+    g.add_edge("note/alpha.md", "note/beta.md", weight=0.3, edge_type="cluster")
+    g.add_edge("note/alpha.md", "note/beta", weight=1.0, edge_type="wikilink")
+
+    store.merge_link_text_nodes()
+
+    edge = store._graph()["note/alpha.md"]["note/beta.md"]
+    assert edge["edge_type"] == "wikilink", "must not stay collectable by clear_cluster_edges"
+    assert edge["weight"] == pytest.approx(1.3)
+    assert store.clear_cluster_edges() == 0, "the merged edge must survive a recluster"
+
+
+def test_merge_leaves_a_pure_cluster_edge_collectable(store):
+    """The widening must not go the other way — an untouched cluster edge stays
+    a cluster edge, or reclustering stops being able to clean up after itself."""
+    g = store._graph()
+    g.add_edge("note/alpha.md", "note/gamma.md", weight=0.3, edge_type="cluster")
+    g.add_edge("note/alpha.md", "note/beta", weight=1.0, edge_type="wikilink")
+
+    store.merge_link_text_nodes()
+
+    assert store._graph()["note/alpha.md"]["note/gamma.md"]["edge_type"] == "cluster"
+
+
 def test_merge_keeps_dangling_links_as_normalized_nodes(store):
     """A link to a note that does not exist yet has no .md twin. It still
     normalizes, so the node is already correct when the file appears."""
