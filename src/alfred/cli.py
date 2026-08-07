@@ -203,10 +203,25 @@ def up(
 @app.command()
 def down(
     config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
+    timeout: float = typer.Option(120.0, "--timeout", help="Seconds to wait for exit"),
 ):
-    """Stop all running daemons."""
+    """Stop the daemons for this config and WAIT for the process to exit.
+
+    Exits non-zero if the process is still alive at the deadline, so a caller
+    doing surgery on the store can branch on it. The old implementation sent
+    one SIGTERM, printed success and returned immediately — callers read that
+    as "quiesced" while the surveyor kept committing vectors. It also unlinked
+    the pidfile before the process died, defeating `up`'s duplicate-start
+    guard for the whole (minutes-long) shutdown.
+
+    SIGKILL is deliberately NOT sent on timeout: killing mid-commit is what
+    leaves the zero-byte manifests that crash-loop the next open (see the
+    comments in store/lancedb_store.py and store/graph.py). Escalating is the
+    operator's call, made knowingly.
+    """
     import os
     import signal
+    import time
 
     cfg = _load(config)
     pid_path = cfg.data_dir / "alfred.pid"
@@ -218,15 +233,46 @@ def down(
     pid_str = pid_path.read_text().strip()
     try:
         pid = int(pid_str.split(":")[0])
-        os.kill(pid, signal.SIGTERM)
-        console.print(f"[green]Sent SIGTERM to Alfred (PID {pid})[/green]")
-        pid_path.unlink(missing_ok=True)
-    except ProcessLookupError:
-        console.print(f"[yellow]Process {pid_str} not found. Removing stale PID file.[/yellow]")
-        pid_path.unlink(missing_ok=True)
     except ValueError:
-        console.print(f"[red]Invalid PID in {pid_path}[/red]")
+        console.print(f"[red]Invalid PID in {pid_path}[/red] — content: {pid_str!r}")
+        pid_path.unlink(missing_ok=True)
         raise typer.Exit(1)
+
+    def _alive() -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True      # exists, owned by someone else
+        return True
+
+    if not _alive():
+        console.print(f"[yellow]Process {pid} not running. Removing stale PID file.[/yellow]")
+        pid_path.unlink(missing_ok=True)
+        return
+
+    os.kill(pid, signal.SIGTERM)
+    console.print(f"Sent SIGTERM to Alfred (PID {pid}) — waiting up to {timeout:g}s for exit…")
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _alive():
+            # Only now is the pidfile meaningless. Unlinking earlier would let a
+            # concurrent `alfred up` start a second instance against the same store.
+            pid_path.unlink(missing_ok=True)
+            console.print(f"[green]Alfred (PID {pid}) stopped[/green]")
+            return
+        time.sleep(0.5)
+
+    console.print(
+        f"[red]PID {pid} still alive after {timeout:g}s — NOT quiesced.[/red]\n"
+        "[dim]The surveyor only checks for shutdown between files, so a large embed\n"
+        "backlog delays exit. Do NOT assume the store is idle. Re-run with a longer\n"
+        "--timeout, and escalate manually only once the log shows no recent\n"
+        "'surveyor.embedded' lines — a mid-commit SIGKILL can corrupt the table.[/dim]"
+    )
+    raise typer.Exit(1)
 
 
 def _query_result_as_dict(cfg, result) -> dict:

@@ -19,6 +19,12 @@ if TYPE_CHECKING:
 
 WATCH_INTERVAL = 60.0      # seconds between filesystem polls
 
+# Files embedded between state.json persists inside one diff. Vectors commit
+# per file, so this bounds how many committed-but-unrecorded files a crash can
+# strand as orphans. Small enough to keep the window tight, large enough that
+# a 7,000-file catch-up doesn't rewrite state.json once per file.
+STATE_SAVE_EVERY = 25
+
 
 class SurveyorDaemon(BaseDaemon):
     name = "surveyor"
@@ -119,6 +125,15 @@ class SurveyorDaemon(BaseDaemon):
         bm25 = self._get_bm25()
         embedder = self._get_embedder()
         state = self.state.state
+        # Vectors are committed to the store per file (upsert_many, below), but
+        # state was persisted only once, after the entire diff. Any death in
+        # between — OOM, SIGKILL, power loss — left committed vectors with no
+        # state.files entry, and nothing can find them again: janitor's ghost
+        # sweep iterates state.files, not the store, so an orphan whose
+        # rel_path never reached state is invisible to every existing sweep.
+        # Persisting in bounded batches makes that window STATE_SAVE_EVERY
+        # files instead of the whole diff.
+        since_save = 0
 
         # Delete removed files
         for rel_path in diff["deleted"]:
@@ -127,7 +142,14 @@ class SurveyorDaemon(BaseDaemon):
             try:
                 self.store.delete_file(rel_path, chunk_ids)
             except Exception as e:
+                # Keep the state entry. Popping it after a FAILED delete is how
+                # a transient store error becomes a permanent orphan: the
+                # vectors are still in the store, but the only record of their
+                # chunk_ids is gone, and janitor's ghost sweep iterates
+                # state.files — so nothing can ever enumerate them again.
+                # Retaining the entry means the next tick retries the delete.
                 self.log.warning("surveyor.delete_failed", path=rel_path, error=str(e))
+                continue
             state.files.pop(rel_path, None)
             self.log.info("surveyor.deleted", path=rel_path)
 
@@ -251,6 +273,18 @@ class SurveyorDaemon(BaseDaemon):
                 record_failure("surveyor.graph_update_failed", error=e, path=rel_path)
 
             self.log.info("surveyor.embedded", path=rel_path, chunks=len(chunk_ids))
+
+            # Bound the vectors-committed-but-state-unsaved window. Ordering
+            # matters: this runs AFTER state.files[rel_path] is assigned, so a
+            # save here always covers every file whose vectors are already in
+            # the store.
+            since_save += 1
+            if since_save >= STATE_SAVE_EVERY:
+                await self.save_state()
+                since_save = 0
+
+        if since_save:
+            await self.save_state()
 
         self.emit("files_embedded", paths=diff["new"] + diff["changed"])
 
