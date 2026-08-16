@@ -55,6 +55,8 @@ uv pip install --python .venv/bin/python -e .
 In production each vault runs as a systemd user unit (`alfred.service`,
 `alfred-neuroscience.service`, ...) with `alfred-mcp-http.service` for the HTTP API
 and `alfred-watchdog.timer` for self-healing. See the runbook for operations.
+Set `ALFRED_HTTP_TOKEN` to require Bearer auth on the HTTP API — see the runbook's
+"HTTP API authentication" section for its three modes (unset/set/set-but-blank).
 
 ## Docs
 
