@@ -62,6 +62,27 @@ curl -s http://localhost:8765/query -H 'Content-Type: application/json' \
   -d '{"query": "what did I learn about content creation"}' | jq .
 ```
 
+### HTTP API authentication
+
+`ALFRED_HTTP_TOKEN` (env var, read by `src/alfred/mcp/server_http.py`) gates the HTTP/SSE
+server with Bearer auth. It has three modes, and the middle one is easy to get wrong:
+
+- **Unset** — server starts open, no auth required (the default; fine for the loopback-only
+  local setup this server binds to).
+- **Set to a non-blank value** — server requires every request to send
+  `Authorization: Bearer <token>`; requests without it get `401 Unauthorized`.
+- **Set but blank/whitespace** (e.g. `Environment="ALFRED_HTTP_TOKEN=${SECRET}"` with `SECRET`
+  unset, expanding to `""`) — the server refuses to start at all (`SystemExit`). This is
+  deliberate: a blank-but-set token would otherwise look like "auth on" in every config check
+  while actually serving unauthenticated.
+
+To call the API with auth enabled:
+```bash
+curl -s http://localhost:8765/query -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <PLACEHOLDER_TOKEN>' \
+  -d '{"query": "what did I learn about content creation"}' | jq .
+```
+
 ---
 
 ## Content creation workflow
