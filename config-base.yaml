@@ -21,7 +21,7 @@ vault:
 ollama:
   base_url: http://localhost:11434
   embed_model: nomic-embed-text
-  llm_model: mistral:latest
+  llm_model: orcarouter/Qwen3.8-27B-Uncensored:q5_K_M
 
 janitor:
   sweep_interval_s: 14400

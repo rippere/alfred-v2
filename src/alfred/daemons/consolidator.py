@@ -334,10 +334,10 @@ class ConsolidatorDaemon(BaseDaemon):
         # de-facto backend anyway, since the cloud call had been 400-ing on an
         # exhausted credit balance and falling through silently.
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=180.0) as client:
                 resp = await client.post(
                     f"{self.cfg.ollama_base_url}/api/generate",
-                    json={"model": self.cfg.ollama_llm_model, "prompt": prompt, "stream": False},
+                    json={"model": self.cfg.ollama_llm_model, "prompt": prompt, "stream": False, "think": False},
                 )
                 resp.raise_for_status()
                 return resp.json().get("response", "").strip()
@@ -398,13 +398,14 @@ class ConsolidatorDaemon(BaseDaemon):
 
         # ── Primary: Ollama ───────────────────────────────────────────────────
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=180.0) as client:
                 resp = await client.post(
                     f"{self.cfg.ollama_base_url}/api/generate",
                     json={
                         "model": self.cfg.ollama_llm_model,
                         "prompt": prompt,
                         "stream": False,
+                        "think": False,
                     },
                 )
                 resp.raise_for_status()

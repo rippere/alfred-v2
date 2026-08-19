@@ -106,7 +106,7 @@ class AlfredConfig:
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
     ollama_embed_model: str = "nomic-embed-text"
-    ollama_llm_model: str = "mistral:latest"
+    ollama_llm_model: str = "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M"
     embed_dims: int = 768
 
     # Milvus

@@ -53,6 +53,9 @@ def complete(
     payload: dict = {
         "model": model,
         "stream": False,
+        # Qwen3.x is a thinking model; suppress reasoning tokens so structured
+        # extraction stays clean and fast. Harmless no-op for non-thinking models.
+        "think": False,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
