@@ -5,7 +5,6 @@ for simplicity — filesystem-only. Wikilink updates on move are not automatic.
 """
 from __future__ import annotations
 
-import hashlib
 import re
 import threading
 from datetime import date
@@ -34,10 +33,6 @@ class VaultError(Exception):
 # threading.RLock rather than asyncio.Lock because these functions are
 # synchronous and must stay so — call sites across 5 daemons depend on it.
 _write_lock = threading.RLock()
-
-
-def compute_md5(path: Path) -> str:
-    return hashlib.md5(path.read_bytes()).hexdigest()
 
 
 def _resolve(vault_path: Path, rel_path: str) -> Path:
@@ -252,14 +247,6 @@ def vault_append_to_topic(
         fp.write_text(_serialize(fm, body), encoding="utf-8")
 
     return {"path": rel_path}
-
-
-def vault_delete(vault_path: Path, rel_path: str) -> dict:
-    fp = _resolve(vault_path, rel_path)
-    if not fp.exists():
-        raise VaultError(f"File not found: {rel_path}")
-    fp.unlink()
-    return {"path": rel_path, "deleted": True}
 
 
 def vault_move(vault_path: Path, from_path: str, to_path: str) -> dict:

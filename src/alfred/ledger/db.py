@@ -86,16 +86,6 @@ def upsert_snapshot(
     return len(payload)
 
 
-def fetch_snapshot(conn: sqlite3.Connection, date: str) -> list[dict]:
-    """All rows for a single date, ordered by domain then metric."""
-    cur = conn.execute(
-        "SELECT date, domain, metric, value, meta, computed_at "
-        "FROM kpi_daily WHERE date = ? ORDER BY domain, metric",
-        (date,),
-    )
-    return [_row_to_dict(r) for r in cur.fetchall()]
-
-
 def fetch_range(conn: sqlite3.Connection, since: str, until: str) -> list[dict]:
     """All rows with `since <= date <= until`, ordered by date/domain/metric."""
     cur = conn.execute(
