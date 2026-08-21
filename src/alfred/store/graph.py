@@ -4,11 +4,30 @@ from __future__ import annotations
 import os
 import pickle
 import threading
+from collections.abc import Iterable
 from pathlib import Path
 
 import structlog
 
 log = structlog.get_logger()
+
+
+def build_wikilink_index(rel_paths: Iterable[str]) -> dict[str, str]:
+    """Map every way a wikilink can spell a file to its canonical rel_path.
+
+    Wikilinks are bare stems (``[[foo]]``), never full paths, but graph nodes
+    for source files are keyed by full rel_path (``topic/foo.md``). Without
+    resolving link text through this index, the same file ends up as two
+    disconnected nodes — one keyed by rel_path (as an edge source), one keyed
+    by raw link text (as an edge target) — a graph.pkl node split-brain.
+    """
+    index: dict[str, str] = {}
+    for rel_str in rel_paths:
+        stem = Path(rel_str).stem
+        index.setdefault(stem, rel_str)
+        index.setdefault(rel_str.removesuffix(".md"), rel_str)
+        index.setdefault(rel_str, rel_str)
+    return index
 
 
 class GraphStore:
@@ -61,11 +80,29 @@ class GraphStore:
         with self._lock:
             return self._graph().number_of_edges()
 
-    def add_edges_from_wikilinks(self, source_rel_path: str, targets: list[str]) -> None:
+    def add_edges_from_wikilinks(
+        self,
+        source_rel_path: str,
+        targets: list[str],
+        link_index: dict[str, str] | None = None,
+    ) -> None:
+        """Add edges from source_rel_path to each of targets.
+
+        targets are raw wikilink text (bare stems) by default. Pass
+        link_index (from build_wikilink_index) to resolve them to the
+        canonical rel_path of the file they point to — otherwise the same
+        file can end up keyed as two disconnected nodes (see
+        build_wikilink_index docstring). Unresolvable links are dropped
+        rather than added as phantom nodes.
+        """
         with self._lock:
             g = self._graph()
             g.add_node(source_rel_path)
-            for t in targets:
+            if link_index is not None:
+                resolved = [link_index[" ".join(t.split())] for t in targets if " ".join(t.split()) in link_index]
+            else:
+                resolved = targets
+            for t in resolved:
                 g.add_node(t)
                 if not g.has_edge(source_rel_path, t):
                     g.add_edge(source_rel_path, t, weight=1.0, edge_type="wikilink")
@@ -173,16 +210,21 @@ class GraphStore:
             ignore = set(ignore_dirs or [])
             self._g = nx.DiGraph()
 
+            md_files = []
             for md_file in vault_path.rglob("*.md"):
                 rel = md_file.relative_to(vault_path)
                 if any(part in ignore for part in rel.parts):
                     continue
-                rel_str = str(rel).replace("\\", "/")
+                md_files.append((md_file, str(rel).replace("\\", "/")))
+
+            link_index = build_wikilink_index(rel_str for _, rel_str in md_files)
+
+            for md_file, rel_str in md_files:
                 try:
                     raw = md_file.read_text(encoding="utf-8")
                     links = extract_wikilinks(raw)
                     if links:
-                        self.add_edges_from_wikilinks(rel_str, links)
+                        self.add_edges_from_wikilinks(rel_str, links, link_index=link_index)
                     else:
                         self._g.add_node(rel_str)
                 except (OSError, UnicodeDecodeError):
