@@ -118,6 +118,18 @@ class QueryEngine:
             opts = QueryOptions(top_k=self.cfg.default_top_k)
 
         if self.cfg.bm25_only:
+            log.warning(
+                "query.bm25_only_deprecated",
+                message=(
+                    "bm25_only is a deprecated/unsupported path: the BM25 corpus at "
+                    "cfg.bm25_path is static and is NOT updated by the live surveyor "
+                    "pipeline. It was last populated by the archived one-off script "
+                    "scripts/_archive/phase4_rebuild_milvus.py and will silently drift "
+                    "stale as the vault changes. Do not rely on this path for "
+                    "production retrieval quality."
+                ),
+                bm25_path=str(self.cfg.bm25_path),
+            )
             return self._query_bm25_only(text, opts)
 
         t = {}
@@ -201,8 +213,6 @@ class QueryEngine:
             answer, backend, model = synthesize(
                 query=text,
                 context=context,
-                anthropic_model=self.cfg.anthropic_model,
-                openrouter_model=self.cfg.openrouter_model,
                 ollama_base_url=self.cfg.ollama_base_url,
                 ollama_model=self.cfg.ollama_llm_model,
             )
@@ -307,8 +317,6 @@ class QueryEngine:
             answer, backend, model = synthesize(
                 query=text,
                 context=context,
-                anthropic_model=self.cfg.anthropic_model,
-                openrouter_model=self.cfg.openrouter_model,
                 ollama_base_url=self.cfg.ollama_base_url,
                 ollama_model=self.cfg.ollama_llm_model,
             )

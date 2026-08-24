@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from alfred.core.provenance import is_daemon_generated_raw
-from alfred.core.vault import VaultRecord, chunk_record, parse_file
+from alfred.embed.ollama import EmbeddingBackendUnavailable
+from alfred.core.vault import VaultRecord, chunk_record, is_sync_conflict, parse_file
 from alfred.daemons.base import BaseDaemon, DaemonEvent
 
 if TYPE_CHECKING:
@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     from alfred.store.state import StateStore
 
 WATCH_INTERVAL = 60.0      # seconds between filesystem polls
-CLUSTER_INTERVAL = 1800.0  # re-cluster every 30 minutes
 
 
 class SurveyorDaemon(BaseDaemon):
@@ -28,7 +27,6 @@ class SurveyorDaemon(BaseDaemon):
         self.store = store
         self._embedder = None
         self._bm25 = None
-        self._last_cluster = float("-inf")
 
     def _get_embedder(self):
         if self._embedder is None:
@@ -64,7 +62,8 @@ class SurveyorDaemon(BaseDaemon):
             self.log.error("surveyor.tick_error", error=str(e))
 
     async def recluster(self) -> None:
-        """One-shot recluster — called by APScheduler on CLUSTER_INTERVAL."""
+        """One-shot recluster — the sole trigger for `_recluster()`, called by
+        the dedicated `surveyor.recluster` APScheduler job (see runner.py)."""
         try:
             await self._recluster()
         except Exception as e:
@@ -82,10 +81,6 @@ class SurveyorDaemon(BaseDaemon):
             await self._process_diff(diff)
             await self.save_state()
 
-        if time.time() - self._last_cluster > CLUSTER_INTERVAL:
-            await self._recluster()
-            self._last_cluster = time.time()
-
     def _compute_diff(self) -> dict[str, list[str]]:
         """Scan vault for new/changed/deleted files."""
         vault_path = self.cfg.vault_path
@@ -95,6 +90,8 @@ class SurveyorDaemon(BaseDaemon):
         for md_file in vault_path.rglob("*.md"):
             rel = md_file.relative_to(vault_path)
             if any(part in ignore for part in rel.parts):
+                continue
+            if is_sync_conflict(md_file):
                 continue
             rel_str = str(rel).replace("\\", "/")
             try:
@@ -144,30 +141,44 @@ class SurveyorDaemon(BaseDaemon):
                 self.log.warning("surveyor.parse_failed", path=rel_path, error=str(e))
                 continue
 
-            # Delete old chunks before re-embedding
-            if rel_path in diff["changed"]:
-                old_fs = state.files.get(rel_path)
-                if old_fs:
-                    self.store.delete_file(rel_path, old_fs.chunk_ids)
-
             chunk_ids: list[str] = []
             rows: list[dict] = []
-            for chunk_id, text in chunks:
-                # Sanitize chunk_id to avoid Milvus apostrophe bug
-                safe_id = chunk_id.replace("'", "’")
-                dense = await embedder.embed(text)
-                if dense is None:
-                    continue
-                sparse = bm25.encode(text) if bm25.is_fitted else {}
-                rows.append({
-                    "chunk_id": safe_id,
-                    "dense": dense,
-                    "sparse": sparse,
-                    "record_type": record.record_type,
-                    "name": record.frontmatter.get("name", rel_path),
-                    "chunk_index": len(chunk_ids),
-                })
-                chunk_ids.append(safe_id)
+            try:
+                for chunk_id, text in chunks:
+                    # Sanitize chunk_id to avoid Milvus apostrophe bug
+                    safe_id = chunk_id.replace("'", "’")
+                    dense = await embedder.embed(text)
+                    if dense is None:
+                        continue
+                    sparse = bm25.encode(text) if bm25.is_fitted else {}
+                    rows.append({
+                        "chunk_id": safe_id,
+                        "dense": dense,
+                        "sparse": sparse,
+                        "record_type": record.record_type,
+                        "name": record.frontmatter.get("name", rel_path),
+                        "chunk_index": len(chunk_ids),
+                    })
+                    chunk_ids.append(safe_id)
+            except EmbeddingBackendUnavailable as e:
+                # Abandon the whole tick before the delete-and-record block
+                # below. Falling through would read an empty `rows` as "this
+                # file has no embeddable content", delete its existing vectors
+                # as stale, and write FileState(md5=current, chunk_ids=[]) —
+                # after which the md5 matches and _compute_diff never revisits
+                # it. That is silent, permanent removal from search.
+                #
+                # Returning (not continuing) leaves every file this tick has
+                # not reached untouched in state, so the next tick redoes the
+                # remainder. Files already committed above keep their state:
+                # _tick still saves.
+                self.log.warning(
+                    "surveyor.embedder_unavailable",
+                    error=str(e),
+                    deferred_from=rel_path,
+                    indexed_before_stop=len(state.files),
+                )
+                return
             # One batched commit per file instead of one per chunk — collapses
             # ~N manifest writes into a single Lance commit, shrinking the
             # interrupted-write corruption window that crash-looped the daemon.
@@ -179,14 +190,39 @@ class SurveyorDaemon(BaseDaemon):
                         "surveyor.upsert_failed",
                         path=rel_path, count=len(rows), error=str(e),
                     )
-                    # Leave state.files[rel_path] untouched so the old md5 is
-                    # preserved and the file is retried next tick.  Recording
-                    # md5=current here would mark it "done" with no chunks —
-                    # and for a changed file its old chunks are already gone
-                    # (deleted above), so it would silently drop from search.
+                    # Leave state.files[rel_path] (and its chunk_ids) untouched
+                    # so the old md5 is preserved and the file is retried next
+                    # tick.  Deleting the old chunks is deferred until *after*
+                    # a successful upsert (below) specifically so this failure
+                    # path never leaves state pointing at chunk_ids that have
+                    # already been removed from the vector store — recording
+                    # md5=current here, or deleting the old chunks up front,
+                    # would silently drop the file from search while state
+                    # still reports it as indexed.
                     continue
             # (rows empty → file has no embeddable content; fall through and
             # record state so we don't retry an empty file forever.)
+
+            # Only remove chunks from the *previous* version of this file once
+            # the new ones are confirmed written (or confirmed unnecessary,
+            # for the empty-rows case above) — never before, so a failed
+            # upsert can't leave state referencing chunk_ids that no longer
+            # exist in the store. chunk_ids are deterministic per index
+            # (rel_path::chunk_NN), so any id shared with the just-written
+            # `chunk_ids` was already refreshed by upsert_many's merge_insert
+            # — only the leftover ids (e.g. the file got shorter) are stale
+            # and need an explicit delete.
+            if rel_path in diff["changed"]:
+                old_fs = state.files.get(rel_path)
+                if old_fs:
+                    stale_ids = [cid for cid in old_fs.chunk_ids if cid not in chunk_ids]
+                    if stale_ids:
+                        try:
+                            self.store.delete_file(rel_path, stale_ids)
+                        except Exception as e:
+                            self.log.warning(
+                                "surveyor.delete_failed", path=rel_path, error=str(e),
+                            )
 
             now = datetime.now(timezone.utc).isoformat()
             state.files[rel_path] = FileState(
@@ -199,9 +235,10 @@ class SurveyorDaemon(BaseDaemon):
             try:
                 from alfred.store.graph import GraphStore
                 graph = GraphStore(self.cfg.graph_path)
-                graph.load()
-                graph.add_edges_from_wikilinks(rel_path, record.wikilinks)
-                graph.save()
+                with graph.transaction():
+                    graph.load()
+                    graph.add_edges_from_wikilinks(rel_path, record.wikilinks)
+                    graph.save()
             except Exception:
                 pass
 
@@ -293,12 +330,13 @@ class SurveyorDaemon(BaseDaemon):
         try:
             from alfred.store.graph import GraphStore
             graph = GraphStore(self.cfg.graph_path)
-            graph.load()
-            cleared = graph.clear_cluster_edges()
-            self.log.debug("surveyor.cluster_edges_cleared", count=cleared)
-            for members in cluster_members.values():
-                graph.add_cluster_edges(members)
-            graph.save()
+            with graph.transaction():
+                graph.load()
+                cleared = graph.clear_cluster_edges()
+                self.log.debug("surveyor.cluster_edges_cleared", count=cleared)
+                for members in cluster_members.values():
+                    graph.add_cluster_edges(members)
+                graph.save()
         except Exception as e:
             self.log.warning("surveyor.graph_update_failed", error=str(e))
 

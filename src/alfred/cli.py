@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import json
+
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -210,6 +212,41 @@ def down(
         raise typer.Exit(1)
 
 
+def _query_result_as_dict(cfg, result) -> dict:
+    """Shape a QueryResult for --json.
+
+    `preview` is read back off disk rather than sliced out of result.context,
+    because context is a single assembled blob with wiki blocks and separators
+    mixed in — attributing a slice of it to a specific hit would be guesswork.
+    """
+    hits = []
+    for h in result.hits:
+        preview = ""
+        try:
+            raw = (cfg.vault_path / h.rel_path).read_text(encoding="utf-8", errors="replace")
+            if raw.startswith("---"):
+                end = raw.find("\n---", 3)
+                if end != -1:
+                    raw = raw[end + 4:]
+            preview = raw.strip()[:400]
+        except OSError:
+            pass    # a hit whose file moved still deserves its path in the output
+        hits.append({
+            "rel_path": h.rel_path,
+            "name": h.name,
+            "record_type": h.record_type,
+            "score": h.score,
+            "preview": preview,
+        })
+    return {
+        "query": result.query,
+        "hits": hits,
+        "answer": result.answer,
+        "synthesis_backend": result.synthesis_backend,
+        "synthesis_model": result.synthesis_model,
+    }
+
+
 @app.command()
 def query(
     text: str = typer.Argument(..., help="Query string"),
@@ -220,6 +257,7 @@ def query(
     no_graph: bool = typer.Option(False, "--no-graph", help="Skip graph spreading activation"),
     include_inbox: bool = typer.Option(False, "--include-inbox", help="Include inbox/ in results"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show per-step timing"),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON on stdout"),
 ):
     """Query the vault with hybrid retrieval + FlashRank reranking."""
     from rich import box
@@ -238,15 +276,26 @@ def query(
         include_inbox=include_inbox,
     )
 
-    console.print()
-    console.print(Rule(f'[bold]alfred query[/bold]', style="dim"))
-    console.print(f'  [italic]"{text}"[/italic]\n')
+    # --json must keep stdout parseable, so none of the rich chrome below runs.
+    if not json_out:
+        console.print()
+        console.print(Rule('[bold]alfred query[/bold]', style="dim"))
+        console.print(f'  [italic]"{text}"[/italic]\n')
 
     try:
         result = engine.query(text, opts)
     except Exception as e:
+        if json_out:
+            # Structured failure, so a caller can tell "query broke" from
+            # "no hits" instead of parsing an empty result as an answer.
+            print(json.dumps({"query": text, "error": str(e), "hits": []}))
+            raise typer.Exit(1)
         console.print(f"[red]Query failed:[/red] {e}")
         raise typer.Exit(1)
+
+    if json_out:
+        print(json.dumps(_query_result_as_dict(cfg, result), indent=2))
+        return
 
     # ── Wiki hit ───────────────────────────────────────────────────────────────
     if result.wiki_hit:

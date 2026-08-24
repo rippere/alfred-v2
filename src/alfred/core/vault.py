@@ -32,6 +32,28 @@ class VaultRecord:
     wikilinks: list[str] = field(default_factory=list)
 
 
+# Syncthing names a conflicted copy `<stem>.sync-conflict-<date>-<time>-<ID><ext>`,
+# so a conflicted note ends in `.md` and matches every `rglob("*.md")` in this
+# codebase. cfg.ignore_dirs cannot express it — that filter is directory-based.
+#
+# The result was 162 conflicted copies indexed alongside their live originals,
+# 129 of them with the original present too. A live `vault_search "decision"`
+# returned 11 conflicts in 40 results: a quarter of the retrieval budget spent
+# on June-22 duplicates, 100 of which were byte-identical to the file they
+# shadowed. They are Syncthing's bookkeeping, not vault content.
+_SYNC_CONFLICT_RE = re.compile(r"\.sync-conflict-\d{8}-\d{6}-[A-Z0-9]+")
+
+
+def is_sync_conflict(path: Path | str) -> bool:
+    """True if *path* is a Syncthing conflict copy.
+
+    Matches on the filename only, so it is safe to call with either an absolute
+    Path or a vault-relative string.
+    """
+    name = path.name if isinstance(path, Path) else str(path).rsplit("/", 1)[-1]
+    return bool(_SYNC_CONFLICT_RE.search(name))
+
+
 def extract_wikilinks(text: str) -> list[str]:
     # Strip Obsidian Bases plugin virtual tables (*.base) — not real files
     return [l for l in WIKILINK_RE.findall(text) if not l.endswith(".base")]

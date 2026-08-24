@@ -56,11 +56,15 @@ vault_status          ← how many files are indexed
 vault_api_cost        ← today's API spend
 ```
 
-For the HTTP API (from terminal or scripts):
+From the terminal or a script, use the CLI — there is no REST `/query` route.
+`alfred-mcp-http.service` speaks MCP JSON-RPC at `/mcp` and binds the tailnet
+address only, so nothing answers on loopback:
 ```bash
-curl -s http://localhost:8765/query -H 'Content-Type: application/json' \
-  -d '{"query": "what did I learn about content creation"}' | jq .
+alfred query "what did I learn about content creation" -k 10 --json | jq .
 ```
+`--json` emits `{"query", "hits":[{"rel_path","name","record_type","score","preview"}],
+"answer", ...}`, or `{"error": ...}` with exit 1 if the query itself failed —
+so a caller can tell a broken backend from a genuinely empty result.
 
 ### HTTP API authentication
 

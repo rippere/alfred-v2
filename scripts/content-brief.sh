@@ -41,25 +41,47 @@ echo "Querying Alfred for: $TOPIC"
 echo "Platform: $PLATFORM"
 echo ""
 
-# Query Alfred HTTP API for context across all vaults
-CONTEXT=$(curl -s http://localhost:8765/query \
-    -H 'Content-Type: application/json' \
-    -d "{\"query\": \"$TOPIC\", \"top_k\": 10, \"include_synthesis\": false}" \
-    2>/dev/null | python3 -c "
+# Query Alfred for context.
+#
+# This used to POST to http://localhost:8765/query, which had two separate
+# problems: there has never been a /query route (the server speaks MCP JSON-RPC
+# at /mcp), and since the tailnet-only bind there is nothing listening on
+# loopback at all. Both failures were invisible — curl's output went to
+# /dev/null and the fallback was an empty string.
+#
+# The CLI needs no HTTP, no auth and no network: this script runs on the same
+# machine as the vault.
+ALFRED_BIN="${ALFRED_BIN:-$(dirname "$0")/../.venv/bin/alfred}"
+
+CONTEXT=$("$ALFRED_BIN" query "$TOPIC" -k 10 --json 2>/dev/null | python3 -c "
 import json, sys
-data = json.load(sys.stdin)
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+if data.get('error'):
+    print('ALFRED_ERROR:' + data['error'], file=sys.stderr)
+    sys.exit(1)
 passages = []
 for hit in data.get('hits', []):
-    path = hit.get('rel_path', '')
-    preview = hit.get('preview', hit.get('text', ''))[:400]
+    preview = (hit.get('preview') or '')[:400]
     if preview:
-        passages.append(f'[{path}]\n{preview}')
+        passages.append(f\"[{hit.get('rel_path', '')}]\n{preview}\")
 print('\n\n---\n\n'.join(passages[:8]))
-" 2>/dev/null || echo "")
+" 2>/tmp/alfred-brief-err.$$) || true
 
 if [[ -z "$CONTEXT" ]]; then
-    echo "Warning: Alfred returned no context. Is the daemon running? Continuing with topic only."
+    # Say which of the two it was. "No context" and "the backend is down" call
+    # for completely different responses from whoever is reading this.
+    if grep -q ALFRED_ERROR /tmp/alfred-brief-err.$$ 2>/dev/null; then
+        echo "Warning: Alfred query failed — $(sed 's/^ALFRED_ERROR://' /tmp/alfred-brief-err.$$)"
+        echo "         (ollama-game-guard stops ollama while a game is running.)"
+    else
+        echo "Warning: Alfred returned no matching context for this topic."
+    fi
+    echo "         Continuing with topic only."
 fi
+rm -f /tmp/alfred-brief-err.$$
 
 # Platform-specific format instructions
 case "$PLATFORM" in
@@ -80,11 +102,17 @@ case "$PLATFORM" in
         ;;
 esac
 
-# Generate brief via Claude
-BRIEF=$(python3 - <<PYEOF
-import anthropic, os, sys
+# Generate the brief on the local model, same backend as the rest of Alfred.
+# The Anthropic call that used to live here shared the key whose exhausted
+# credit balance stalled ingestion; it also ran under the system python3,
+# which has no `anthropic` module installed, so it could only ever have failed.
+BRIEF=$("$(dirname "$0")/../.venv/bin/python" - <<PYEOF
+import sys
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+from alfred.config import AlfredConfig
+from alfred.core.local_llm import LocalLLMUnavailable, complete
+
+cfg = AlfredConfig.load("$(dirname "$0")/../config.yaml")
 
 topic = """$TOPIC"""
 platform_hint = """$FORMAT_HINT"""
@@ -126,18 +154,23 @@ What do I want them to do at the end? (comment, save, DM, follow)
 ## Related Topics to Mine Next
 3 adjacent topics that connect naturally from this one"""
 
-resp = client.messages.create(
-    model="claude-sonnet-4-6",
-    max_tokens=1200,
-    system=system,
-    messages=[{"role": "user", "content": prompt}]
-)
-print(resp.content[0].text)
+try:
+    print(complete(
+        system, prompt,
+        base_url=cfg.ollama_base_url,
+        model=cfg.ollama_llm_model,
+        max_tokens=1200,
+    ))
+except LocalLLMUnavailable as e:
+    print(f"BACKEND_UNAVAILABLE: {e}", file=sys.stderr)
+    sys.exit(1)
 PYEOF
 )
 
 if [[ -z "$BRIEF" ]]; then
-    echo "Error: Claude API call failed. Check ANTHROPIC_API_KEY."
+    echo "Error: could not generate the brief — the local model is unreachable."
+    echo "       Check: systemctl is-active ollama"
+    echo "       (ollama-game-guard stops it while a game is running.)"
     exit 1
 fi
 

@@ -11,7 +11,7 @@ from datetime import date, datetime, timezone
 import httpx
 import structlog
 
-from alfred.core.anthropic_client import get_client
+from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import vault_create, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
@@ -148,51 +148,55 @@ class ConsolidatorDaemon(BaseDaemon):
 
         state = self.state.state
         graph = GraphStore(self.cfg.graph_path)
-        graph.load()
 
         SYNTHESIS_STALE_DAYS = 30  # only re-synthesize existing pages after 30 days
 
         ranked: list[tuple[str, object, int]] = []
-        for key, cluster in state.clusters.items():
-            if len(cluster.member_files) < MIN_MEMBERS:
-                continue
-            if not cluster.label:
-                continue  # not yet labeled — wait for label pass
+        # Hold the path-shared lock across load() + the degree reads below so
+        # this never observes a graph mid-mutation by a surveyor GraphStore
+        # instance operating on the same file (see GraphStore.transaction()).
+        with graph.transaction():
+            graph.load()
+            for key, cluster in state.clusters.items():
+                if len(cluster.member_files) < MIN_MEMBERS:
+                    continue
+                if not cluster.label:
+                    continue  # not yet labeled — wait for label pass
 
-            # Guard: if consolidated_chunk_id is set, verify the file exists on disk.
-            # If it exists and is fresh (< 30 days old), skip — already synthesized.
-            # If consolidated_chunk_id is set but the file is gone, allow re-synthesis.
-            if cluster.consolidated_chunk_id:
-                synthesis_path = vault_path / cluster.consolidated_chunk_id
-                if synthesis_path.exists():
+                # Guard: if consolidated_chunk_id is set, verify the file exists on disk.
+                # If it exists and is fresh (< 30 days old), skip — already synthesized.
+                # If consolidated_chunk_id is set but the file is gone, allow re-synthesis.
+                if cluster.consolidated_chunk_id:
+                    synthesis_path = vault_path / cluster.consolidated_chunk_id
+                    if synthesis_path.exists():
+                        try:
+                            mtime = synthesis_path.stat().st_mtime
+                            age_days = (time.time() - mtime) / 86400
+                            if age_days < SYNTHESIS_STALE_DAYS:
+                                continue  # fresh synthesis exists — skip
+                        except OSError:
+                            pass  # can't stat — fall through and re-synthesize
+                    else:
+                        # consolidated_chunk_id points to a missing file — reset it
+                        cluster.consolidated_chunk_id = ""
+
+                # Additional guard: even without consolidated_chunk_id, check if target
+                # synthesis file already exists on disk (race condition / state reset).
+                label_slug = "-".join((cluster.label[0] if cluster.label else "cluster").lower().split())[:60]
+                synthesis_rel = f"synthesis/{label_slug}.md"
+                if not cluster.consolidated_chunk_id and (vault_path / synthesis_rel).exists():
                     try:
-                        mtime = synthesis_path.stat().st_mtime
+                        mtime = (vault_path / synthesis_rel).stat().st_mtime
                         age_days = (time.time() - mtime) / 86400
                         if age_days < SYNTHESIS_STALE_DAYS:
-                            continue  # fresh synthesis exists — skip
+                            # File exists and is fresh — adopt it without re-synthesizing
+                            cluster.consolidated_chunk_id = synthesis_rel
+                            continue
                     except OSError:
-                        pass  # can't stat — fall through and re-synthesize
-                else:
-                    # consolidated_chunk_id points to a missing file — reset it
-                    cluster.consolidated_chunk_id = ""
+                        pass
 
-            # Additional guard: even without consolidated_chunk_id, check if target
-            # synthesis file already exists on disk (race condition / state reset).
-            label_slug = "-".join((cluster.label[0] if cluster.label else "cluster").lower().split())[:60]
-            synthesis_rel = f"synthesis/{label_slug}.md"
-            if not cluster.consolidated_chunk_id and (vault_path / synthesis_rel).exists():
-                try:
-                    mtime = (vault_path / synthesis_rel).stat().st_mtime
-                    age_days = (time.time() - mtime) / 86400
-                    if age_days < SYNTHESIS_STALE_DAYS:
-                        # File exists and is fresh — adopt it without re-synthesizing
-                        cluster.consolidated_chunk_id = synthesis_rel
-                        continue
-                except OSError:
-                    pass
-
-            degree_sum = sum(graph.get_node_degree(f) for f in cluster.member_files)
-            ranked.append((key, cluster, degree_sum))
+                degree_sum = sum(graph.get_node_degree(f) for f in cluster.member_files)
+                ranked.append((key, cluster, degree_sum))
 
         ranked.sort(key=lambda x: x[2], reverse=True)
 
@@ -305,31 +309,10 @@ class ConsolidatorDaemon(BaseDaemon):
             f"Return only the formatted synthesis — no preamble."
         )
 
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if anthropic_key and self.state.can_make_api_call(daemon="consolidator"):
-            try:
-                client = get_client()
-
-                def _call():
-                    resp = client.messages.create(
-                        model=self.cfg.anthropic_model,
-                        max_tokens=600,
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-                    return resp
-
-                resp = await asyncio.to_thread(_call)
-                usage = resp.usage
-                self.state.record_api_call(
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    cached_tokens=getattr(usage, "cache_read_input_tokens", 0),
-                )
-                return resp.content[0].text.strip()
-            except Exception as e:
-                self.log.warning("consolidator.claude_error", error=str(e))
-
-        # Ollama fallback
+        # Local backend only. The Anthropic leg that used to sit here was removed
+        # with the rest of the cloud chain; the Ollama path below was already the
+        # de-facto backend anyway, since the cloud call had been 400-ing on an
+        # exhausted credit balance and falling through silently.
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
@@ -419,13 +402,8 @@ class ConsolidatorDaemon(BaseDaemon):
                 error=traceback.format_exc(),
             )
 
-        # ── Fallback 1: Anthropic ─────────────────────────────────────────────
-        if not self.state.can_make_api_call(daemon="consolidator"):
-            return ""
+        # ── Fallback 1: local model ───────────────────────────────────────────
         try:
-            from alfred.core.anthropic_client import get_client
-
-            client = get_client()
             file_list_short = "\n".join(f"- {f}" for f in member_files[:10])
             fallback_prompt = (
                 f"These files are in the same knowledge cluster:\n{file_list_short}\n\n"
@@ -433,20 +411,26 @@ class ConsolidatorDaemon(BaseDaemon):
                 "Return only the label, no explanation."
             )
 
-            def _call():
-                response = client.messages.create(
-                    model=self.cfg.anthropic_model,
+            def _call() -> str:
+                return complete(
+                    "You label clusters of related documents concisely.",
+                    fallback_prompt,
+                    base_url=self.cfg.ollama_base_url,
+                    model=self.cfg.ollama_llm_model,
                     max_tokens=20,
-                    messages=[{"role": "user", "content": fallback_prompt}],
-                )
-                return response.content[0].text.strip()
+                ).strip()
 
             label = await asyncio.to_thread(_call)
             if label:
                 return label
+        except LocalLLMUnavailable as e:
+            # Deliberately non-fatal here, unlike curator/distiller: fallback 2
+            # below derives a label from filenames, so a paused backend costs
+            # label quality, not correctness, and never blocks clustering.
+            self.log.info("consolidator.label_backend_unavailable", error=str(e))
         except Exception:
             self.log.warning(
-                "consolidator.anthropic_label_error",
+                "consolidator.local_label_error",
                 error=traceback.format_exc(),
             )
 

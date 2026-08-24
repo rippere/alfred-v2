@@ -16,19 +16,23 @@ import os
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import frontmatter
 import structlog
 
-from alfred.core.anthropic_client import get_client
+from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.schema import (
     KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
     correct_status, correct_type,
 )
-from alfred.core.vault import extract_wikilinks
+from alfred.core.vault import extract_wikilinks, is_sync_conflict
 from alfred.core.vault_ops import VaultError, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
+
+if TYPE_CHECKING:
+    from alfred.store.lancedb_store import LanceDBStore
 
 log = structlog.get_logger()
 
@@ -52,8 +56,9 @@ class IssueCode(str, Enum):
 class JanitorDaemon(BaseDaemon):
     name = "janitor"
 
-    def __init__(self, cfg, state, events) -> None:
+    def __init__(self, cfg, state, events, store: LanceDBStore) -> None:
         super().__init__(cfg, state, events)
+        self.store = store
         self._last_sweep = float("-inf")
         self._last_deep = float("-inf")
         self._last_dedup = float("-inf")
@@ -136,6 +141,8 @@ class JanitorDaemon(BaseDaemon):
             rel = md_file.relative_to(vault_path)
             if any(part in ignore for part in rel.parts):
                 continue
+            if is_sync_conflict(md_file):
+                continue
             rel_str = str(rel).replace("\\", "/")
             try:
                 file_issues = self._check_file(vault_path, rel_str)
@@ -148,14 +155,19 @@ class JanitorDaemon(BaseDaemon):
         state = self.state.state
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # Prune ghost state entries (files deleted from vault but still in state.files)
+        # Prune ghost state entries (files deleted from vault but still in state.files).
+        # Conflict copies are excluded from live_paths deliberately: any that were
+        # indexed before the filter existed now read as ghosts and get their state
+        # entry and embeddings dropped here, which is exactly the cleanup wanted.
+        # The files themselves are never touched — only the index.
         live_paths = {
             str(md_file.relative_to(vault_path)).replace("\\", "/")
             for md_file in vault_path.rglob("*.md")
+            if not is_sync_conflict(md_file)
         }
         ghost_keys = [k for k in state.files if k not in live_paths]
         for k in ghost_keys:
-            del state.files[k]
+            self._delete_embeddings(state, k)
         if ghost_keys:
             self.log.info("janitor.pruned_ghosts", count=len(ghost_keys))
 
@@ -194,6 +206,10 @@ class JanitorDaemon(BaseDaemon):
         """
         index: dict[str, set[str]] = {}
         for md_file in vault_path.rglob("*.md"):
+            # A conflict copy is not a legitimate wikilink target — registering
+            # one lets a broken link resolve to a stale duplicate and read as fixed.
+            if is_sync_conflict(md_file):
+                continue
             rel = md_file.relative_to(vault_path)
             rel_str = str(rel).replace("\\", "/")
             stem = md_file.stem
@@ -332,11 +348,6 @@ class JanitorDaemon(BaseDaemon):
 
     async def _deep_sweep(self) -> None:
         """LLM enrichment for stub records. One call per file, one template per call."""
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not anthropic_key:
-            self.log.info("janitor.deep_skip", reason="no ANTHROPIC_API_KEY")
-            return
-
         vault_path = self.cfg.vault_path
         ignore = set(self.cfg.ignore_dirs)
         state = self.state.state
@@ -354,6 +365,17 @@ class JanitorDaemon(BaseDaemon):
                 fs.open_issues = [c for c in fs.open_issues if c != IssueCode.STUB_RECORD.value]
                 enriched += 1
                 await asyncio.sleep(1.0)   # gentle rate limiting
+            except LocalLLMUnavailable as e:
+                # Stop rather than retry a dead backend per stub. The STUB_RECORD
+                # issue is only cleared on a successful enrichment, so everything
+                # unreached stays queued for the next sweep.
+                self.log.warning(
+                    "janitor.backend_unavailable",
+                    error=str(e),
+                    deferred_from=rel_path,
+                    enriched_before_stop=enriched,
+                )
+                break
             except Exception as e:
                 self.log.warning("janitor.enrich_error", path=rel_path, error=str(e))
 
@@ -390,21 +412,36 @@ class JanitorDaemon(BaseDaemon):
         if len(prompt_bytes) > self.cfg.janitor_max_bytes_per_call:
             prompt = prompt[:self.cfg.janitor_max_bytes_per_call].decode("utf-8", errors="replace")
 
-        client = get_client()
-
-        def _call():
-            resp = client.messages.create(
-                model=self.cfg.anthropic_model,
+        def _call() -> str:
+            return complete(
+                "You are a careful editor enriching a knowledge-vault record.",
+                prompt,
+                base_url=self.cfg.ollama_base_url,
+                model=self.cfg.ollama_llm_model,
                 max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
             )
-            return resp
 
-        resp = await asyncio.to_thread(_call)
-        new_body = resp.content[0].text.strip()
+        new_body = (await asyncio.to_thread(_call)).strip()
         if new_body and len(new_body) > 20:
             vault_edit(vault_path, rel_path, body_replace=new_body)
             self.log.info("janitor.enriched_file", path=rel_path, chars=len(new_body))
+
+    def _delete_embeddings(self, state, rel_path: str) -> None:
+        """Delete a file's vectors from the vector store and prune its state entry.
+
+        Mirrors ``SurveyorDaemon._process_diff``'s deletion path: look up the
+        known chunk_ids (if any) before popping state, so ``store.delete_file``
+        can use the fast explicit-id delete instead of falling back to a
+        prefix scan. Used by ``_archive_sessions`` and ``_dedup_sweep`` so
+        moved/removed files never leave orphaned LanceDB embeddings behind.
+        """
+        fs = state.files.get(rel_path)
+        chunk_ids = fs.chunk_ids if fs else None
+        try:
+            self.store.delete_file(rel_path, chunk_ids)
+        except Exception as e:
+            self.log.warning("janitor.vector_delete_failed", path=rel_path, error=str(e))
+        state.files.pop(rel_path, None)
 
     # ── Dedup sweep: weekly similarity-based deduplication ────────────────────
 
@@ -437,11 +474,24 @@ class JanitorDaemon(BaseDaemon):
         merged_count = 0
         merge_log: list[str] = []
 
-        # Group all markdown files by their parent directory
+        # Group all markdown files by their parent directory.
+        #
+        # Conflict copies are excluded, and this exclusion is load-bearing, not
+        # tidiness. A conflict lives in the same directory as its original and
+        # is near-identical to it: measured against the live vault, all 129
+        # conflict/original pairs scored above this sweep's 0.85 threshold, with
+        # a median similarity of 1.000. Keeper selection below is "longer body
+        # wins", which has no notion of which file is the live one — in 9 of
+        # those pairs the conflict was longer, so enabling this sweep would have
+        # deleted the real note and promoted a June-22 copy in its place.
+        # Conflict resolution belongs to scripts/reconcile_conflicts.py, which
+        # is dry-run by default and shows its work.
         dir_files: dict[str, list[Path]] = {}
         for md_file in vault_path.rglob("*.md"):
             rel = md_file.relative_to(vault_path)
             if any(part in ignore for part in rel.parts):
+                continue
+            if is_sync_conflict(md_file):
                 continue
             dir_key = str(rel.parent)
             dir_files.setdefault(dir_key, []).append(md_file)
@@ -517,8 +567,10 @@ class JanitorDaemon(BaseDaemon):
                     try:
                         dupe_rel = str(dupe.relative_to(vault_path)).replace("\\", "/")
                         dupe.unlink()
-                        # Prune from state
-                        state.files.pop(dupe_rel, None)
+                        # Prune from state and vector store — mirrors surveyor's
+                        # deletion path so a deduped file doesn't leave orphaned
+                        # LanceDB embeddings behind.
+                        self._delete_embeddings(state, dupe_rel)
                         checked.add(str(dupe))
                         merged_count += 1
                         msg = f"merged {dupe.name} → {keeper.name} (ratio={ratio:.2f})"
@@ -598,18 +650,17 @@ class JanitorDaemon(BaseDaemon):
                 continue
 
             dest = archive_dir / md_file.name
+            rel_path = f"session/{md_file.name}"
             # If destination already exists, skip (idempotent)
             if dest.exists():
                 md_file.unlink(missing_ok=True)
-                rel_path = f"session/{md_file.name}"
-                state.files.pop(rel_path, None)
+                self._delete_embeddings(state, rel_path)
                 archived += 1
                 continue
 
             try:
                 md_file.rename(dest)
-                rel_path = f"session/{md_file.name}"
-                state.files.pop(rel_path, None)
+                self._delete_embeddings(state, rel_path)
                 archived += 1
                 self.log.debug(
                     "janitor.session_archived",
