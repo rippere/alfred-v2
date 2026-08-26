@@ -131,7 +131,13 @@ class SurveyorDaemon(BaseDaemon):
 
         # Embed new + changed
         from alfred.core.models import FileState
+        from alfred.store.graph import build_wikilink_index
         from datetime import datetime, timezone
+
+        # Built once per tick (not per file) from every currently-known vault
+        # file, so wikilink targets resolve to the same rel_path used as the
+        # node identity for their source file — see build_wikilink_index.
+        link_index = build_wikilink_index(current.keys())
 
         for rel_path in diff["new"] + diff["changed"]:
             vault_file = self.cfg.vault_path / rel_path
@@ -200,7 +206,7 @@ class SurveyorDaemon(BaseDaemon):
                 from alfred.store.graph import GraphStore
                 graph = GraphStore(self.cfg.graph_path)
                 graph.load()
-                graph.add_edges_from_wikilinks(rel_path, record.wikilinks)
+                graph.add_edges_from_wikilinks(rel_path, record.wikilinks, link_index=link_index)
                 graph.save()
             except Exception:
                 pass

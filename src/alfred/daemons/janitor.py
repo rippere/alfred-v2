@@ -325,7 +325,16 @@ class JanitorDaemon(BaseDaemon):
         parts = rel_path.replace("\\", "/").split("/")
         if len(parts) < 2:
             return ""
-        dir_to_type = {v: k for k, v in TYPE_DIRECTORY.items()}
+        # Several types share a directory (e.g. decision/assumption/constraint/
+        # contradiction/learn all live under topic/). A naive {v: k for k, v}
+        # reversal lets whichever type is declared LAST in TYPE_DIRECTORY win
+        # for every shared directory, silently mis-inferring type for the
+        # others. setdefault() with first-wins instead prefers the type whose
+        # name matches the directory itself (declared first, e.g. topic/topic,
+        # session/session) as the canonical inferred type for that directory.
+        dir_to_type: dict[str, str] = {}
+        for type_name, directory in TYPE_DIRECTORY.items():
+            dir_to_type.setdefault(directory, type_name)
         return dir_to_type.get(parts[0], "")
 
     # ── Stage 3: LLM enrichment (stub records, per-file, per-type prompt) ────
