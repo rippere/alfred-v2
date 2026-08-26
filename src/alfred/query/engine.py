@@ -168,7 +168,10 @@ class QueryEngine:
         # ── Step 6: FlashRank reranking ───────────────────────────────────────
         t0 = time.perf_counter()
         from alfred.query.context import _chunk_text
-        texts = {h.chunk_id: (_chunk_text(self.cfg.vault_path, h.chunk_id) or "") for h in hits}
+        # Shared with Step 8's assemble() below so each source file is parsed
+        # at most once for this query, not once per hit plus once per assemble.
+        chunk_cache: dict = {}
+        texts = {h.chunk_id: (_chunk_text(self.cfg.vault_path, h.chunk_id, chunk_cache) or "") for h in hits}
         from alfred.embed.reranker import rerank
         hits = rerank(text, hits, texts, top_n=opts.top_k)
         t["rerank"] = time.perf_counter() - t0
@@ -187,7 +190,7 @@ class QueryEngine:
         # ── Step 8: Context assembly ──────────────────────────────────────────
         t0 = time.perf_counter()
         # Prepend wiki hit context if present
-        context, sources = assemble(hits, self.cfg.vault_path)
+        context, sources = assemble(hits, self.cfg.vault_path, chunk_cache)
         if wiki_hit:
             wiki_block = f"[Wiki: {wiki_hit.rel_path}  score=0.95]\n{wiki_hit.content}"
             context = wiki_block + "\n\n---\n\n" + context if context else wiki_block
@@ -289,12 +292,15 @@ class QueryEngine:
         t0 = time.perf_counter()
         from alfred.query.context import _chunk_text
         from alfred.embed.reranker import rerank
-        texts = {h.chunk_id: (_chunk_text(self.cfg.vault_path, h.chunk_id) or "") for h in hits}
+        # Shared with assemble() below so each source file is parsed at most
+        # once for this query, not once per hit plus once per assemble.
+        chunk_cache: dict = {}
+        texts = {h.chunk_id: (_chunk_text(self.cfg.vault_path, h.chunk_id, chunk_cache) or "") for h in hits}
         hits = rerank(text, hits, texts, top_n=opts.top_k)
         t["rerank"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        context, sources = assemble(hits, self.cfg.vault_path)
+        context, sources = assemble(hits, self.cfg.vault_path, chunk_cache)
         if wiki_hit:
             wiki_block = f"[Wiki: {wiki_hit.rel_path}  score=0.95]\n{wiki_hit.content}"
             context = wiki_block + "\n\n---\n\n" + context if context else wiki_block
