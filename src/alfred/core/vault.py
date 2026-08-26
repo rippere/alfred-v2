@@ -12,7 +12,6 @@ import frontmatter
 
 WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[#|][^\]]+)?\]\]")
 
-MAX_EMBEDDING_CHARS = 6_000
 CHUNK_SIZE = 3_000
 CHUNK_OVERLAP = 200
 
@@ -49,22 +48,6 @@ def parse_file(vault_path: Path, rel_path: str) -> VaultRecord:
         record_type=fm.get("type", "unknown"),
         wikilinks=extract_wikilinks(raw_text),
     )
-
-
-def build_embedding_text(record: VaultRecord) -> str:
-    parts: list[str] = []
-    for key in EMBEDDING_FM_KEYS:
-        val = record.frontmatter.get(key)
-        if val and isinstance(val, str):
-            parts.append(f"{key}: {val}")
-    fm_text = "\n".join(parts)
-    fm_chars = len(fm_text) + 1
-    if record.body:
-        body = record.body.strip()
-        body_budget = MAX_EMBEDDING_CHARS - fm_chars
-        if body_budget > 0:
-            parts.append(body[:body_budget])
-    return "\n".join(parts)
 
 
 def _safe_chunk_id(rel_path: str, idx: int) -> str:
