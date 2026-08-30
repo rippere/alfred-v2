@@ -56,10 +56,12 @@ vault_status          ← how many files are indexed
 vault_api_cost        ← today's API spend
 ```
 
-For the HTTP API (from terminal or scripts):
+The HTTP server (`src/alfred/mcp/server_http.py`) serves a single route, `POST /mcp`,
+speaking streamable-http MCP JSON-RPC — not a plain REST `{"query": ...}` endpoint. There
+is no `/query` route. From a terminal or script, use the CLI instead (see Quickstart in
+README.md):
 ```bash
-curl -s http://localhost:8765/query -H 'Content-Type: application/json' \
-  -d '{"query": "what did I learn about content creation"}' | jq .
+.venv/bin/alfred query "what did I learn about content creation"
 ```
 
 ### HTTP API authentication
@@ -76,11 +78,12 @@ server with Bearer auth. It has three modes, and the middle one is easy to get w
   deliberate: a blank-but-set token would otherwise look like "auth on" in every config check
   while actually serving unauthenticated.
 
-To call the API with auth enabled:
+To call the API with auth enabled (MCP JSON-RPC over `POST /mcp`):
 ```bash
-curl -s http://localhost:8765/query -H 'Content-Type: application/json' \
+curl -s http://localhost:8765/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -H 'Authorization: Bearer <PLACEHOLDER_TOKEN>' \
-  -d '{"query": "what did I learn about content creation"}' | jq .
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "vault_query", "arguments": {"query": "what did I learn about content creation"}}}'
 ```
 
 ---
