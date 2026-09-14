@@ -1,0 +1,19 @@
+[Unit]
+Description=Alfred x402 tripwire watcher — monthly HOLD/FLIP-TO-GO/ABANDON-WEDGE verdict
+Documentation=file:///home/rippere/alfred-v2/deploy/systemd/INSTALL.md
+After=network-online.target
+Wants=network-online.target
+OnFailure=alfred-alert@%n.service
+
+[Service]
+Type=oneshot
+# Reads data/tripwire-signals.yaml (this month's manually/agent-updated
+# signals) and writes a verdict note to the Alfred inbox. Exits non-zero if
+# the signals file is missing/malformed — deliberately does not default to
+# HOLD on bad input.
+ExecStart=/home/rippere/alfred-v2/.venv/bin/alfred tripwire check
+WorkingDirectory=/home/rippere/alfred-v2
+Nice=10
+
+[Install]
+WantedBy=default.target
