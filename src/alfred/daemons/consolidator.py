@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import time
 import traceback
 from datetime import date, datetime, timezone
@@ -23,6 +25,19 @@ CONSOLIDATE_INTERVAL = 1800.0   # run every 30 minutes
 MIN_MEMBERS = 3                  # skip clusters with fewer files
 MAX_MEMBERS_IN_PROMPT = 8        # cap members sent to LLM
 SYNTHESIS_BATCH = 5              # max clusters to synthesize per run
+# Member bodies per synthesis prompt. The Spark's window is 32K tokens for
+# input + output and it answers 400 above that, where Ollama silently cut the
+# prompt; the employment vault's synthesis was already arriving at 31.3K.
+SYNTHESIS_INPUT_TOKEN_CAP = 24_000
+
+# Over-counts Qwen tokens on purpose: a run of up to 5 letters, each digit,
+# each other visible char. Against the Qwen tokenizer on 2,344 vault notes
+# (2026-09-24) it read a median 1.25x the real count and fell short on 3,
+# worst 0.72x. A flat chars/4 fell short on a quarter of them — Qwen spends a
+# token per digit, and table-heavy notes run 1.5 chars per token. The short
+# ones are URL-encoded blobs; capped, the eight densest large notes came to
+# 26.5K real tokens — over the nominal cap, still inside the window.
+_TOKEN_RE = re.compile(r"[^\W\d_]{1,5}|\d|\S")
 
 # Record types that should get wiki pages
 WIKI_ENTITY_TYPES = {"person", "org"}
@@ -114,40 +129,83 @@ class ConsolidatorDaemon(BaseDaemon):
         await self._generate_wiki_stubs(vault_path)
 
     async def _label_pass(self, vault_path) -> None:
-        """Label unlabeled (or stale-labeled) clusters, persisting on change."""
+        """Label clusters whose membership changed since their label was made.
+
+        This used to relabel every cluster older than 24h, and the writes were
+        mostly lost (see _live_cluster), so each pass relabelled nearly every
+        eligible cluster: ~3.5K label calls on 2026-09-23 across the personal,
+        finance and neuroscience vaults, 761 in the main one, for memberships
+        that had not changed.
+        """
         state = self.state.state
-        updated = 0
+        labeled = 0
+        reused = 0
+
+        # Model-made labels by the membership they describe, so a cluster whose
+        # members only moved to a new key (HDBSCAN renumbers when the vault
+        # changes) takes its label along instead of costing a call.
+        known = {
+            c.labeled_members: list(c.label)
+            for c in state.clusters.values()
+            if c.label and c.labeled_members
+        }
 
         for key, cluster in list(state.clusters.items()):
-            if len(cluster.member_files) < MIN_MEMBERS:
+            members = list(cluster.member_files)
+            if len(members) < MIN_MEMBERS:
                 continue
-            if cluster.label and cluster.last_labeled:
+            fingerprint = _members_fingerprint(members)
+            if cluster.label and cluster.labeled_members == fingerprint:
+                continue  # nothing joined or left since it was labeled
+
+            label = known.get(fingerprint)
+            if label is not None:
+                reused += 1
+            else:
                 try:
-                    last = datetime.fromisoformat(cluster.last_labeled)
-                    age_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600
-                    if age_h < 24:
-                        continue  # labeled recently enough
-                except Exception as e:
-                    # Unparsable last_labeled defeats the 24h guard, so this
-                    # cluster gets re-labeled (an LLM call) every single tick.
-                    record_failure(
-                        "consolidator.label_timestamp_unparsable",
-                        error=e,
-                        value=cluster.last_labeled,
-                    )
+                    text = await self._label_cluster(members, vault_path)
+                except Exception:
+                    self.log.warning("consolidator.label_error", cluster=key, error=traceback.format_exc())
+                    continue
+                if text:
+                    label = [text]
+                    labeled += 1
 
-            try:
-                label = await self._label_cluster(cluster.member_files, vault_path)
-                if label:
-                    cluster.label = [label]
-                    cluster.last_labeled = datetime.now(timezone.utc).isoformat()
-                    updated += 1
-            except Exception:
-                self.log.warning("consolidator.label_error", cluster=key, error=traceback.format_exc())
+            live = self._live_cluster(key, fingerprint)
+            if live is None:
+                continue  # membership moved on mid-call; the next pass labels it
+            if label is None:
+                # No model answer (backend paused). A name from the paths beats
+                # no label, but it is not stamped, so the model gets another go
+                # next pass instead of the placeholder sticking for good — and
+                # it never replaces a real label the cluster already has.
+                if not live.label:
+                    live.label = [_label_from_paths(members)]
+                continue
+            live.label = list(label)
+            live.last_labeled = datetime.now(timezone.utc).isoformat()
+            live.labeled_members = fingerprint
 
-        if updated:
-            self.log.info("consolidator.labeled", clusters=updated)
+        if labeled or reused:
+            self.log.info("consolidator.labeled", clusters=labeled, reused=reused)
             await self.save_state()
+
+    def _live_cluster(self, key: str, fingerprint: str):
+        """The cluster holding exactly these members now, or None.
+
+        Looked up at write time, never taken from the start of the pass: the
+        surveyor reclusters on the same 30-min cadence while a pass is waiting
+        on the model, and a label or synthesis path written into a cluster it
+        has since moved on from is written for nobody.
+        """
+        clusters = self.state.state.clusters
+        cluster = clusters.get(key)
+        if cluster is not None and _members_fingerprint(cluster.member_files) == fingerprint:
+            return cluster
+        for cluster in clusters.values():
+            if _members_fingerprint(cluster.member_files) == fingerprint:
+                return cluster
+        return None
 
     async def _synthesis_pass(self, vault_path) -> None:
         """Synthesize learn/ clusters into synthesis/ pages, ranked by graph centrality."""
@@ -157,6 +215,14 @@ class ConsolidatorDaemon(BaseDaemon):
         graph = GraphStore(self.cfg.graph_path)
 
         SYNTHESIS_STALE_DAYS = 30  # only re-synthesize existing pages after 30 days
+
+        # Synthesis pages by the membership they were written from; same idea
+        # as the label pass's `known`, for members that moved to a new key.
+        done_by_members = {
+            c.synthesized_members: c.consolidated_chunk_id
+            for c in state.clusters.values()
+            if c.synthesized_members and c.consolidated_chunk_id
+        }
 
         ranked: list[tuple[str, object, int]] = []
         # Hold the path-shared lock across load() + the degree reads below so
@@ -169,6 +235,30 @@ class ConsolidatorDaemon(BaseDaemon):
                     continue
                 if not cluster.label:
                     continue  # not yet labeled — wait for label pass
+
+                # Unchanged since its last synthesis (or since it was found to
+                # hold nothing to synthesize): skip, whatever the page's age.
+                # The age check below alone re-ran one 31K-token synthesis 40+
+                # times a day: a cluster pointing at a >30-day-old page was
+                # re-synthesized every pass because the new page's path never
+                # reached the cluster the next pass read.
+                fingerprint = _members_fingerprint(cluster.member_files)
+                if cluster.labeled_members != fingerprint:
+                    # Label not yet made for these members (new, changed, or a
+                    # placeholder while the backend was paused). The page's
+                    # path comes from the label, so wait for the label pass
+                    # rather than write a synthesis under a name about to change.
+                    continue
+                if cluster.synthesized_members == fingerprint and (
+                    not cluster.consolidated_chunk_id
+                    or (vault_path / cluster.consolidated_chunk_id).exists()
+                ):
+                    continue
+                moved = done_by_members.get(fingerprint)
+                if moved and (vault_path / moved).exists():
+                    cluster.consolidated_chunk_id = moved
+                    cluster.synthesized_members = fingerprint
+                    continue
 
                 # Guard: if consolidated_chunk_id is set, verify the file exists on disk.
                 # If it exists and is fresh (< 30 days old), skip — already synthesized.
@@ -219,20 +309,40 @@ class ConsolidatorDaemon(BaseDaemon):
         ranked.sort(key=lambda x: x[2], reverse=True)
 
         synthesized = 0
+        settled = 0
         for cluster_key, cluster, _ in ranked[:SYNTHESIS_BATCH]:
+            fingerprint = _members_fingerprint(cluster.member_files)
             try:
-                await self._synthesize_cluster(cluster, vault_path)
-                synthesized += 1
-                await asyncio.sleep(2.0)  # gentle rate limit between LLM calls
+                path = await self._synthesize_cluster(cluster, vault_path)
             except Exception as e:
                 self.log.warning("consolidator.synthesize_error", cluster=cluster_key, error=str(e))
+                continue
+            if path is None:
+                continue  # no answer from the model — retry next pass
+            live = self._live_cluster(cluster_key, fingerprint)
+            if live is not None:
+                live.synthesized_members = fingerprint
+                if path:
+                    live.consolidated_chunk_id = path
+                settled += 1
+            if path:
+                synthesized += 1
+                await asyncio.sleep(2.0)  # gentle rate limit between LLM calls
 
-        if synthesized:
+        if synthesized or settled:
             self.log.info("consolidator.synthesized", clusters=synthesized)
             await self.save_state()
 
-    async def _synthesize_cluster(self, cluster, vault_path) -> None:
-        """Build a synthesis/ page from a cluster's learn/ members, then mark them absorbed."""
+    async def _synthesize_cluster(self, cluster, vault_path) -> str | None:
+        """Build a synthesis/ page from a cluster's learn/ members, then mark them absorbed.
+
+        Returns the page's path; "" when the members hold nothing to
+        synthesize (none readable, or all daemon output), which stays true
+        until the membership changes; None when the model gave nothing back,
+        so the next pass retries. The caller records the result on the live
+        cluster (_live_cluster) — `cluster` may be stale by the time the model
+        answers.
+        """
         learn_entries: list[tuple[str, str, str]] = []  # (rel_path, name, body)
         for rel_path in cluster.member_files[:MAX_MEMBERS_IN_PROMPT]:
             try:
@@ -247,7 +357,7 @@ class ConsolidatorDaemon(BaseDaemon):
                 record_failure("consolidator.member_read_failed", error=e, path=rel_path)
 
         if not learn_entries:
-            return
+            return ""
 
         # Guard: if every source is daemon-generated content, skip synthesis.
         # Synthesizing LLM output produces compounding noise, not knowledge.
@@ -255,12 +365,12 @@ class ConsolidatorDaemon(BaseDaemon):
         if not human_sources:
             self.log.info("consolidator.skip_all_daemon_sources",
                           cluster=cluster.label, entries=len(learn_entries))
-            return
+            return ""
 
         label = cluster.label[0] if cluster.label else "cluster"
         synthesis_body = await self._call_synthesis_llm(label, learn_entries)
         if not synthesis_body:
-            return
+            return None
 
         # Wikilinks pointing back to each learn/ source
         source_links = [
@@ -286,7 +396,7 @@ class ConsolidatorDaemon(BaseDaemon):
                 )
             except Exception as e:
                 self.log.warning("consolidator.synthesis_update_failed", path=synthesis_rel, error=str(e))
-                return
+                return None
             result = {"path": synthesis_rel}
         else:
             result = vault_create(
@@ -310,11 +420,20 @@ class ConsolidatorDaemon(BaseDaemon):
             except Exception as e:
                 self.log.debug("consolidator.absorb_skip", path=rel_path, error=str(e))
 
-        cluster.consolidated_chunk_id = result.get("path", f"synthesis/{label_slug}.md")
-        self.log.info("consolidator.cluster_synthesized", label=label, path=cluster.consolidated_chunk_id)
+        path = result.get("path", f"synthesis/{label_slug}.md")
+        self.log.info("consolidator.cluster_synthesized", label=label, path=path)
+        return path
 
     async def _call_synthesis_llm(self, label: str, entries: list[tuple[str, str, str]]) -> str:
         """Call Claude API for synthesis (falls back to Ollama if key absent)."""
+        entries, estimated = _fit_to_budget(entries, SYNTHESIS_INPUT_TOKEN_CAP)
+        if estimated > SYNTHESIS_INPUT_TOKEN_CAP:
+            self.log.info(
+                "consolidator.synthesis_input_capped",
+                label=label,
+                estimated_tokens=estimated,
+                cap=SYNTHESIS_INPUT_TOKEN_CAP,
+            )
         bodies_text = "\n\n".join(f"### {name}\n{body}" for _, name, body in entries)
         prompt = (
             f"You are synthesizing atomic knowledge fragments into a coherent insight document "
@@ -455,14 +574,63 @@ class ConsolidatorDaemon(BaseDaemon):
                 error=traceback.format_exc(),
             )
 
-        # ── Fallback 2: deterministic from file names ─────────────────────────
-        from pathlib import Path
-        from collections import Counter
+        # No model answer. _label_pass falls back to _label_from_paths, and
+        # knows not to treat that name as the cluster's real label.
+        return ""
 
-        dirs = [Path(f).parent.name for f in member_files if Path(f).parent.name not in (".", "")]
-        if dirs:
-            most_common_dir = Counter(dirs).most_common(1)[0][0]
-            return most_common_dir
 
-        stems = [Path(f).stem for f in member_files[:2]]
-        return "/".join(stems) if stems else "unlabeled"
+def _label_from_paths(member_files: list[str]) -> str:
+    """A placeholder label from the members' folders or file names — no LLM."""
+    from pathlib import Path
+    from collections import Counter
+
+    dirs = [Path(f).parent.name for f in member_files if Path(f).parent.name not in (".", "")]
+    if dirs:
+        most_common_dir = Counter(dirs).most_common(1)[0][0]
+        return most_common_dir
+
+    stems = [Path(f).stem for f in member_files[:2]]
+    return "/".join(stems) if stems else "unlabeled"
+
+
+def _members_fingerprint(member_files) -> str:
+    """Order-independent identity of a cluster's membership."""
+    return hashlib.sha1("\n".join(sorted(member_files)).encode()).hexdigest()
+
+
+def _approx_tokens(text: str) -> int:
+    return len(_TOKEN_RE.findall(text))
+
+
+def _fit_to_budget(
+    entries: list[tuple[str, str, str]], budget: int
+) -> tuple[list[tuple[str, str, str]], int]:
+    """Trim member bodies so together they come to at most `budget` tokens.
+
+    Returns the entries and their estimated size before trimming. Short bodies
+    go in whole; the long ones split what is left evenly, each cut at a token
+    boundary and marked, so no single note crowds the others out.
+    """
+    sizes = [_approx_tokens(body) for _, _, body in entries]
+    total = sum(sizes)
+    if total <= budget:
+        return entries, total
+
+    allowed = [0] * len(entries)
+    left = budget
+    order = sorted(range(len(entries)), key=sizes.__getitem__)
+    for n, i in enumerate(order):
+        allowed[i] = min(sizes[i], left // (len(order) - n))
+        left -= allowed[i]
+
+    fitted = []
+    for (rel, name, body), size, cap in zip(entries, sizes, allowed, strict=True):
+        if cap < size:
+            cut = 0
+            for count, match in enumerate(_TOKEN_RE.finditer(body), start=1):
+                if count > cap:
+                    break
+                cut = match.end()
+            body = body[:cut] + "\n[…truncated]"
+        fitted.append((rel, name, body))
+    return fitted, total
