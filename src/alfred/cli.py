@@ -52,7 +52,8 @@ def status(
     cfg_table.add_row("vault", str(cfg.vault_path))
     cfg_table.add_row("data", str(cfg.data_dir))
     cfg_table.add_row("embed model", cfg.ollama_embed_model)
-    cfg_table.add_row("llm model", cfg.ollama_llm_model)
+    llm = cfg.llm
+    cfg_table.add_row("llm", f"{llm['model']} via {llm['api']} at {llm['base_url']}")
     cfg_table.add_row("milvus", cfg.milvus_uri)
     console.print("[bold]Config[/bold]")
     console.print(cfg_table)

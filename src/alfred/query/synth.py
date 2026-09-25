@@ -1,4 +1,4 @@
-"""Synthesis backend: local Ollama.
+"""Synthesis backend: the configured local LLM (cfg.llm — Ollama by default).
 
 This used to be a three-link chain (Anthropic → OpenRouter → Ollama). It was
 removed rather than repaired: the chain degraded silently. Anthropic 400'd on
@@ -12,7 +12,9 @@ ladder nobody can see sliding down.
 """
 from __future__ import annotations
 
-from alfred.core.local_llm import LocalLLMUnavailable, complete
+from urllib.parse import urlparse
+
+from alfred.core.local_llm import LocalLLMRequestTooLarge, LocalLLMUnavailable, complete
 
 SYSTEM_PROMPT = (
     "You are Alfred, a personal knowledge assistant with access to a private vault "
@@ -21,28 +23,36 @@ SYSTEM_PROMPT = (
     "cite which vault documents support each point. If context is insufficient, say so."
 )
 
-__all__ = ["SYSTEM_PROMPT", "LocalLLMUnavailable", "synthesize"]
+__all__ = ["SYSTEM_PROMPT", "LocalLLMRequestTooLarge", "LocalLLMUnavailable", "synthesize"]
 
 
 def synthesize(
     query: str,
     context: str,
-    ollama_base_url: str,
-    ollama_model: str,
+    base_url: str,
+    model: str,
     preamble: str = "",
+    *,
+    api: str = "ollama",
+    api_key_env: str | None = None,
 ) -> tuple[str, str, str]:
-    """Returns (answer, backend_label, model_label).
+    """Returns (answer, backend_label, model_label). Pass **cfg.llm.
 
-    Raises LocalLLMUnavailable if Ollama cannot be reached — callers must
-    surface that to the user rather than presenting an empty answer as though
-    the vault had nothing to say.
+    Raises LocalLLMUnavailable if the backend cannot be reached, and
+    LocalLLMRequestTooLarge if it refused the request's size — callers must
+    surface either to the user rather than presenting an empty answer as
+    though the vault had nothing to say.
     """
     system = (preamble + "\n\n" + SYSTEM_PROMPT).strip() if preamble else SYSTEM_PROMPT
     answer = complete(
         system,
         f"Query: {query}\n\nVault context:\n\n{context}",
-        base_url=ollama_base_url,
-        model=ollama_model,
+        base_url=base_url,
+        model=model,
+        api=api,
+        api_key_env=api_key_env,
         max_tokens=2048,
     )
-    return answer, "Ollama (local)", ollama_model
+    if api == "ollama":
+        return answer, "Ollama (local)", model
+    return answer, f"OpenAI-compatible at {urlparse(base_url).netloc}", model

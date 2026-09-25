@@ -45,6 +45,9 @@ def _perturb(key_path: tuple[str, ...], value):
         # Keep it relative so the perturbed dir lands inside tmp_path, never
         # alongside the live data dirs.
         return "./__sentinel_data__"
+    if key_path == ("llm", "api"):
+        # An enum: load() rejects anything else, so flip to the other backend.
+        return "openai" if value == "ollama" else "ollama"
     if isinstance(value, bool):  # bool before int — bool is an int subclass
         return not value
     if isinstance(value, int):
@@ -69,7 +72,12 @@ def _snapshot(cfg: AlfredConfig) -> dict:
 
 
 @pytest.mark.parametrize("config_name", VAULT_CONFIGS)
-def test_every_yaml_key_is_consumed(config_name, tmp_path):
+def test_every_yaml_key_is_consumed(config_name, tmp_path, monkeypatch):
+    # Flipping llm.api to openai makes load() resolve the Spark settings; give
+    # it synthetic ones and keep the real ~/.config/spark/env out of it.
+    monkeypatch.setenv("SPARK_BASE_URL", "http://spark.test:8000/v1")
+    monkeypatch.setenv("SPARK_MODEL", "test-model")
+    monkeypatch.setattr("alfred.config.SPARK_ENV_PATH", tmp_path / "no-spark-env")
     src = REPO_ROOT / config_name
     assert src.exists(), f"{config_name} missing from repo root"
     # Vault configs are slim overrides merged over config-base.yaml at load

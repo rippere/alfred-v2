@@ -12,7 +12,7 @@ import frontmatter
 import structlog
 
 from alfred.core.failures import record_failure
-from alfred.core.local_llm import LocalLLMUnavailable, complete
+from alfred.core.local_llm import LocalLLMRequestTooLarge, LocalLLMUnavailable, complete
 from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import VaultError, vault_append_to_topic, vault_read
 from alfred.daemons.base import BaseDaemon
@@ -174,6 +174,11 @@ class DistillerDaemon(BaseDaemon):
                         await self.save_state()
                         self.log.debug("distiller.incremental_save", files=distilled_count)
                     await asyncio.sleep(1.5)
+                except LocalLLMRequestTooLarge as e:
+                    # Retrying sends the same request, so stamp it like a file
+                    # with nothing to distill: it comes back when it goes stale.
+                    self.log.warning("distiller.request_too_large", path=rel_path, error=str(e))
+                    fs.last_distilled = now_iso
                 except LocalLLMUnavailable as e:
                     # Stop the sweep instead of retrying a dead backend once per
                     # file. last_distilled is only stamped on success (line
@@ -250,8 +255,7 @@ class DistillerDaemon(BaseDaemon):
             return complete(
                 _EXTRACT_SYSTEM,
                 user_text,
-                base_url=self.cfg.ollama_base_url,
-                model=self.cfg.ollama_llm_model,
+                **self.cfg.llm,
                 json_mode=True,
                 max_tokens=512,
             )

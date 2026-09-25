@@ -309,3 +309,44 @@ def test_sweep_deferred_before_any_progress_records_no_run(tmp_path, monkeypatch
 
     assert daemon.state.state.distiller_runs == []
     assert not daemon.state.state.files["a.md"].last_distilled
+
+
+def test_request_too_large_skips_the_file_and_the_sweep_goes_on(tmp_path, monkeypatch):
+    """An oversized request (the Spark's 400, or an answer cut at max_tokens)
+    gets the same answer next sweep. It must not stop the sweep the way a down
+    backend does, and must not leave the file stale to be re-sent tomorrow."""
+    from alfred.core.local_llm import LocalLLMRequestTooLarge
+    from alfred.core.models import FileState
+
+    daemon = _make_daemon(tmp_path)
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _no_sleep)
+    calls: list[str] = []
+
+    def _complete(system, user, **kw):
+        calls.append(user)
+        if "a.md" in user:
+            raise LocalLLMRequestTooLarge("400: over the window")
+        return json.dumps({"items": [{"title": "from-b", "body": "b", "tags": ["misc"]}]})
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _complete)
+    for name in ("a.md", "b.md"):
+        daemon.state.state.files[name] = FileState(md5=name)
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.tick())
+
+    assert len(calls) == 2, "the sweep stopped at the oversized file"
+    assert appended == ["from-b"]
+    assert daemon.state.state.files["a.md"].last_distilled, "a.md would be re-sent next sweep"
+    assert [e for e in logs if e.get("event") == "distiller.request_too_large"
+            and e.get("path") == "a.md"]
+
+    calls.clear()
+    asyncio.run(daemon.tick())
+    assert calls == []
+
+
+async def _no_sleep(_seconds: float) -> None:
+    return None

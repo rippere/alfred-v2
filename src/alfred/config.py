@@ -12,6 +12,13 @@ log = structlog.get_logger()
 # Shared-defaults file merged UNDER each vault config (vault file wins).
 BASE_CONFIG_NAME = "config-base.yaml"
 
+# Completion backends the `llm:` block may name.
+LLM_APIS = ("ollama", "openai")
+
+# KEY=VALUE lines shared by every Spark client on this machine (tools/spark,
+# hooks). Read when a SPARK_* variable is not in the environment.
+SPARK_ENV_PATH = Path.home() / ".config" / "spark" / "env"
+
 # Every YAML key path AlfredConfig.load() actually consumes. Keys present in a
 # merged config but absent here are dead weight — load() warns on them (the
 # check that would have caught `distiller.stale_days` / `consolidator.*`).
@@ -22,6 +29,10 @@ _CONSUMED_KEYS: frozenset[tuple[str, ...]] = frozenset({
     ("ollama", "base_url"),
     ("ollama", "embed_model"),
     ("ollama", "llm_model"),
+    ("llm", "api"),
+    ("llm", "base_url"),
+    ("llm", "model"),
+    ("llm", "api_key_env"),
     ("surveyor", "hdbscan_min_cluster_size"),
     ("surveyor", "hdbscan_min_samples"),
     ("surveyor", "embed_dims"),
@@ -79,6 +90,29 @@ def _warn_unused_keys(raw: dict, source: Path) -> None:
     _walk(raw, ())
 
 
+def spark_env(name: str) -> str | None:
+    """A Spark client setting: the environment first, then SPARK_ENV_PATH.
+
+    Blank counts as unset. Never logged or stored on AlfredConfig — the file
+    holds SPARK_API_KEY, which local_llm reads per call instead.
+    """
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    try:
+        lines = SPARK_ENV_PATH.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, val = line.partition("=")
+        if sep and key.strip() == name:
+            return val.strip().strip('"').strip("'") or None
+    return None
+
+
 def load_env(config_path: Path) -> None:
     """Load .env from the same directory as config.yaml."""
     env_path = Path(config_path).parent / ".env"
@@ -108,6 +142,19 @@ class AlfredConfig:
     ollama_embed_model: str = "nomic-embed-text"
     ollama_llm_model: str = "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M"
     embed_dims: int = 768
+
+    # Completions backend (the `llm:` block) for every daemon call and query
+    # synthesis. Embeddings stay on the ollama_* fields whatever this says.
+    #   "ollama": today's path. A blank base_url/model means ollama_base_url /
+    #     ollama_llm_model, so an absent block changes nothing.
+    #   "openai": an OpenAI-compatible server (the DGX Spark's vLLM). load()
+    #     fills a blank base_url/model from SPARK_BASE_URL / SPARK_MODEL. The
+    #     key is read from the variable api_key_env names, per call, and is
+    #     never held here.
+    llm_api: str = "ollama"
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_api_key_env: str = "SPARK_API_KEY"
 
     # Milvus
     milvus_collection: str = "vault_v2"
@@ -199,6 +246,22 @@ class AlfredConfig:
     # anthropic_model / openrouter_model keys were removed with the cloud chain.
 
     @property
+    def llm(self) -> dict:
+        """Backend keyword arguments for local_llm.complete() / complete_json()."""
+        if self.llm_api == "ollama":
+            return {
+                "api": "ollama",
+                "base_url": self.llm_base_url or self.ollama_base_url,
+                "model": self.llm_model or self.ollama_llm_model,
+            }
+        return {
+            "api": self.llm_api,
+            "base_url": self.llm_base_url,
+            "model": self.llm_model,
+            "api_key_env": self.llm_api_key_env,
+        }
+
+    @property
     def milvus_uri(self) -> str:
         return str(self.data_dir / "milvus.db")
 
@@ -252,6 +315,24 @@ class AlfredConfig:
             cfg.ollama_base_url = ol.get("base_url", cfg.ollama_base_url)
             cfg.ollama_embed_model = ol.get("embed_model", cfg.ollama_embed_model)
             cfg.ollama_llm_model = ol.get("llm_model", cfg.ollama_llm_model)
+
+        # Completions backend
+        if lm := raw.get("llm"):
+            cfg.llm_api = lm.get("api", cfg.llm_api)
+            cfg.llm_base_url = lm.get("base_url") or cfg.llm_base_url
+            cfg.llm_model = lm.get("model") or cfg.llm_model
+            cfg.llm_api_key_env = lm.get("api_key_env", cfg.llm_api_key_env)
+        if cfg.llm_api not in LLM_APIS:
+            # A typo must not quietly fall back to either backend.
+            raise ValueError(f"{path}: llm.api is {cfg.llm_api!r}; expected one of {LLM_APIS}")
+        if cfg.llm_api == "openai":
+            cfg.llm_base_url = (cfg.llm_base_url or spark_env("SPARK_BASE_URL") or "").rstrip("/")
+            cfg.llm_model = cfg.llm_model or spark_env("SPARK_MODEL") or ""
+            if not (cfg.llm_base_url and cfg.llm_model):
+                raise ValueError(
+                    f"{path}: llm.api is openai but no base_url/model: set llm.base_url and "
+                    f"llm.model, or SPARK_BASE_URL and SPARK_MODEL (environment or {SPARK_ENV_PATH})"
+                )
 
         # Vault ignore dirs
         if v := raw.get("vault"):

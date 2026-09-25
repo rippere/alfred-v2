@@ -4,3 +4,9 @@ vault:
   path: /mnt/external/vault-employment
 
 data_dir: ./data-employment
+
+# Betson carve-out: this vault's text never leaves benderman, whatever
+# config-base.yaml's llm.api says. The meta MCP server loads this file too.
+llm:
+  api: ollama
+  base_url: http://127.0.0.1:11434

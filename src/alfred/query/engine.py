@@ -211,12 +211,7 @@ class QueryEngine:
         if opts.include_synthesis and context:
             t0 = time.perf_counter()
             from alfred.query.synth import synthesize
-            answer, backend, model = synthesize(
-                query=text,
-                context=context,
-                ollama_base_url=self.cfg.ollama_base_url,
-                ollama_model=self.cfg.ollama_llm_model,
-            )
+            answer, backend, model = synthesize(query=text, context=context, **self.cfg.llm)
             t["synth"] = time.perf_counter() - t0
 
         # Record memory access asynchronously
@@ -317,12 +312,7 @@ class QueryEngine:
         if opts.include_synthesis and context:
             t0 = time.perf_counter()
             from alfred.query.synth import synthesize
-            answer, backend, model = synthesize(
-                query=text,
-                context=context,
-                ollama_base_url=self.cfg.ollama_base_url,
-                ollama_model=self.cfg.ollama_llm_model,
-            )
+            answer, backend, model = synthesize(query=text, context=context, **self.cfg.llm)
             t["synth"] = time.perf_counter() - t0
 
         return QueryResult(

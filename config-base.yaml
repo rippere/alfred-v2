@@ -23,6 +23,20 @@ ollama:
   embed_model: nomic-embed-text
   llm_model: orcarouter/Qwen3.8-27B-Uncensored:q5_K_M
 
+# Completions backend for every daemon call and query synthesis. Embeddings
+# stay on the ollama: block above whatever this says.
+#   api: ollama  today's path; base_url/model default to the ollama: block.
+#   api: openai  an OpenAI-compatible server (the DGX Spark's vLLM). base_url
+#                and model default to SPARK_BASE_URL / SPARK_MODEL (environment
+#                first, then ~/.config/spark/env); the key comes from the
+#                variable api_key_env names.
+# To move the fleet, set only `api: openai` here and leave base_url/model to
+# the env: config-employment.yaml pins api and base_url but inherits model, so
+# a model set here would reach its local Ollama as a name Ollama doesn't have.
+llm:
+  api: ollama
+  api_key_env: SPARK_API_KEY
+
 janitor:
   sweep_interval_s: 14400
   deep_interval_h: 24

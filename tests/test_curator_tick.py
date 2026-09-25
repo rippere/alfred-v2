@@ -139,3 +139,108 @@ def test_tick_exception_is_caught_and_logged_not_propagated(tmp_path, monkeypatc
               and e.get("event") == "curator.tick_error"]
     assert len(errors) == 1
     assert "simulated curator inbox failure" in errors[0]["error"]
+
+
+def test_request_too_large_skips_that_file_and_not_the_tick(tmp_path, monkeypatch):
+    """Unlike a down backend, an oversized request fails the same way every
+    10 s: skip that file (left in inbox/ for a person), keep going with the
+    rest, and do not send it again until its content changes."""
+    from alfred.core.local_llm import LocalLLMRequestTooLarge
+
+    daemon, state_store = _make_daemon(tmp_path)
+    vault_path = daemon.cfg.vault_path
+    big = vault_path / "inbox" / "a-too-big.md"
+    fine = vault_path / "inbox" / "b-fine.md"
+    big.write_text("BIG raw note, no frontmatter.\n", encoding="utf-8")
+    fine.write_text("Fine raw note, no frontmatter.\n", encoding="utf-8")
+    calls: list[str] = []
+
+    def _complete_json(system, user, **kw):
+        calls.append(user)
+        if "BIG" in user:
+            raise LocalLLMRequestTooLarge("400: over the window")
+        return {"type": "note", "name": "fine-note"}
+
+    monkeypatch.setattr("alfred.daemons.curator.complete_json", _complete_json)
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.tick())
+
+    assert big.exists(), "the skipped file must stay in inbox/"
+    assert not fine.exists() and (vault_path / "note" / "fine-note.md").exists()
+    assert len(state_store.state.curator_processed) == 2
+    assert [e for e in logs if e.get("event") == "curator.request_too_large"]
+
+    calls.clear()
+    asyncio.run(daemon.tick())
+    assert calls == [], "the oversized file was sent again"
+
+    big.write_text("BIG raw note, edited.\n", encoding="utf-8")
+    asyncio.run(daemon.tick())
+    assert len(calls) == 1, "an edited file must be tried again"
+
+
+def test_classification_request_per_backend(tmp_path, monkeypatch):
+    """Flag off: the request Ollama always got (format=json, no schema).
+    Flag on: a json_schema whose `type` is the known-type enum."""
+    import httpx
+    import openai
+
+    from alfred.core import local_llm
+    from alfred.core.schema import KNOWN_TYPES
+
+    daemon, _ = _make_daemon(tmp_path)
+    inbox = daemon.cfg.vault_path / "inbox"
+    (inbox / "a.md").write_text("Raw note one.\n", encoding="utf-8")
+
+    ollama: list[dict] = []
+
+    def _ollama_post(url, json=None, timeout=None):
+        ollama.append({"url": url, "json": json})
+        return httpx.Response(
+            200, json={"message": {"content": '{"type": "note", "name": "one"}'}},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", _ollama_post)
+    asyncio.run(daemon.tick())
+
+    (request,) = ollama
+    assert request["url"] == f"{daemon.cfg.ollama_base_url}/api/chat"
+    assert request["json"]["model"] == daemon.cfg.ollama_llm_model
+    assert request["json"]["format"] == "json"
+    assert request["json"]["options"] == {"num_predict": 256}
+    assert request["json"]["think"] is False
+
+    daemon.cfg.llm_api = "openai"
+    daemon.cfg.llm_base_url = "http://spark.test:8000/v1"
+    daemon.cfg.llm_model = "qwen3-30b"
+    monkeypatch.setattr("alfred.config.SPARK_ENV_PATH", tmp_path / "no-spark-env")
+    monkeypatch.delenv("SPARK_API_KEY", raising=False)
+    spark: list[httpx.Request] = []
+
+    def _spark(request: httpx.Request) -> httpx.Response:
+        spark.append(request)
+        return httpx.Response(200, json={
+            "id": "x", "object": "chat.completion", "created": 0, "model": "qwen3-30b",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": '{"type": "task", "name": "two"}'}}],
+        })
+
+    monkeypatch.setattr(local_llm, "_openai_client", lambda base_url, api_key, timeout: openai.OpenAI(
+        base_url=base_url, api_key=api_key, max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(_spark)),
+    ))
+    (inbox / "b.md").write_text("Raw note two.\n", encoding="utf-8")
+    asyncio.run(daemon.tick())
+
+    assert len(ollama) == 1, "flag on, yet Ollama was called"
+    (request,) = spark
+    body = json.loads(request.content)
+    assert body["model"] == "qwen3-30b"
+    assert body["max_tokens"] == 256
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert body["response_format"]["type"] == "json_schema"
+    assert schema["properties"]["type"]["enum"] == sorted(KNOWN_TYPES)
+    assert (daemon.cfg.vault_path / "task" / "two.md").exists()

@@ -12,7 +12,7 @@ from pathlib import Path
 import frontmatter
 import structlog
 
-from alfred.core.local_llm import LocalLLMUnavailable, complete_json
+from alfred.core.local_llm import LocalLLMRequestTooLarge, LocalLLMUnavailable, complete_json
 from alfred.core.schema import KNOWN_TYPES, STATUS_BY_TYPE, TYPE_DIRECTORY, correct_status, correct_type
 from alfred.core.vault_ops import VaultError, vault_create, vault_edit, vault_move
 from alfred.daemons.base import BaseDaemon
@@ -46,6 +46,20 @@ Note content:
 ---
 {content}
 ---"""
+
+# The reply shape _CLASSIFY_SYSTEM asks for, enforced by the server on the
+# OpenAI path (contract §4): `type` can only come back as a known note type.
+_CLASSIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": sorted(KNOWN_TYPES)},
+        "name": {"type": "string"},
+        "status": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "summary": {"type": "string"},
+    },
+    "required": ["type", "name"],
+}
 
 
 # A recurring feed marks every drop with `<!-- alfred:source <key> -->` (or a
@@ -167,6 +181,12 @@ class CuratorDaemon(BaseDaemon):
                 ingested = await self._ingest_file(md_file, processed_dir, content_hash)
                 if ingested:
                     state.curator_processed[process_key] = datetime.now(timezone.utc).isoformat()
+            except LocalLLMRequestTooLarge as e:
+                # The same file gets the same answer every 10 s. Mark it done so
+                # it is retried only when its content changes; it stays in
+                # inbox/, unclassified, for a person to look at.
+                self.log.warning("curator.request_too_large", path=rel_str, error=str(e))
+                state.curator_processed[process_key] = datetime.now(timezone.utc).isoformat()
             except LocalLLMUnavailable as e:
                 # Abandon the whole tick, not just this file. The backend is down
                 # for everyone, so continuing would retry it once per inbox entry
@@ -356,17 +376,21 @@ class CuratorDaemon(BaseDaemon):
 
         Raises LocalLLMUnavailable when the backend is unreachable. That is not
         a classification outcome and must not be flattened into None: the caller
-        leaves the file in inbox/ and retries on the next tick.
+        leaves the file in inbox/ and retries on the next tick. Raises
+        LocalLLMRequestTooLarge when retrying cannot help; the caller skips it.
         """
         system_text = _CLASSIFY_SYSTEM.format(types=", ".join(sorted(KNOWN_TYPES)))
         user_text = _CLASSIFY_USER_TEMPLATE.format(content=content[:3000])
+
+        llm = self.cfg.llm
 
         def _call() -> dict:
             return complete_json(
                 system_text,
                 user_text,
-                base_url=self.cfg.ollama_base_url,
-                model=self.cfg.ollama_llm_model,
+                **llm,
+                # Ollama keeps plain format=json, so flag-off requests are unchanged.
+                schema=_CLASSIFY_SCHEMA if llm["api"] == "openai" else None,
                 max_tokens=256,
             )
 
