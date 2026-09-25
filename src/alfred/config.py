@@ -159,17 +159,29 @@ def is_ollama_cloud_model(model: str) -> bool:
     return bool(_CLOUD_MODEL_RE.search((model or "").strip()))
 
 
-def _is_local_only_vault(vault_path: Path) -> bool:
-    """Is this vault under a local-only root, as written or after symlinks?"""
-    candidates = [Path(os.path.abspath(vault_path.expanduser()))]
+def _as_written_and_resolved(path: Path) -> list[Path]:
+    paths = [Path(os.path.abspath(path.expanduser()))]
     try:
-        candidates.append(vault_path.expanduser().resolve())
+        paths.append(path.expanduser().resolve())
     except OSError:
         pass
+    return paths
+
+
+def _is_local_only_vault(vault_path: Path) -> bool:
+    """Does this vault hold a local-only root, or sit inside one?
+
+    Both directions, as written and after symlinks: a vault under
+    /mnt/external/vault-employment is local-only, and so is a vault at
+    /mnt/external or ~, whose tree takes in the employment vault, the twin
+    repo or ~/betson-it-review.
+    """
+    vaults = _as_written_and_resolved(vault_path)
+    roots = [r for root in LOCAL_ONLY_VAULT_ROOTS for r in _as_written_and_resolved(root)]
     return any(
-        path == root or root in path.parents
-        for path in candidates
-        for root in LOCAL_ONLY_VAULT_ROOTS
+        vault == root or root in vault.parents or vault in root.parents
+        for vault in vaults
+        for root in roots
     )
 
 

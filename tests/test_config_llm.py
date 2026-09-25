@@ -326,6 +326,38 @@ def test_employment_vault_path_is_local_only_under_any_config_name(tmp_path, mon
         ))
 
 
+@pytest.mark.parametrize("vault_path", [
+    "/mnt/external",
+    "/mnt",
+    "/mnt/external/Employment/..",
+    str(Path.home()),
+])
+def test_a_vault_that_contains_a_local_only_root_is_local_only(tmp_path, monkeypatch, vault_path):
+    """The path check works both ways: a vault whose tree takes in the
+    employment vault, the twin repo or ~/betson-it-review is local-only, so a
+    base flip to the Spark fails its load instead of moving it."""
+    monkeypatch.setenv("SPARK_BASE_URL", "https://spark.test:8000/v1")
+    monkeypatch.setenv("SPARK_MODEL", "qwen3-30b")
+    path = _write(tmp_path, {"llm": {"api": "openai"}}, {"vault": {"path": vault_path}})
+
+    with pytest.raises(LocalOnlyViolation):
+        AlfredConfig.load(path)
+
+    # And with the base on ollama it loads, local-only, on loopback.
+    path = _write(tmp_path, {}, {"vault": {"path": vault_path},
+                                 "ollama": {"base_url": "http://127.0.0.1:11434"}})
+    assert AlfredConfig.load(path).local_only
+
+
+@pytest.mark.parametrize("vault_path", [
+    "/mnt/external/obsidian-vault", "/mnt/external/vault-personal", "/mnt/external/Employed",
+    "/mnt/external/vault-employment-archive",
+])
+def test_neighbours_of_a_local_only_root_are_not_local_only(tmp_path, vault_path):
+    path = _write(tmp_path, {}, {"vault": {"path": vault_path}})
+    assert not AlfredConfig.load(path).local_only
+
+
 def test_a_runtime_change_is_refused_at_the_call_site(tmp_path):
     """load() is not the only gate: cfg.llm and cfg.embed_base_url re-check,
     so code that edits a loaded config cannot route a local-only vault off-box."""
