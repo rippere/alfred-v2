@@ -23,6 +23,22 @@ ollama:
   embed_model: nomic-embed-text
   llm_model: orcarouter/Qwen3.8-27B-Uncensored:q5_K_M
 
+# Completions backend for every daemon call and query synthesis. Embeddings
+# stay on the ollama: block above whatever this says.
+#   api: ollama  today's path; base_url/model default to the ollama: block.
+#   api: openai  an OpenAI-compatible server (the DGX Spark's vLLM). base_url
+#                and model default to SPARK_BASE_URL / SPARK_MODEL (environment
+#                first, then ~/.config/spark/env); the key comes from the
+#                variable api_key_env names.
+# Keep this block on ollama. A vault moves to the Spark by setting
+# `llm: {api: openai}` in its own config-*.yaml (step 15, one satellite at a
+# time, base_url/model left to the env). config.yaml (main vault) pins ollama
+# until the pre-flip gates close, and config-employment.yaml pins it for good,
+# so nothing set here moves either of them off the local Ollama.
+llm:
+  api: ollama
+  api_key_env: SPARK_API_KEY
+
 janitor:
   sweep_interval_s: 14400
   deep_interval_h: 24
@@ -30,7 +46,15 @@ janitor:
   dedup_enabled: false    # disabled until dry-run gate is tested
 
 distiller:
-  mode: scheduled         # scheduled = nightly at 2am | on_demand = explicit trigger only
+  # scheduled = nightly at 2am | on_demand = explicit trigger only.
+  # on_demand until Ben signs off on the write ramp. Before the {items} fix
+  # the distiller wrote nothing; with it, the main vault's ~15K never-distilled
+  # files become up to 600 topic/ appends a night for ~75 nights. Setting
+  # `scheduled` here (or in one vault's file) is that sign-off.
+  mode: on_demand
+  # Stale files per sweep, never-distilled and oldest first. Each file can
+  # append up to 3 learnings to topic/, so this caps a night's writes at ~600.
+  max_files_per_sweep: 200
 
 api_budget:
   max_calls_per_day: 500

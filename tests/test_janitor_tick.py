@@ -111,3 +111,44 @@ def test_deep_tick_exception_is_caught_and_logged_not_propagated(tmp_path, monke
               and e.get("event") == "janitor.deep_tick_error"]
     assert len(errors) == 1
     assert "simulated janitor deep sweep failure" in errors[0]["error"]
+
+
+def test_deep_sweep_request_too_large_drops_the_stub_and_goes_on(tmp_path, monkeypatch):
+    """An oversized request gets the same answer every sweep: log it, stop
+    asking, and carry on with the other stubs instead of stopping the sweep."""
+    from alfred.core.local_llm import LocalLLMRequestTooLarge
+
+    daemon = _make_daemon(tmp_path)
+    vault_path = daemon.cfg.vault_path
+    (vault_path / "note").mkdir()
+    for name in ("a", "b"):
+        (vault_path / "note" / f"{name}.md").write_text(
+            f"---\ntype: note\ncreated: '2026-01-01'\n---\nStub {name}.\n", encoding="utf-8"
+        )
+        daemon.state.state.files[f"note/{name}.md"] = FileState(
+            md5=name, open_issues=[IssueCode.STUB_RECORD.value]
+        )
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("alfred.daemons.janitor.asyncio.sleep", _no_sleep)
+    calls: list[str] = []
+
+    def _complete(system, prompt, **kw):
+        calls.append(prompt)
+        if "note/a.md" in prompt:
+            raise LocalLLMRequestTooLarge("finish_reason=length")
+        return "An enriched body for b, long enough to be written to the vault."
+
+    monkeypatch.setattr("alfred.daemons.janitor.complete", _complete)
+
+    with capture_logs() as logs:
+        asyncio.run(daemon._deep_sweep())
+
+    assert len(calls) == 2
+    files = daemon.state.state.files
+    assert IssueCode.STUB_RECORD.value not in files["note/a.md"].open_issues
+    assert IssueCode.STUB_RECORD.value not in files["note/b.md"].open_issues
+    assert "enriched body for b" in vault_read(vault_path, "note/b.md")["body"]
+    assert [e for e in logs if e.get("event") == "janitor.request_too_large"]

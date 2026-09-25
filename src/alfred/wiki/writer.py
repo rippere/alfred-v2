@@ -112,14 +112,16 @@ class WikiWriter:
         )
 
         try:
-            from alfred.core.local_llm import LocalLLMUnavailable, complete_json
+            from alfred.core.local_llm import LocalLLMRequestTooLarge, LocalLLMUnavailable, complete_json
             data = complete_json(
                 "You extract structured facts about an entity from source documents.",
                 prompt,
-                base_url=self.cfg.ollama_base_url,
-                model=self.cfg.ollama_llm_model,
+                **self.cfg.llm,
                 max_tokens=512,
             )
+        except LocalLLMRequestTooLarge as e:
+            log.warning("wiki.enrich_request_too_large", entity=entity_name, error=str(e))
+            return False
         except LocalLLMUnavailable as e:
             # Returning False leaves the page unenriched and its sources still
             # pending, so the next pass retries. Distinct log event from a

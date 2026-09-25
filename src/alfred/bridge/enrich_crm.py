@@ -41,6 +41,7 @@ from alfred.bridge import config as C
 from alfred.bridge.brief import synthesize_entity_brief
 from alfred.bridge.notes import post_note
 from alfred.bridge.resolve import resolve_contact_to_entity
+from alfred.config import LocalOnlyViolation
 from alfred.ledger.push import _AuthError, _authenticate, ensure_env_scaffold
 
 log = structlog.get_logger()
@@ -129,6 +130,13 @@ def run_enrich(
     GET is made, returning an all-zero (or errors=1) summary rather than a
     partial/garbled run.
     """
+    if getattr(cfg, "local_only", False):
+        # Briefs are written by Anthropic over this vault's retrieved context.
+        # A local-only vault (the employment vault) never sends text off-box.
+        raise LocalOnlyViolation(
+            f"alfred bridge sends vault context to Anthropic; {cfg.vault_path} is local-only"
+        )
+
     summary = EnrichSummary()
 
     ensure_env_scaffold()

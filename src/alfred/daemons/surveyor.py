@@ -26,6 +26,13 @@ WATCH_INTERVAL = 60.0      # seconds between filesystem polls
 STATE_SAVE_EVERY = 25
 
 
+def _chunk_rank(chunk_id: str) -> tuple[int, str]:
+    """Sort key for a chunk id ("<rel_path>::chunk_NN"): chunk number first."""
+    suffix = chunk_id.rsplit("::", 1)[-1]
+    digits = "".join(ch for ch in suffix if ch.isdigit())
+    return (int(digits) if digits else 0, suffix)
+
+
 class SurveyorDaemon(BaseDaemon):
     name = "surveyor"
 
@@ -38,7 +45,11 @@ class SurveyorDaemon(BaseDaemon):
     def _get_embedder(self):
         if self._embedder is None:
             from alfred.embed.ollama import OllamaEmbedder
-            self._embedder = OllamaEmbedder(self.cfg.ollama_base_url, self.cfg.ollama_embed_model)
+            self._embedder = OllamaEmbedder(
+                self.cfg.embed_base_url,
+                self.cfg.ollama_embed_model,
+                local_only=getattr(self.cfg, "local_only", False),
+            )
         return self._embedder
 
     def _get_bm25(self):
@@ -310,14 +321,22 @@ class SurveyorDaemon(BaseDaemon):
             if not rows:
                 return None
 
-            seen: dict[str, list[float]] = {}
+            # One vector per file — its lowest-numbered chunk — in path order,
+            # never in the store's row order. HDBSCAN's output depends on input
+            # order: the neuro vault's own vectors, shuffled, came back with 13
+            # of 30 clusters intact and nearly every key renumbered (measured
+            # 2026-09-24). Re-embeds rewrite rows, so the order drifted between
+            # passes and the consolidator saw "changed" membership, and paid an
+            # LLM call to relabel it, for clusters nobody had touched.
+            seen: dict[str, tuple[tuple[int, str], list[float]]] = {}
             for r in rows:
                 rel_path = r["id"].rsplit("::", 1)[0]
-                if rel_path not in seen:
-                    seen[rel_path] = r["embedding"]
+                rank = _chunk_rank(r["id"])
+                if rel_path not in seen or rank < seen[rel_path][0]:
+                    seen[rel_path] = (rank, r["embedding"])
 
-            paths = list(seen.keys())
-            vectors = np.array(list(seen.values()), dtype=np.float32)
+            paths = sorted(seen)
+            vectors = np.array([seen[p][1] for p in paths], dtype=np.float32)
 
             if len(paths) < min_cluster_size:
                 return None
@@ -360,14 +379,19 @@ class SurveyorDaemon(BaseDaemon):
         for cid, members in cluster_members.items():
             key = f"semantic_{cid}"
             existing = state.clusters.get(key)
-            state.clusters[key] = ClusterState(
-                cluster_id=cid,
-                cluster_type="semantic",
-                label=existing.label if existing else [],
-                member_files=members,
-                last_labeled=existing.last_labeled if existing else "",
-                consolidated_chunk_id=existing.consolidated_chunk_id if existing else "",
-            )
+            if existing is None:
+                state.clusters[key] = ClusterState(
+                    cluster_id=cid,
+                    cluster_type="semantic",
+                    member_files=members,
+                )
+            else:
+                # In place: the label/synthesis bookkeeping rides along, and a
+                # consolidator pass holding this object keeps writing to the
+                # one that gets saved.
+                existing.cluster_id = cid
+                existing.cluster_type = "semantic"
+                existing.member_files = members
 
         try:
             from alfred.store.graph import GraphStore

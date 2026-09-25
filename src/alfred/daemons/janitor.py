@@ -22,7 +22,7 @@ import frontmatter
 import structlog
 
 from alfred.core.failures import record_failure
-from alfred.core.local_llm import LocalLLMUnavailable, complete
+from alfred.core.local_llm import LocalLLMRequestTooLarge, LocalLLMUnavailable, complete
 from alfred.core.schema import (
     DIRECTORY_TO_TYPE, KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS, STATUS_BY_TYPE,
@@ -404,6 +404,11 @@ class JanitorDaemon(BaseDaemon):
                 fs.open_issues = [c for c in fs.open_issues if c != IssueCode.STUB_RECORD.value]
                 enriched += 1
                 await asyncio.sleep(1.0)   # gentle rate limiting
+            except LocalLLMRequestTooLarge as e:
+                # The same stub gets the same answer next sweep: drop the issue
+                # instead of paying for it every four hours.
+                self.log.warning("janitor.request_too_large", path=rel_path, error=str(e))
+                fs.open_issues = [c for c in fs.open_issues if c != IssueCode.STUB_RECORD.value]
             except LocalLLMUnavailable as e:
                 # Stop rather than retry a dead backend per stub. The STUB_RECORD
                 # issue is only cleared on a successful enrichment, so everything
@@ -455,8 +460,7 @@ class JanitorDaemon(BaseDaemon):
             return complete(
                 "You are a careful editor enriching a knowledge-vault record.",
                 prompt,
-                base_url=self.cfg.ollama_base_url,
-                model=self.cfg.ollama_llm_model,
+                **self.cfg.llm,
                 max_tokens=512,
             )
 

@@ -19,6 +19,10 @@ from alfred.config import AlfredConfig, _deep_merge
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# The fleet's local model since 031c0e1 (was mistral:latest): the dataclass
+# default and config-base.yaml's ollama.llm_model.
+QWEN_27B = "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M"
+
 BASE = """\
 ollama:
   llm_model: base-model:latest
@@ -56,7 +60,7 @@ def test_vault_file_wins_and_base_fills_gaps(tmp_path):
     assert cfg.janitor_sweep_interval_s == 22222
     # Base wins over dataclass default (default is 24, base sets it too — use
     # sweep partner key deep_interval_h which only base sets vs default 24;
-    # llm_model is the unambiguous one: default "mistral:latest")
+    # llm_model is the unambiguous one: default is the Qwen3.8 27B)
     assert cfg.ollama_llm_model == "base-model:latest"
     assert cfg.default_top_k == 8
     # Dataclass default survives where neither file sets a key
@@ -71,7 +75,7 @@ def test_lists_replaced_wholesale_not_concatenated(tmp_path):
 def test_missing_base_is_harmless(tmp_path):
     cfg = AlfredConfig.load(_write(tmp_path, None))
     assert cfg.janitor_sweep_interval_s == 22222
-    assert cfg.ollama_llm_model == "mistral:latest"  # dataclass default
+    assert cfg.ollama_llm_model == QWEN_27B  # dataclass default
 
 
 def test_deep_merge_does_not_mutate_inputs():
@@ -194,9 +198,9 @@ def test_real_config_loads_with_expected_effective_values(config_name):
 
     # Fleet-wide invariants every vault must inherit (base or dataclass default)
     assert cfg.vector_store == "lancedb"
-    assert cfg.distiller_mode == "scheduled"          # from config-base.yaml
+    assert cfg.distiller_mode == "on_demand"          # from config-base.yaml: ramp gated
     assert cfg.janitor_dedup_enabled is False         # gated until dry-run tested
-    assert cfg.ollama_llm_model == "mistral:latest"
+    assert cfg.ollama_llm_model == QWEN_27B
     assert cfg.ollama_embed_model == "nomic-embed-text"
     # No cloud model fields: synthesis and every daemon call use ollama_llm_model.
     assert not hasattr(cfg, "anthropic_model")

@@ -11,8 +11,9 @@ from pathlib import Path
 import frontmatter
 import structlog
 
-from alfred.core.local_llm import LocalLLMUnavailable, complete
-from alfred.core.provenance import is_daemon_generated
+from alfred.core.failures import record_failure
+from alfred.core.local_llm import LocalLLMRequestTooLarge, LocalLLMUnavailable, complete
+from alfred.core.provenance import has_twin_provenance, is_daemon_generated
 from alfred.core.vault_ops import VaultError, vault_append_to_topic, vault_read
 from alfred.daemons.base import BaseDaemon
 
@@ -91,15 +92,16 @@ _EXTRACT_SYSTEM = """\
 You are a personal knowledge distiller. Read vault records and extract the most \
 reusable, transferable insights or lessons — things worth remembering and reviewing later.
 
-Output a JSON array of learning objects (max 3). Each object must have:
+Output a JSON object with one key, "items", holding a list of learning objects (max 3). \
+Each learning object must have:
   "title": short descriptive slug (3-6 words, lowercase, hyphens)
   "body": 2-3 sentences capturing the insight or lesson
   "tags": list of 1-3 topic tags
 
 If there is nothing worth extracting (the record is purely factual/reference with no lessons), \
-output an empty JSON array: []
+output: {"items": []}
 
-Respond with only the JSON array. No prose."""
+Respond with only the JSON object. No prose."""
 
 _EXTRACT_USER_TEMPLATE = """\
 Record type: {rec_type}
@@ -156,41 +158,70 @@ class DistillerDaemon(BaseDaemon):
         now_iso = datetime.now(timezone.utc).isoformat()
         distilled_count = 0
         learn_count = 0
+        deferred = False
         self.failed_appends_this_tick = 0
 
-        for rel_path, fs in list(state.files.items()):
-            if is_daemon_generated(rel_path, generated_by=fs.__dict__.get("generated_by")):
-                continue  # daemon output — never re-distill
-            if _is_stale(fs.last_distilled):
-                try:
-                    created = await self._distill_file(vault_path, rel_path)
-                    fs.last_distilled = now_iso
-                    learn_count += created
-                    distilled_count += 1
-                    if distilled_count % 50 == 0:
-                        await self.save_state()
-                        self.log.debug("distiller.incremental_save", files=distilled_count)
-                    await asyncio.sleep(1.5)
-                except LocalLLMUnavailable as e:
-                    # Stop the sweep instead of retrying a dead backend once per
-                    # file. last_distilled is only stamped on success (line
-                    # above), so everything not yet reached stays stale and the
-                    # next sweep resumes from here.
-                    self.log.warning(
-                        "distiller.backend_unavailable",
-                        error=str(e),
-                        deferred_from=rel_path,
-                        distilled_before_stop=distilled_count,
-                    )
-                    break
-                except Exception as e:
-                    self.log.warning("distiller.file_error", path=rel_path, error=str(e))
+        stale = [
+            (rel_path, fs)
+            for rel_path, fs in list(state.files.items())
+            # daemon output — never re-distill
+            if not is_daemon_generated(rel_path, generated_by=fs.__dict__.get("generated_by"))
+            and _is_stale(fs.last_distilled)
+        ]
+        # Never-distilled first, then the oldest stamp. With a cap, dict order
+        # would take the same leading files again each time they went stale
+        # and never reach the rest of the vault.
+        stale.sort(key=lambda item: item[1].last_distilled or "")
+        cap = max(1, int(getattr(self.cfg, "distiller_max_files_per_sweep", 200)))
+        batch = stale[:cap]
+        if len(stale) > cap:
+            # Up to 3 topic appends per file, so an uncapped first sweep over
+            # the main vault's ~15K unstamped files would be ~45K writes in
+            # one night. The rest waits for the next sweeps, oldest first.
+            self.log.info("distiller.sweep_capped", cap=cap, stale=len(stale))
 
-        if distilled_count:
+        for rel_path, fs in batch:
+            try:
+                created = await self._distill_file(vault_path, rel_path)
+                fs.last_distilled = now_iso
+                learn_count += created
+                distilled_count += 1
+                if distilled_count % 50 == 0:
+                    await self.save_state()
+                    self.log.debug("distiller.incremental_save", files=distilled_count)
+                await asyncio.sleep(1.5)
+            except LocalLLMRequestTooLarge as e:
+                # Retrying sends the same request, so stamp it like a file
+                # with nothing to distill: it comes back when it goes stale.
+                self.log.warning("distiller.request_too_large", path=rel_path, error=str(e))
+                fs.last_distilled = now_iso
+            except LocalLLMUnavailable as e:
+                # Stop the sweep instead of retrying a dead backend once per
+                # file. last_distilled is only stamped on success (line
+                # above), so everything not yet reached stays stale and the
+                # next sweep resumes from here.
+                self.log.warning(
+                    "distiller.backend_unavailable",
+                    error=str(e),
+                    deferred_from=rel_path,
+                    distilled_before_stop=distilled_count,
+                )
+                deferred = True
+                break
+            except Exception as e:
+                self.log.warning("distiller.file_error", path=rel_path, error=str(e))
+
+        # Every finished sweep is a run, including one that found nothing
+        # stale — runner.py's startup catch-up reads the last entry, and a
+        # quiet vault must not look overdue. A sweep that hit a dead backend
+        # before doing anything is not a run, so the catch-up retries it.
+        stale_remaining = sum(1 for _, fs in stale if _is_stale(fs.last_distilled))
+        if distilled_count or not deferred:
             state.distiller_runs.append({
                 "timestamp": now_iso,
                 "files_scanned": distilled_count,
                 "learn_records_created": learn_count,
+                "stale_remaining": stale_remaining,
             })
             if len(state.distiller_runs) > 30:
                 state.distiller_runs = state.distiller_runs[-30:]
@@ -199,6 +230,7 @@ class DistillerDaemon(BaseDaemon):
                 files=distilled_count,
                 learned=learn_count,
                 failed_appends=self.failed_appends_this_tick,
+                stale_remaining=stale_remaining,
             )
             await self.save_state()
 
@@ -217,6 +249,15 @@ class DistillerDaemon(BaseDaemon):
             return 0
         if is_daemon_generated(record_type=rec_type, generated_by=fm.get("generated_by")):
             return 0  # daemon output — LLM-generated content must never feed back into distillation
+        if not getattr(self.cfg, "local_only", False) and has_twin_provenance(
+            rel_path, str(fm), body,
+        ):
+            # A record from twin/employment work, in a shared vault. Its
+            # learnings would land in shared topic/ notes, mixing twin-derived
+            # text into files that may one day go to the Spark. Stamped like a
+            # file with nothing to learn, so it doesn't hold a place in the cap.
+            self.log.info("distiller.skip_twin_provenance", path=rel_path)
+            return 0
 
         from datetime import date as _date, datetime as _datetime
 
@@ -242,8 +283,7 @@ class DistillerDaemon(BaseDaemon):
             return complete(
                 _EXTRACT_SYSTEM,
                 user_text,
-                base_url=self.cfg.ollama_base_url,
-                model=self.cfg.ollama_llm_model,
+                **self.cfg.llm,
                 json_mode=True,
                 max_tokens=512,
             )
@@ -255,15 +295,27 @@ class DistillerDaemon(BaseDaemon):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
         try:
-            learnings = json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
             return 0
-        if not isinstance(learnings, list):
+        learnings = _unwrap_items(parsed)
+        if learnings is None:
+            # json_mode constrains the reply to a JSON *object*, so the bare
+            # array the old prompt asked for never came back and every file
+            # scored learned=0 without a trace. Count any shape we still
+            # can't read, so a regression shows up in error_counts.
+            record_failure(
+                "distiller.unexpected_json_shape",
+                path=rel_path,
+                shape=type(parsed).__name__,
+            )
             return 0
 
         state = self.state.state
         created = 0
         for item in learnings[:3]:
+            if not isinstance(item, dict):
+                continue
             title = item.get("title", "")
             body_text = item.get("body", "")
             tags = item.get("tags", [])
@@ -297,6 +349,19 @@ class DistillerDaemon(BaseDaemon):
                 )
 
         return created
+
+
+def _unwrap_items(parsed) -> list | None:
+    """The learnings list from a {"items": [...]} reply, or a bare list.
+
+    None means the reply had neither shape — not "nothing to learn", which is
+    an empty list.
+    """
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        return parsed["items"]
+    if isinstance(parsed, list):
+        return parsed
+    return None
 
 
 def _tag_to_slug(tag: str) -> str:

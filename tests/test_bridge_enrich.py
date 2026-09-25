@@ -260,3 +260,23 @@ def test_run_enrich_auth_failure_reports_error_and_makes_no_deal_calls(monkeypat
     assert summary.errors == 1
     assert summary.deals_seen == 0
     assert summary.decisions == []
+
+
+def test_run_enrich_refuses_a_local_only_vault_before_any_call(monkeypatch):
+    """The bridge writes briefs with Anthropic over retrieved vault context.
+    `alfred bridge enrich --config config-employment.yaml` must not do that."""
+    from alfred.config import LocalOnlyViolation
+
+    _set_all_creds(monkeypatch)
+    crm = _CrmFake()
+    _patch_flow(monkeypatch, crm)
+    synthesized: list = []
+    monkeypatch.setattr(
+        enrich_crm, "synthesize_entity_brief", lambda *a, **kw: synthesized.append(a)
+    )
+
+    cfg = SimpleNamespace(vault_path=Path("/mnt/external/vault-employment"), local_only=True)
+    with pytest.raises(LocalOnlyViolation, match="local-only"):
+        enrich_crm.run_enrich(cfg, object(), dry_run=True)
+
+    assert crm.get_calls == [] and crm.post_calls == [] and synthesized == []

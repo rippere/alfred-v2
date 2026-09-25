@@ -4,13 +4,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import frontmatter
 import structlog
 
-from alfred.core.local_llm import LocalLLMUnavailable, complete_json
+from alfred.core.local_llm import (
+    LocalLLMBadRequest,
+    LocalLLMOutputTruncated,
+    LocalLLMRequestTooLarge,
+    LocalLLMUnavailable,
+    complete_json,
+)
 from alfred.core.schema import KNOWN_TYPES, STATUS_BY_TYPE, TYPE_DIRECTORY, correct_status, correct_type
 from alfred.core.vault_ops import VaultError, vault_create, vault_move
 from alfred.daemons.base import BaseDaemon
@@ -18,6 +25,20 @@ from alfred.daemons.base import BaseDaemon
 log = structlog.get_logger()
 
 WATCH_INTERVAL = 10.0   # poll inbox every 10 seconds
+
+# A classification cut off at max_tokens is retried, never marked done: a
+# sampled answer that ran long once need not again. Back off per file so a
+# persistent one is not re-sent every 10 s: 1 min, doubling, capped at 1 h.
+# In memory only, so a restart retries at once.
+TRUNCATED_RETRY_BASE_S = 60.0
+TRUNCATED_RETRY_MAX_S = 3600.0
+
+# Output budget for one classification. Ollama keeps the 256 it always had,
+# so flag-off requests are byte-for-byte unchanged. The OpenAI path gets
+# headroom: its schema caps every string (below), so a whole reply is a few
+# hundred tokens at most and finish_reason=length should be rare.
+CLASSIFY_MAX_TOKENS_OLLAMA = 256
+CLASSIFY_MAX_TOKENS_OPENAI = 1024
 
 
 _CLASSIFY_SYSTEM = """\
@@ -45,6 +66,34 @@ Note content:
 {content}
 ---"""
 
+# The reply shape _CLASSIFY_SYSTEM asks for, enforced by the server on the
+# OpenAI path (contract §4): `type` can only come back as a known note type,
+# and every free-text field is length-capped, so the longest reply the schema
+# allows (~1.9K chars, ~600 tokens) fits CLASSIFY_MAX_TOKENS_OPENAI.
+#
+# The caps are generous on purpose, well past "1-2 sentences". Measured on the
+# Spark's vLLM 0.11 (2026-09-24, synthetic prompt): a string that reaches its
+# maxLength is cut, but the grammar then allows any whitespace before the
+# next token, and a model that wanted to keep writing pads tabs and newlines
+# until max_tokens (finish_reason=length). Per-request whitespace controls
+# are ignored there. A tight cap would turn a verbose answer into a truncated
+# one; these only stop a runaway string, and the curator retries that later.
+_CLASSIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": sorted(KNOWN_TYPES)},
+        "name": {"type": "string", "maxLength": 200},
+        "status": {"type": "string", "maxLength": 60},
+        "tags": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 60},
+            "maxItems": 10,
+        },
+        "summary": {"type": "string", "maxLength": 1000},
+    },
+    "required": ["type", "name"],
+}
+
 
 def _json_default(obj):
     if isinstance(obj, (date, datetime)):
@@ -52,8 +101,17 @@ def _json_default(obj):
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
+def _now() -> float:
+    return time.monotonic()
+
+
 class CuratorDaemon(BaseDaemon):
     name = "curator"
+
+    def __init__(self, cfg, state, events) -> None:
+        super().__init__(cfg, state, events)
+        # process_key -> (truncated attempts so far, _now() to retry after)
+        self._truncated_retry: dict[str, tuple[int, float]] = {}
 
     async def run(self) -> None:
         self.log.info("curator.start")
@@ -97,19 +155,47 @@ class CuratorDaemon(BaseDaemon):
             process_key = f"{rel_str}#{content_hash}"
             if process_key in state.curator_processed:
                 continue
+            retry = self._truncated_retry.get(process_key)
+            if retry is not None and _now() < retry[1]:
+                continue  # its classification ran long; waiting out the backoff
             if rel_str in state.curator_processed:
                 self.log.warning("curator.redrop_detected", path=rel_str)
             try:
                 ingested = await self._ingest_file(md_file, processed_dir, content_hash)
+                self._truncated_retry.pop(process_key, None)
                 if ingested:
                     state.curator_processed[process_key] = datetime.now(timezone.utc).isoformat()
+            except LocalLLMOutputTruncated as e:
+                # The answer hit max_tokens. Unlike an oversized prompt, the
+                # next sample may fit, so it is NOT marked processed: it stays
+                # in inbox/ and is retried after a backoff. The rest of the
+                # inbox goes on.
+                attempts = (retry[0] if retry else 0) + 1
+                delay = min(TRUNCATED_RETRY_MAX_S, TRUNCATED_RETRY_BASE_S * 2 ** (attempts - 1))
+                self._truncated_retry[process_key] = (attempts, _now() + delay)
+                self.log.warning(
+                    "curator.classify_truncated",
+                    path=rel_str,
+                    attempts=attempts,
+                    retry_in_s=delay,
+                    error=str(e),
+                )
+            except LocalLLMRequestTooLarge as e:
+                # The same file gets the same answer every 10 s. Mark it done so
+                # it is retried only when its content changes; it stays in
+                # inbox/, unclassified, for a person to look at.
+                self.log.warning("curator.request_too_large", path=rel_str, error=str(e))
+                state.curator_processed[process_key] = datetime.now(timezone.utc).isoformat()
             except LocalLLMUnavailable as e:
                 # Abandon the whole tick, not just this file. The backend is down
                 # for everyone, so continuing would retry it once per inbox entry
                 # and bury the one fact that matters under N identical errors.
                 # Nothing is marked processed, so the next tick picks up where
-                # this one stopped.
-                self.log.warning(
+                # this one stopped. A LocalLLMBadRequest (a 400 that is not
+                # about size: a rejected schema, say) is the setup's fault and
+                # would fail every file alike, so it lands here too, at error.
+                report = self.log.error if isinstance(e, LocalLLMBadRequest) else self.log.warning
+                report(
                     "curator.backend_unavailable",
                     error=str(e),
                     deferred_from=rel_str,
@@ -264,18 +350,27 @@ class CuratorDaemon(BaseDaemon):
 
         Raises LocalLLMUnavailable when the backend is unreachable. That is not
         a classification outcome and must not be flattened into None: the caller
-        leaves the file in inbox/ and retries on the next tick.
+        leaves the file in inbox/ and retries on the next tick (so does
+        LocalLLMBadRequest, its subclass). Raises LocalLLMOutputTruncated when
+        the answer hit max_tokens; the caller retries that file after a
+        backoff. Raises LocalLLMRequestTooLarge when the prompt itself is over
+        the window and retrying cannot help; the caller skips it.
         """
         system_text = _CLASSIFY_SYSTEM.format(types=", ".join(sorted(KNOWN_TYPES)))
         user_text = _CLASSIFY_USER_TEMPLATE.format(content=content[:3000])
+
+        llm = self.cfg.llm
+        openai = llm["api"] == "openai"
 
         def _call() -> dict:
             return complete_json(
                 system_text,
                 user_text,
-                base_url=self.cfg.ollama_base_url,
-                model=self.cfg.ollama_llm_model,
-                max_tokens=256,
+                **llm,
+                # Ollama keeps plain format=json and its 256, so flag-off
+                # requests are unchanged.
+                schema=_CLASSIFY_SCHEMA if openai else None,
+                max_tokens=CLASSIFY_MAX_TOKENS_OPENAI if openai else CLASSIFY_MAX_TOKENS_OLLAMA,
             )
 
         # LocalLLMUnavailable intentionally not caught — see docstring.
