@@ -132,12 +132,24 @@ def test_misspelled_api_fails_the_load(tmp_path):
         AlfredConfig.load(_write(tmp_path, {"llm": {"api": "OpenAI"}}, {}))
 
 
-def test_employment_stays_local_when_the_fleet_flips(tmp_path, monkeypatch):
+@pytest.mark.parametrize("flip", [
+    pytest.param(
+        {"api": "openai", "api_key_env": "SPARK_API_KEY"},
+        id="base-sets-api-only",
+    ),
+    # Someone writes the Spark URL and model into the base instead of the env.
+    pytest.param(
+        {"api": "openai", "base_url": "https://spark.test:8000/v1",
+         "model": "qwen3-30b", "api_key_env": "SPARK_API_KEY"},
+        id="base-also-sets-url-and-model",
+    ),
+])
+def test_employment_stays_local_when_the_fleet_flips(tmp_path, monkeypatch, flip):
     """The Betson carve-out: config-base.yaml says openai, the employment vault
-    still resolves to the local Ollama — URL and model both."""
+    still resolves to the local Ollama — URL and model both, even when the base
+    names a model that Ollama doesn't have."""
     monkeypatch.setenv("SPARK_BASE_URL", "https://spark.test:8000/v1")
     monkeypatch.setenv("SPARK_MODEL", "qwen3-30b")
-    flip = {"api": "openai", "api_key_env": "SPARK_API_KEY"}
 
     employment = AlfredConfig.load(_copy_real(tmp_path, "config-employment.yaml", flip))
     personal = AlfredConfig.load(_copy_real(tmp_path, "config-personal.yaml", flip))

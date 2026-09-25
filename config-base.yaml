@@ -31,8 +31,8 @@ ollama:
 #                first, then ~/.config/spark/env); the key comes from the
 #                variable api_key_env names.
 # To move the fleet, set only `api: openai` here and leave base_url/model to
-# the env: config-employment.yaml pins api and base_url but inherits model, so
-# a model set here would reach its local Ollama as a name Ollama doesn't have.
+# the env. config-employment.yaml pins api and base_url and blanks model, so
+# nothing set here moves the employment vault off its local Ollama.
 llm:
   api: ollama
   api_key_env: SPARK_API_KEY
