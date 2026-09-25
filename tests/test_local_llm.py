@@ -20,6 +20,8 @@ import pytest
 from alfred.config import AlfredConfig
 from alfred.core import local_llm
 from alfred.core.local_llm import (
+    LocalLLMBadRequest,
+    LocalLLMOutputTruncated,
     LocalLLMRequestTooLarge,
     LocalLLMUnavailable,
     complete,
@@ -320,8 +322,80 @@ def test_openai_400_is_not_a_kind_of_unavailable():
 
 
 def test_openai_truncated_answer_raises_request_too_large(monkeypatch):
-    """Contract §2: finish_reason must be "stop"; never ship half an answer."""
+    """Contract §2: finish_reason must be "stop"; never ship half an answer.
+    It is the OutputTruncated kind of RequestTooLarge, so the curator can
+    retry it later while every other caller keeps skipping it."""
     _fake_openai_server(monkeypatch, lambda r: _chat_response('{"items": [', finish_reason="length"))
 
-    with pytest.raises(LocalLLMRequestTooLarge, match="max_tokens=64"):
+    with pytest.raises(LocalLLMOutputTruncated, match="max_tokens=64"):
         complete_json("s", "u", api="openai", base_url=SPARK, model="m", max_tokens=64)
+    assert issubclass(LocalLLMOutputTruncated, LocalLLMRequestTooLarge)
+
+
+@pytest.mark.parametrize("reason", [
+    (
+        "This model's maximum context length is 32768 tokens. However, you requested "
+        "40014 tokens (38002 in the messages, 2012 in the completion)."
+    ),
+    (
+        "'max_tokens' or 'max_completion_tokens' is too large: 2048. This model's maximum "
+        "context length is 32768 tokens and your request has 31000 input tokens."
+    ),
+    "The prompt (40014 tokens) is longer than the model's context length (32768).",
+    "Input prompt (40014 tokens) is too long and exceeds limit of 32768",
+    "Request exceeds max_model_len 32768",
+], ids=["vllm-classic", "vllm-max-tokens", "prompt-longer", "input-too-long", "max-model-len"])
+def test_openai_context_length_400_is_request_too_large(monkeypatch, reason):
+    _fake_openai_server(
+        monkeypatch,
+        lambda r: httpx.Response(400, json={"error": {"message": reason, "code": 400}}),
+    )
+
+    with pytest.raises(LocalLLMRequestTooLarge) as info:
+        complete("s", "u", api="openai", base_url=SPARK, model="m")
+    assert not isinstance(info.value, LocalLLMUnavailable)
+    assert not isinstance(info.value, LocalLLMOutputTruncated)
+
+
+def test_openai_context_length_error_code_alone_is_request_too_large(monkeypatch):
+    """OpenAI's own shape: the code says it, the message may not."""
+    _fake_openai_server(monkeypatch, lambda r: httpx.Response(400, json={"error": {
+        "message": "Please reduce the length of the messages.", "code": "context_length_exceeded",
+    }}))
+
+    with pytest.raises(LocalLLMRequestTooLarge):
+        complete("s", "u", api="openai", base_url=SPARK, model="m")
+
+
+@pytest.mark.parametrize("reason", [
+    "The provided JSON schema contains features not supported by xgrammar.",
+    "Invalid JSON schema: maxLength is not supported",
+    "chat_template_kwargs is not a valid argument",
+    "response_format.type must be one of json_object, json_schema, text",
+    "[{'type': 'missing', 'loc': ('body', 'messages'), 'msg': 'Field required'}]",
+], ids=["xgrammar", "maxLength", "template-kwargs", "response-format", "validation"])
+def test_openai_other_400_is_a_loud_retry_later(monkeypatch, reason):
+    """A 400 caused by the setup (a rejected schema, kwarg or format) would
+    fail every input alike. Reading it as "too large" made callers mark each
+    input done: the whole inbox silently skipped. It must be a retry-later
+    (a LocalLLMUnavailable), logged at error and counted."""
+    from structlog.testing import capture_logs
+
+    from alfred.core.failures import drain_failures
+
+    _fake_openai_server(
+        monkeypatch,
+        lambda r: httpx.Response(400, json={"error": {"message": reason, "code": 400}}),
+    )
+    drain_failures()
+
+    with capture_logs() as logs, pytest.raises(LocalLLMBadRequest) as info:
+        complete("s", "u", api="openai", base_url=SPARK, model="m", schema={"type": "object"})
+
+    assert isinstance(info.value, LocalLLMUnavailable)
+    assert not isinstance(info.value, LocalLLMRequestTooLarge)
+    (event,) = [e for e in logs if e.get("event") == "local_llm.bad_request"
+                and e.get("log_level") == "error"]
+    assert event["response_format"] == "json_schema"
+    assert reason in event["error"]
+    assert drain_failures().get("local_llm.bad_request") == 1

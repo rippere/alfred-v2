@@ -454,3 +454,27 @@ def test_real_base_config_caps_the_distiller_at_200():
     cfg = AlfredConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
     assert cfg.distiller_mode == "scheduled"
     assert cfg.distiller_max_files_per_sweep == 200
+
+
+def test_bad_request_stops_the_sweep_and_stamps_nothing(tmp_path, monkeypatch):
+    """A 400 that is not about size is the setup's fault: retry later, like a
+    down backend. Stamping would skip the file for 30 days."""
+    from alfred.core.local_llm import LocalLLMBadRequest
+
+    daemon = _make_daemon(tmp_path)
+    _stub_vault(monkeypatch)
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _no_sleep)
+    calls: list[str] = []
+
+    def _rejected(system, user, **kw):
+        calls.append(user)
+        raise LocalLLMBadRequest("400: json_object not supported")
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _rejected)
+    _stale_files(daemon, ["a.md", "b.md"])
+
+    asyncio.run(daemon.tick())
+
+    assert len(calls) == 1
+    assert not any(fs.last_distilled for fs in daemon.state.state.files.values())
+    assert daemon.state.state.distiller_runs == []

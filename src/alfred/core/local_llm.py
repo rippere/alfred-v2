@@ -26,8 +26,12 @@ import json as _json
 import re
 
 import httpx
+import structlog
 
 from alfred.config import spark_env
+from alfred.core.failures import record_failure
+
+log = structlog.get_logger()
 
 
 class LocalLLMUnavailable(RuntimeError):
@@ -39,18 +43,62 @@ class LocalLLMUnavailable(RuntimeError):
     """
 
 
+class LocalLLMBadRequest(LocalLLMUnavailable):
+    """The OpenAI-compatible server answered 400 for a reason other than size.
+
+    A rejected response_format or json_schema, an unsupported
+    chat_template_kwargs, a malformed request: the setup is at fault, not this
+    input, so it would fail for every input alike. It IS a LocalLLMUnavailable,
+    so every caller treats it as "retry later": nothing is marked processed,
+    stamped or dropped. It is also logged at error level and counted in
+    error_counts (local_llm.bad_request) when raised, so a fleet stalled on it
+    is loud. Before this, every 400 was LocalLLMRequestTooLarge, and a setup
+    mistake would have silently skipped the whole inbox.
+    """
+
+
 class LocalLLMRequestTooLarge(RuntimeError):
     """The backend refused or cut this request because of its size.
 
-    HTTP 400 from the OpenAI-compatible path, which is what vLLM answers when
-    the prompt plus max_tokens is over the window (Ollama silently truncated
-    instead); the server's message is kept. Also finish_reason "length": the
-    answer ran out of max_tokens and is incomplete.
+    HTTP 400 from the OpenAI-compatible path when the server says the prompt
+    plus max_tokens is over the context window, which is what vLLM answers
+    (Ollama silently truncated instead); the server's message is kept. Other
+    400s are LocalLLMBadRequest. finish_reason "length" is the subclass
+    LocalLLMOutputTruncated.
 
     Deliberately NOT a LocalLLMUnavailable. Sending the same request again gets
     the same answer, so a caller that deferred on it would defer forever.
     Callers skip the item (or shrink it and try once more) and log it.
     """
+
+
+class LocalLLMOutputTruncated(LocalLLMRequestTooLarge):
+    """finish_reason "length": the answer ran out of max_tokens and is cut off.
+
+    A LocalLLMRequestTooLarge, so callers that skip on that keep doing so. A
+    caller whose answer is short and bounded (the curator's classification)
+    can tell it apart: a sampled answer that ran long once need not run long
+    again, so it retries later instead of skipping the input for good.
+    """
+
+
+# What vLLM (and OpenAI) say when prompt + max_tokens is over the window:
+#   "This model's maximum context length is 32768 tokens. However, you requested ..."
+#   "'max_tokens' ... is too large: ... This model's maximum context length is ..."
+#   "The prompt (40014 tokens) is longer than the model's context length ..."
+#   "Input prompt (N tokens) is too long and exceeds limit of M" / max_model_len
+#   code "context_length_exceeded"
+# Deliberately narrow: a schema complaint about a `maxLength` keyword must not
+# read as "too large", or it would skip every input for good.
+_CONTEXT_LENGTH_RE = re.compile(
+    r"maximum context length|context[ _]length|max_model_len"
+    r"|\b(?:prompt|input)\b[^.]{0,60}\btoo long",
+    re.IGNORECASE,
+)
+
+
+def _is_context_length_error(e) -> bool:
+    return bool(_CONTEXT_LENGTH_RE.search(f"{getattr(e, 'message', '')} {getattr(e, 'body', '')}"))
 
 
 # Qwen3 reasons inside <think> and vLLM has no reasoning parser configured, so
@@ -83,9 +131,10 @@ def complete(
     old /api/generate calls did.
 
     Raises LocalLLMUnavailable on any transport error, any non-2xx status
-    (bar the OpenAI path's 400), or a malformed response body, and
-    LocalLLMRequestTooLarge as described there. Never returns "" to signal
-    failure.
+    (bar the OpenAI path's context-length 400), or a malformed response body;
+    LocalLLMBadRequest (a LocalLLMUnavailable) on any other OpenAI-path 400;
+    and LocalLLMRequestTooLarge / LocalLLMOutputTruncated as described there.
+    Never returns "" to signal failure.
     """
     messages = [{"role": "user", "content": user}]
     if system:
@@ -179,8 +228,22 @@ def _complete_openai(
         with _openai_client(base_url, api_key, timeout) as client:
             resp = client.chat.completions.create(**request)
     except openai.BadRequestError as e:
-        raise LocalLLMRequestTooLarge(
-            f"{base_url} rejected the request for model {model!r} (400): {e.message}"
+        if _is_context_length_error(e):
+            raise LocalLLMRequestTooLarge(
+                f"{base_url} rejected the request for model {model!r} (400): {e.message}"
+            ) from e
+        # Not about size, so not this input's fault: retry later, loudly.
+        log.error(
+            "local_llm.bad_request",
+            base_url=base_url,
+            model=model,
+            response_format=(request.get("response_format") or {}).get("type"),
+            error=e.message,
+        )
+        record_failure("local_llm.bad_request")
+        raise LocalLLMBadRequest(
+            f"{base_url} rejected the request for model {model!r} (400, not a size "
+            f"error; retrying later): {e.message}"
         ) from e
     except openai.APIStatusError as e:
         # 401/403 (key missing or wrong), 404 (model or path), 429, 5xx: the
@@ -203,7 +266,7 @@ def _complete_openai(
         ) from e
 
     if finish_reason == "length":
-        raise LocalLLMRequestTooLarge(
+        raise LocalLLMOutputTruncated(
             f"{base_url}: the answer hit max_tokens={max_tokens} for model {model!r} and is cut off"
         )
     if finish_reason != "stop":
