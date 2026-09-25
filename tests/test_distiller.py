@@ -15,6 +15,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from structlog.testing import capture_logs
 
 from alfred.config import AlfredConfig
@@ -452,8 +453,131 @@ def test_default_cap_is_200_and_config_sets_it(tmp_path):
 
 def test_real_base_config_caps_the_distiller_at_200():
     cfg = AlfredConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
-    assert cfg.distiller_mode == "scheduled"
     assert cfg.distiller_max_files_per_sweep == 200
+
+
+REAL_CONFIGS = ("config.yaml", "config-content.yaml", "config-employment.yaml",
+                "config-finance.yaml", "config-neuroscience.yaml", "config-personal.yaml")
+
+
+def test_the_write_ramp_waits_for_an_explicit_flip(tmp_path, monkeypatch):
+    """Deploying this branch must not start the ~75-night topic/ write ramp
+    on its own (Ben's rule d): every real vault is on_demand, so runner.py
+    registers neither the 2am job nor the startup catch-up."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    from alfred.runner import run_daemons
+
+    repo = Path(__file__).resolve().parents[1]
+    for name in REAL_CONFIGS:
+        assert AlfredConfig.load(repo / name).distiller_mode == "on_demand", name
+
+    class _Started(Exception):
+        pass
+
+    class _StubVectorStore:
+        was_recreated = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    captured = {}
+
+    def _fake_start(self, *args, **kwargs):
+        captured["jobs"] = {job.id for job in self.get_jobs()}
+        raise _Started
+
+    monkeypatch.setattr(AsyncIOScheduler, "start", _fake_start)
+    monkeypatch.setattr("alfred.store.lancedb_store.LanceDBStore", _StubVectorStore)
+    (tmp_path / "config-base.yaml").write_text((repo / "config-base.yaml").read_text())
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (tmp_path / "config-x.yaml").write_text(f"vault:\n  path: {vault}\ndata_dir: ./data\n")
+    cfg = AlfredConfig.load(tmp_path / "config-x.yaml")
+
+    with pytest.raises(_Started):
+        asyncio.run(run_daemons(cfg))
+    assert not {j for j in captured["jobs"] if j.startswith("distiller")}
+
+
+# ── Twin provenance stays out of shared topic/ notes ────────────────────────
+
+
+def _one_record(monkeypatch, body: str, frontmatter: dict | None = None) -> None:
+    monkeypatch.setattr(
+        "alfred.daemons.distiller.vault_read",
+        lambda vault_path, rel_path: {
+            "path": rel_path,
+            "frontmatter": frontmatter or {"type": "session"},
+            "body": body,
+        },
+    )
+
+
+def _count_calls(monkeypatch) -> list[str]:
+    calls: list[str] = []
+
+    def _complete(system, user, **kw):
+        calls.append(user)
+        return json.dumps({"items": [{"title": "t", "body": "b", "tags": ["misc"]}]})
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _complete)
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _no_sleep)
+    return calls
+
+
+@pytest.mark.parametrize("body, frontmatter", [
+    ("cwd /mnt/external/Employment/Betson/betson-gameroom-twin\n" + "x" * 300, None),
+    ("worked on the floorplan wizard " + "x" * 300,
+     {"type": "session", "project": "betson-gameroom-twin"}),
+    ("ran the audit in ~/betson-it-review " + "x" * 300, None),
+    ("indexed /mnt/external/vault-employment " + "x" * 300, None),
+])
+def test_twin_provenance_records_are_not_distilled_into_the_main_vault(
+    tmp_path, monkeypatch, body, frontmatter,
+):
+    daemon = _make_daemon(tmp_path)
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    _one_record(monkeypatch, body, frontmatter)
+    calls = _count_calls(monkeypatch)
+    _stale_files(daemon, ["session/twin-work.md"])
+
+    asyncio.run(daemon.tick())
+
+    assert calls == [] and appended == []
+    # Stamped, so it doesn't hold a place at the head of the capped queue.
+    assert daemon.state.state.files["session/twin-work.md"].last_distilled
+
+
+def test_a_note_that_only_mentions_betson_is_distilled(tmp_path, monkeypatch):
+    """Rule (b): the word "Betson" is not provenance."""
+    daemon = _make_daemon(tmp_path)
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    _one_record(monkeypatch, "Lunch with someone from Betson about arcades. " + "x" * 300)
+    calls = _count_calls(monkeypatch)
+    _stale_files(daemon, ["note/lunch.md"])
+
+    asyncio.run(daemon.tick())
+
+    assert len(calls) == 1 and appended == ["t"]
+
+
+def test_the_employment_vault_still_distills_its_own_records(tmp_path, monkeypatch):
+    """Inside the local-only vault, twin text only reaches its own topic/."""
+    daemon = _make_daemon(tmp_path)
+    daemon.cfg.local_only = True
+    monkeypatch.setattr(AlfredConfig, "check_local_only", lambda self: None)
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    _one_record(monkeypatch, "cwd /mnt/external/Employment/Betson/betson-gameroom-twin " + "x" * 300)
+    calls = _count_calls(monkeypatch)
+    _stale_files(daemon, ["session/twin-work.md"])
+
+    asyncio.run(daemon.tick())
+
+    assert len(calls) == 1 and appended == ["t"]
 
 
 def test_bad_request_stops_the_sweep_and_stamps_nothing(tmp_path, monkeypatch):

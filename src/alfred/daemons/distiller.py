@@ -13,7 +13,7 @@ import structlog
 
 from alfred.core.failures import record_failure
 from alfred.core.local_llm import LocalLLMRequestTooLarge, LocalLLMUnavailable, complete
-from alfred.core.provenance import is_daemon_generated
+from alfred.core.provenance import has_twin_provenance, is_daemon_generated
 from alfred.core.vault_ops import VaultError, vault_append_to_topic, vault_read
 from alfred.daemons.base import BaseDaemon
 
@@ -249,6 +249,15 @@ class DistillerDaemon(BaseDaemon):
             return 0
         if is_daemon_generated(record_type=rec_type, generated_by=fm.get("generated_by")):
             return 0  # daemon output — LLM-generated content must never feed back into distillation
+        if not getattr(self.cfg, "local_only", False) and has_twin_provenance(
+            rel_path, str(fm), body,
+        ):
+            # A record from twin/employment work, in a shared vault. Its
+            # learnings would land in shared topic/ notes, mixing twin-derived
+            # text into files that may one day go to the Spark. Stamped like a
+            # file with nothing to learn, so it doesn't hold a place in the cap.
+            self.log.info("distiller.skip_twin_provenance", path=rel_path)
+            return 0
 
         from datetime import date as _date, datetime as _datetime
 

@@ -198,7 +198,7 @@ def test_real_config_loads_with_expected_effective_values(config_name):
 
     # Fleet-wide invariants every vault must inherit (base or dataclass default)
     assert cfg.vector_store == "lancedb"
-    assert cfg.distiller_mode == "scheduled"          # from config-base.yaml
+    assert cfg.distiller_mode == "on_demand"          # from config-base.yaml: ramp gated
     assert cfg.janitor_dedup_enabled is False         # gated until dry-run tested
     assert cfg.ollama_llm_model == QWEN_27B
     assert cfg.ollama_embed_model == "nomic-embed-text"

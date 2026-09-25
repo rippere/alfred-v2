@@ -30,6 +30,35 @@ _RAW_MARKERS: tuple[bytes, ...] = (
 )
 
 
+# Twin/employment provenance (Ben's rule, 2026-09-24): text from work in the
+# twin repo, the IT review or the employment vault stays on benderman. These
+# are the paths and repo names that mark it, matched case-insensitively. The
+# word "Betson" alone is deliberately absent: a note that merely mentions
+# Betson is not proprietary.
+TWIN_PROVENANCE_MARKERS: tuple[str, ...] = (
+    "/mnt/external/employment",
+    "vault-employment",
+    "betson-gameroom-twin",
+    "betson-it-review",
+)
+
+
+def has_twin_provenance(*texts: str | None) -> bool:
+    """True if any text names a twin/employment path or repo.
+
+    The distiller uses it to keep learnings from twin work out of the main
+    vault's shared topic/ notes. A worktree of the twin repo in a neutral
+    directory (~/.cache/fleet-worktrees/<run>/<task>) is only caught when the
+    record also names the repo.
+    """
+    return any(
+        marker in text.lower()
+        for text in texts
+        if text
+        for marker in TWIN_PROVENANCE_MARKERS
+    )
+
+
 def is_daemon_generated(
     rel_path: str | None = None,
     *,

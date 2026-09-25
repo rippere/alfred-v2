@@ -46,7 +46,12 @@ janitor:
   dedup_enabled: false    # disabled until dry-run gate is tested
 
 distiller:
-  mode: scheduled         # scheduled = nightly at 2am | on_demand = explicit trigger only
+  # scheduled = nightly at 2am | on_demand = explicit trigger only.
+  # on_demand until Ben signs off on the write ramp. Before the {items} fix
+  # the distiller wrote nothing; with it, the main vault's ~15K never-distilled
+  # files become up to 600 topic/ appends a night for ~75 nights. Setting
+  # `scheduled` here (or in one vault's file) is that sign-off.
+  mode: on_demand
   # Stale files per sweep, never-distilled and oldest first. Each file can
   # append up to 3 learnings to topic/, so this caps a night's writes at ~600.
   max_files_per_sweep: 200
