@@ -347,7 +347,10 @@ def test_openai_truncated_answer_raises_request_too_large(monkeypatch):
     "The prompt (40014 tokens) is longer than the model's context length (32768).",
     "Input prompt (40014 tokens) is too long and exceeds limit of 32768",
     "Request exceeds max_model_len 32768",
-], ids=["vllm-classic", "vllm-max-tokens", "prompt-longer", "input-too-long", "max-model-len"])
+    # vLLM V1's input processor, without the max_model_len hint it sometimes adds.
+    "The decoder prompt (length 40014) is longer than the maximum model length of 32768.",
+], ids=["vllm-classic", "vllm-max-tokens", "prompt-longer", "input-too-long", "max-model-len",
+        "vllm-v1-decoder-prompt"])
 def test_openai_context_length_400_is_request_too_large(monkeypatch, reason):
     _fake_openai_server(
         monkeypatch,

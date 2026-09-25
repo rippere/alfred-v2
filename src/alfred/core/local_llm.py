@@ -98,11 +98,13 @@ class LocalLLMOutputTruncated(LocalLLMRequestTooLarge):
 #   "'max_tokens' ... is too large: ... This model's maximum context length is ..."
 #   "The prompt (40014 tokens) is longer than the model's context length ..."
 #   "Input prompt (N tokens) is too long and exceeds limit of M" / max_model_len
+#   "The decoder prompt (length N) is longer than the maximum model length of M"
+#     (vLLM V1's input processor)
 #   code "context_length_exceeded"
 # Deliberately narrow: a schema complaint about a `maxLength` keyword must not
 # read as "too large", or it would skip every input for good.
 _CONTEXT_LENGTH_RE = re.compile(
-    r"maximum context length|context[ _]length|max_model_len"
+    r"maximum context length|maximum model length|context[ _]length|max_model_len"
     r"|\b(?:prompt|input)\b[^.]{0,60}\btoo long",
     re.IGNORECASE,
 )
