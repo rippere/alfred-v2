@@ -199,3 +199,113 @@ def test_tick_exception_is_caught_and_logged_not_propagated(tmp_path, monkeypatc
               and e.get("event") == "distiller.tick_error"]
     assert len(errors) == 1
     assert "simulated distiller sweep failure" in errors[0]["error"]
+
+
+def _stub_vault(monkeypatch, appended: list[str] | None = None) -> None:
+    monkeypatch.setattr(
+        "alfred.daemons.distiller.vault_read",
+        lambda vault_path, rel_path: {
+            "path": rel_path,
+            "frontmatter": {"type": "note"},
+            "body": "w" * 300,
+        },
+    )
+
+    def _fake_append_to_topic(vault_path, topic_slug, title, body_text, tags=None, source=None):
+        if appended is not None:
+            appended.append(title)
+        return {"path": f"topic/{topic_slug}.md"}
+
+    monkeypatch.setattr("alfred.daemons.distiller.vault_append_to_topic", _fake_append_to_topic)
+
+
+def test_items_object_reply_is_unwrapped(tmp_path, monkeypatch):
+    """json_mode constrains the reply to a JSON object, so the model answers
+    {"items": [...]} — the old `isinstance(list)` check scored every such
+    reply as learned=0."""
+    daemon = _make_daemon(tmp_path)
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    reply = {"items": [{"title": "wrapped-learning", "body": "insight", "tags": ["misc"]}]}
+    monkeypatch.setattr("alfred.daemons.distiller.complete", lambda *a, **kw: json.dumps(reply))
+
+    created = asyncio.run(daemon._distill_file(daemon.cfg.vault_path, "inbox/note.md"))
+
+    assert created == 1
+    assert appended == ["wrapped-learning"]
+
+
+def test_unreadable_json_shape_is_counted_not_silent(tmp_path, monkeypatch):
+    daemon = _make_daemon(tmp_path)
+    _stub_vault(monkeypatch)
+    reply = {"title": "a-lone-object", "body": "no items key", "tags": []}
+    monkeypatch.setattr("alfred.daemons.distiller.complete", lambda *a, **kw: json.dumps(reply))
+
+    with capture_logs() as logs:
+        created = asyncio.run(daemon._distill_file(daemon.cfg.vault_path, "inbox/note.md"))
+
+    assert created == 0
+    assert [e for e in logs if e.get("event") == "distiller.unexpected_json_shape"]
+
+
+def test_sweep_spanning_another_save_is_recorded_on_disk(tmp_path, monkeypatch):
+    """The live failure: every sweep ran through the 5-min periodic save, so
+    its stamps and run entry landed in a detached copy of the state. After a
+    restart (fresh StateStore) the last run must be this sweep, which is what
+    runner.py's catch-up reads, and no file may be stale again."""
+    from alfred.core.models import FileState
+
+    daemon = _make_daemon(tmp_path)
+    _stub_vault(monkeypatch)
+    reply = {"items": [{"title": "t", "body": "b", "tags": ["misc"]}]}
+    monkeypatch.setattr("alfred.daemons.distiller.complete", lambda *a, **kw: json.dumps(reply))
+    for name in ("a.md", "b.md", "c.md"):
+        daemon.state.state.files[name] = FileState(md5=name)
+    daemon.state.save()
+
+    async def _sleep_while_another_job_saves(_seconds: float) -> None:
+        daemon.state.save()
+
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _sleep_while_another_job_saves)
+
+    asyncio.run(daemon.tick())
+
+    restarted = StateStore(daemon.state.path)
+    restarted.load()
+    runs = restarted.state.distiller_runs
+    assert len(runs) == 1, f"sweep not recorded on disk: {runs!r}"
+    assert runs[0]["files_scanned"] == 3
+    assert runs[0]["learn_records_created"] == 3
+    stale = [p for p, fs in restarted.state.files.items() if not fs.last_distilled]
+    assert not stale, f"last_distilled lost for {stale}"
+
+
+def test_sweep_with_nothing_stale_still_records_a_run(tmp_path):
+    """A quiet vault must not look overdue to the startup catch-up."""
+    daemon = _make_daemon(tmp_path)
+
+    asyncio.run(daemon.tick())
+
+    assert len(daemon.state.state.distiller_runs) == 1
+    assert daemon.state.state.distiller_runs[0]["files_scanned"] == 0
+
+
+def test_sweep_deferred_before_any_progress_records_no_run(tmp_path, monkeypatch):
+    """Backend down on the first file: nothing was done, so the catch-up must
+    still see the vault as overdue and retry after the next start."""
+    from alfred.core.local_llm import LocalLLMUnavailable
+    from alfred.core.models import FileState
+
+    daemon = _make_daemon(tmp_path)
+    _stub_vault(monkeypatch)
+
+    def _down(*a, **kw):
+        raise LocalLLMUnavailable("connection refused")
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _down)
+    daemon.state.state.files["a.md"] = FileState(md5="a")
+
+    asyncio.run(daemon.tick())
+
+    assert daemon.state.state.distiller_runs == []
+    assert not daemon.state.state.files["a.md"].last_distilled

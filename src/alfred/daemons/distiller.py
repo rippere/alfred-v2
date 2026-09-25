@@ -11,6 +11,7 @@ from pathlib import Path
 import frontmatter
 import structlog
 
+from alfred.core.failures import record_failure
 from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import VaultError, vault_append_to_topic, vault_read
@@ -91,15 +92,16 @@ _EXTRACT_SYSTEM = """\
 You are a personal knowledge distiller. Read vault records and extract the most \
 reusable, transferable insights or lessons — things worth remembering and reviewing later.
 
-Output a JSON array of learning objects (max 3). Each object must have:
+Output a JSON object with one key, "items", holding a list of learning objects (max 3). \
+Each learning object must have:
   "title": short descriptive slug (3-6 words, lowercase, hyphens)
   "body": 2-3 sentences capturing the insight or lesson
   "tags": list of 1-3 topic tags
 
 If there is nothing worth extracting (the record is purely factual/reference with no lessons), \
-output an empty JSON array: []
+output: {"items": []}
 
-Respond with only the JSON array. No prose."""
+Respond with only the JSON object. No prose."""
 
 _EXTRACT_USER_TEMPLATE = """\
 Record type: {rec_type}
@@ -156,6 +158,7 @@ class DistillerDaemon(BaseDaemon):
         now_iso = datetime.now(timezone.utc).isoformat()
         distilled_count = 0
         learn_count = 0
+        deferred = False
         self.failed_appends_this_tick = 0
 
         for rel_path, fs in list(state.files.items()):
@@ -182,11 +185,16 @@ class DistillerDaemon(BaseDaemon):
                         deferred_from=rel_path,
                         distilled_before_stop=distilled_count,
                     )
+                    deferred = True
                     break
                 except Exception as e:
                     self.log.warning("distiller.file_error", path=rel_path, error=str(e))
 
-        if distilled_count:
+        # Every finished sweep is a run, including one that found nothing
+        # stale — runner.py's startup catch-up reads the last entry, and a
+        # quiet vault must not look overdue. A sweep that hit a dead backend
+        # before doing anything is not a run, so the catch-up retries it.
+        if distilled_count or not deferred:
             state.distiller_runs.append({
                 "timestamp": now_iso,
                 "files_scanned": distilled_count,
@@ -255,15 +263,27 @@ class DistillerDaemon(BaseDaemon):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
         try:
-            learnings = json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
             return 0
-        if not isinstance(learnings, list):
+        learnings = _unwrap_items(parsed)
+        if learnings is None:
+            # json_mode constrains the reply to a JSON *object*, so the bare
+            # array the old prompt asked for never came back and every file
+            # scored learned=0 without a trace. Count any shape we still
+            # can't read, so a regression shows up in error_counts.
+            record_failure(
+                "distiller.unexpected_json_shape",
+                path=rel_path,
+                shape=type(parsed).__name__,
+            )
             return 0
 
         state = self.state.state
         created = 0
         for item in learnings[:3]:
+            if not isinstance(item, dict):
+                continue
             title = item.get("title", "")
             body_text = item.get("body", "")
             tags = item.get("tags", [])
@@ -297,6 +317,19 @@ class DistillerDaemon(BaseDaemon):
                 )
 
         return created
+
+
+def _unwrap_items(parsed) -> list | None:
+    """The learnings list from a {"items": [...]} reply, or a bare list.
+
+    None means the reply had neither shape — not "nothing to learn", which is
+    an empty list.
+    """
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        return parsed["items"]
+    if isinstance(parsed, list):
+        return parsed
+    return None
 
 
 def _tag_to_slug(tag: str) -> str:
