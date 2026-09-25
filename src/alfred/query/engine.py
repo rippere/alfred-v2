@@ -358,12 +358,18 @@ class QueryEngine:
             # LanceDBStore exposes this via its search() + query_all() API;
             # MilvusStore exposes it via the internal _client.search() call.
             if self.cfg.vector_store == "lancedb":
-                from alfred.store.lancedb_store import LanceDBStore
+                from alfred.store.lancedb_store import (
+                    SEARCH_NPROBES,
+                    SEARCH_REFINE_FACTOR,
+                    LanceDBStore,
+                )
                 assert isinstance(store, LanceDBStore)
                 rows = (
                     store._tbl
                     .search(dense_vec, vector_column_name="vector")
                     .metric("cosine")
+                    .nprobes(SEARCH_NPROBES)
+                    .refine_factor(SEARCH_REFINE_FACTOR)
                     .limit(limit)
                     .select(["vector", "_distance"])
                     .to_list()
