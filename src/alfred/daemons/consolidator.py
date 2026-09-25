@@ -1,4 +1,4 @@
-"""ConsolidatorDaemon — cluster summarization via Ollama + wiki page generation + synthesis pass."""
+"""ConsolidatorDaemon — cluster summarization via the local LLM + wiki page generation + synthesis pass."""
 from __future__ import annotations
 
 import asyncio
@@ -10,11 +10,10 @@ import time
 import traceback
 from datetime import date, datetime, timezone
 
-import httpx
 import structlog
 
 from alfred.core.failures import record_failure
-from alfred.core.local_llm import LocalLLMUnavailable, complete
+from alfred.core.local_llm import LocalLLMRequestTooLarge, LocalLLMUnavailable, complete
 from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import vault_create, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
@@ -29,6 +28,8 @@ SYNTHESIS_BATCH = 5              # max clusters to synthesize per run
 # input + output and it answers 400 above that, where Ollama silently cut the
 # prompt; the employment vault's synthesis was already arriving at 31.3K.
 SYNTHESIS_INPUT_TOKEN_CAP = 24_000
+SYNTHESIS_MAX_TOKENS = 2048      # a 300-400 word page, with room to spare
+LABEL_MAX_TOKENS = 256           # a LABEL line and a SUMMARY sentence
 
 # Over-counts Qwen tokens on purpose: a run of up to 5 letters, each digit,
 # each other visible char. Against the Qwen tokenizer on 2,344 vault notes
@@ -119,7 +120,7 @@ class ConsolidatorDaemon(BaseDaemon):
     async def _consolidate(self) -> None:
         vault_path = self.cfg.vault_path
 
-        # Label clusters via Ollama (Anthropic / deterministic fallbacks)
+        # Label clusters via the local LLM (placeholder from paths when it's down)
         await self._label_pass(vault_path)
 
         # Synthesize high-centrality clusters into synthesis/ pages
@@ -140,6 +141,7 @@ class ConsolidatorDaemon(BaseDaemon):
         state = self.state.state
         labeled = 0
         reused = 0
+        backend_down = False
 
         # Model-made labels by the membership they describe, so a cluster whose
         # members only moved to a new key (HDBSCAN renumbers when the vault
@@ -161,9 +163,19 @@ class ConsolidatorDaemon(BaseDaemon):
             label = known.get(fingerprint)
             if label is not None:
                 reused += 1
-            else:
+            elif not backend_down:
                 try:
                     text = await self._label_cluster(members, vault_path)
+                except LocalLLMUnavailable as e:
+                    # Down for every cluster, not just this one: stop asking for
+                    # the rest of the pass instead of waiting out a timeout per
+                    # cluster. They still get a placeholder below, and the next
+                    # pass asks again. Deliberately non-fatal, unlike curator or
+                    # distiller: a paused backend costs label quality, not
+                    # correctness, and never blocks clustering.
+                    self.log.warning("consolidator.label_backend_unavailable", cluster=key, error=str(e))
+                    backend_down = True
+                    text = ""
                 except Exception:
                     self.log.warning("consolidator.label_error", cluster=key, error=traceback.format_exc())
                     continue
@@ -314,6 +326,21 @@ class ConsolidatorDaemon(BaseDaemon):
             fingerprint = _members_fingerprint(cluster.member_files)
             try:
                 path = await self._synthesize_cluster(cluster, vault_path)
+            except LocalLLMUnavailable as e:
+                # Down for every cluster, not just this one. Nothing is stamped,
+                # so the next pass picks the same clusters up again.
+                self.log.warning(
+                    "consolidator.synthesis_backend_unavailable", cluster=cluster_key, error=str(e)
+                )
+                break
+            except LocalLLMRequestTooLarge as e:
+                # Too big even at half the cap. Settle it without a page, as for
+                # a cluster with nothing to synthesize, so it is tried again only
+                # when its membership changes.
+                self.log.warning(
+                    "consolidator.synthesis_request_too_large", cluster=cluster_key, error=str(e)
+                )
+                path = ""
             except Exception as e:
                 self.log.warning("consolidator.synthesize_error", cluster=cluster_key, error=str(e))
                 continue
@@ -368,7 +395,15 @@ class ConsolidatorDaemon(BaseDaemon):
             return ""
 
         label = cluster.label[0] if cluster.label else "cluster"
-        synthesis_body = await self._call_synthesis_llm(label, learn_entries)
+        try:
+            synthesis_body = await self._call_synthesis_llm(label, learn_entries)
+        except LocalLLMRequestTooLarge as e:
+            # The estimate can read short of the real count (worst seen 0.72x),
+            # so one more go at half the budget before giving up on it.
+            self.log.info("consolidator.synthesis_retry_smaller", label=label, error=str(e))
+            synthesis_body = await self._call_synthesis_llm(
+                label, learn_entries, cap=SYNTHESIS_INPUT_TOKEN_CAP // 2
+            )
         if not synthesis_body:
             return None
 
@@ -424,15 +459,21 @@ class ConsolidatorDaemon(BaseDaemon):
         self.log.info("consolidator.cluster_synthesized", label=label, path=path)
         return path
 
-    async def _call_synthesis_llm(self, label: str, entries: list[tuple[str, str, str]]) -> str:
-        """Call Claude API for synthesis (falls back to Ollama if key absent)."""
-        entries, estimated = _fit_to_budget(entries, SYNTHESIS_INPUT_TOKEN_CAP)
-        if estimated > SYNTHESIS_INPUT_TOKEN_CAP:
+    async def _call_synthesis_llm(
+        self, label: str, entries: list[tuple[str, str, str]], cap: int = SYNTHESIS_INPUT_TOKEN_CAP
+    ) -> str:
+        """One synthesis from the configured backend; "" when the model said nothing.
+
+        Raises LocalLLMUnavailable and LocalLLMRequestTooLarge; neither is
+        turned into "" here.
+        """
+        entries, estimated = _fit_to_budget(entries, cap)
+        if estimated > cap:
             self.log.info(
                 "consolidator.synthesis_input_capped",
                 label=label,
                 estimated_tokens=estimated,
-                cap=SYNTHESIS_INPUT_TOKEN_CAP,
+                cap=cap,
             )
         bodies_text = "\n\n".join(f"### {name}\n{body}" for _, name, body in entries)
         prompt = (
@@ -449,20 +490,14 @@ class ConsolidatorDaemon(BaseDaemon):
         )
 
         # Local backend only. The Anthropic leg that used to sit here was removed
-        # with the rest of the cloud chain; the Ollama path below was already the
-        # de-facto backend anyway, since the cloud call had been 400-ing on an
-        # exhausted credit balance and falling through silently.
-        try:
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                resp = await client.post(
-                    f"{self.cfg.ollama_base_url}/api/generate",
-                    json={"model": self.cfg.ollama_llm_model, "prompt": prompt, "stream": False, "think": False},
-                )
-                resp.raise_for_status()
-                return resp.json().get("response", "").strip()
-        except Exception as e:
-            self.log.warning("consolidator.ollama_synthesis_error", error=str(e))
-            return ""
+        # with the rest of the cloud chain. This used to POST /api/generate
+        # itself and turn every failure into "", which read as "the model said
+        # nothing" and hid a down backend; it now goes through complete() and
+        # lets the caller see which failure it was. No system prompt, as before.
+        def _call() -> str:
+            return complete("", prompt, **self.cfg.llm, max_tokens=SYNTHESIS_MAX_TOKENS)
+
+        return (await asyncio.to_thread(_call)).strip()
 
     async def _generate_wiki_stubs(self, vault_path) -> None:
         """Create wiki stub pages for all person and org records that don't have one yet."""
@@ -515,68 +550,29 @@ class ConsolidatorDaemon(BaseDaemon):
         file_list = "\n".join(lines)
         prompt = _LABEL_PROMPT.format(file_list=file_list)
 
-        # ── Primary: Ollama ───────────────────────────────────────────────────
+        # One call to the configured backend. This used to POST /api/generate
+        # itself and, on any failure, ask the same backend again through
+        # complete() with a shorter prompt — two waits on a backend that was
+        # already known to be down. No system prompt, as the old call had none.
+        def _call() -> str:
+            return complete("", prompt, **self.cfg.llm, max_tokens=LABEL_MAX_TOKENS)
+
+        # LocalLLMUnavailable propagates: _label_pass stops asking for the pass.
         try:
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                resp = await client.post(
-                    f"{self.cfg.ollama_base_url}/api/generate",
-                    json={
-                        "model": self.cfg.ollama_llm_model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "think": False,
-                    },
-                )
-                resp.raise_for_status()
-                raw = resp.json().get("response", "").strip()
+            raw = (await asyncio.to_thread(_call)).strip()
+        except LocalLLMRequestTooLarge as e:
+            # The prompt is a few hundred tokens, so this is the answer running
+            # past LABEL_MAX_TOKENS; a fresh sample next pass usually doesn't.
+            self.log.warning("consolidator.label_request_too_large", error=str(e))
+            return ""
 
-            # Parse LABEL: line
-            for line in raw.splitlines():
-                if line.upper().startswith("LABEL:"):
-                    return line.split(":", 1)[-1].strip()
-            if raw:
-                return raw[:50].strip()
-        except Exception:
-            self.log.warning(
-                "consolidator.ollama_error",
-                error=traceback.format_exc(),
-            )
+        for line in raw.splitlines():
+            if line.upper().startswith("LABEL:"):
+                return line.split(":", 1)[-1].strip()
 
-        # ── Fallback 1: local model ───────────────────────────────────────────
-        try:
-            file_list_short = "\n".join(f"- {f}" for f in member_files[:10])
-            fallback_prompt = (
-                f"These files are in the same knowledge cluster:\n{file_list_short}\n\n"
-                "Give a 2-4 word descriptive label for this cluster. "
-                "Return only the label, no explanation."
-            )
-
-            def _call() -> str:
-                return complete(
-                    "You label clusters of related documents concisely.",
-                    fallback_prompt,
-                    base_url=self.cfg.ollama_base_url,
-                    model=self.cfg.ollama_llm_model,
-                    max_tokens=20,
-                ).strip()
-
-            label = await asyncio.to_thread(_call)
-            if label:
-                return label
-        except LocalLLMUnavailable as e:
-            # Deliberately non-fatal here, unlike curator/distiller: fallback 2
-            # below derives a label from filenames, so a paused backend costs
-            # label quality, not correctness, and never blocks clustering.
-            self.log.info("consolidator.label_backend_unavailable", error=str(e))
-        except Exception:
-            self.log.warning(
-                "consolidator.local_label_error",
-                error=traceback.format_exc(),
-            )
-
-        # No model answer. _label_pass falls back to _label_from_paths, and
-        # knows not to treat that name as the cluster's real label.
-        return ""
+        # No LABEL: line: the reply's start will do. An empty reply returns "",
+        # which _label_pass treats as no model answer (see _label_from_paths).
+        return raw[:50].strip()
 
 
 def _label_from_paths(member_files: list[str]) -> str:

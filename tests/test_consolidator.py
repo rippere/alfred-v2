@@ -3,10 +3,8 @@
 registration metadata (tests/test_scheduler_jobs.py).
 
 Covers one normal-tick path per responsibility exercised here:
-  - label_tick(): a real cluster gets labeled through the actual Ollama ->
-    Anthropic fallback chain, with the Ollama HTTP call mocked to fail (no
-    local Ollama in test env) and the Anthropic client mocked to succeed —
-    proving the fallback, not just the happy path of either provider alone.
+  - label_tick(): a real cluster gets labeled through the local backend,
+    mocked at the consolidator's complete() (no model in the test env).
   - stubs_tick(): a real person/org vault record gets a wiki stub page
     created via real (tmp_path) vault I/O — no LLM involved in stub
     creation.
@@ -64,13 +62,7 @@ class _FakeAnthropicClient:
         self.messages = _FakeAnthropicMessages(text)
 
 
-async def _failing_post(self, url, **kwargs):
-    raise httpx.ConnectError("simulated: no local Ollama running")
-
-
-def test_label_tick_normal_path_labels_cluster_via_local_llm_fallback(
-    tmp_path, monkeypatch
-):
+def test_label_tick_normal_path_labels_cluster_via_local_llm(tmp_path, monkeypatch):
     daemon = _make_daemon(tmp_path)
     vault_path = daemon.cfg.vault_path
     note_dir = vault_path / "note"
@@ -89,11 +81,8 @@ def test_label_tick_normal_path_labels_cluster_via_local_llm_fallback(
         member_files=member_paths,
     )
 
-    # Ollama (the primary path) is unreachable in the test environment —
-    # mock the HTTP call to fail fast rather than actually attempting network I/O.
-    monkeypatch.setattr(httpx.AsyncClient, "post", _failing_post)
-    # Fallback 1 is now the local backend, bound at import time in the
-    # consolidator's namespace — patch it there.
+    # The local backend, bound at import time in the consolidator's
+    # namespace — patch it there. A reply with no LABEL: line still counts.
     monkeypatch.setattr(
         "alfred.daemons.consolidator.complete",
         lambda *a, **kw: "fallback cluster label",
@@ -151,16 +140,17 @@ def test_stubs_tick_normal_path_creates_wiki_page(tmp_path):
 
 
 class _FakeGenerate:
-    """Ollama /api/generate stand-in: counts label and synthesis prompts,
-    and can run a hook mid-call (the surveyor reclustering meanwhile)."""
+    """complete() stand-in: counts label and synthesis prompts, and can run a
+    hook mid-call (the surveyor reclustering meanwhile)."""
 
     def __init__(self) -> None:
         self.labels: list[str] = []
         self.syntheses: list[str] = []
+        self.kwargs: list[dict] = []
         self.during_call = None
 
-    async def post(self, client, url, json=None, **kwargs):
-        prompt = json["prompt"]
+    def complete(self, system, prompt, **kwargs):
+        self.kwargs.append(kwargs)
         if prompt.startswith("You are synthesizing"):
             self.syntheses.append(prompt)
             text = "## Insight\nA synthesis.\n\n## Evidence\nE.\n\n## Implications\nI.\n\n## Applicability\nA."
@@ -170,8 +160,7 @@ class _FakeGenerate:
         if self.during_call is not None:
             hook, self.during_call = self.during_call, None
             hook()
-        request = httpx.Request("POST", url)
-        return httpx.Response(200, json={"response": text}, request=request)
+        return text
 
 
 def _cluster_daemon(tmp_path, monkeypatch, n_members: int = 3):
@@ -189,11 +178,7 @@ def _cluster_daemon(tmp_path, monkeypatch, n_members: int = 3):
         cluster_id=0, cluster_type="semantic", member_files=list(members)
     )
     fake = _FakeGenerate()
-
-    async def _post(self, url, **kwargs):
-        return await fake.post(self, url, **kwargs)
-
-    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", fake.complete)
     monkeypatch.setattr("alfred.daemons.consolidator.asyncio.sleep", _no_sleep)
     return daemon, fake, members
 
@@ -274,7 +259,6 @@ def test_placeholder_label_is_replaced_once_the_model_answers(tmp_path, monkeypa
     """Backend paused: the cluster gets a name from its paths, but not a
     stamped one — so it does not keep "note" for good."""
     daemon, fake, _ = _cluster_daemon(tmp_path, monkeypatch)
-    monkeypatch.setattr(httpx.AsyncClient, "post", _failing_post)
 
     def _down(*a, **kw):
         from alfred.core.local_llm import LocalLLMUnavailable
@@ -285,10 +269,7 @@ def test_placeholder_label_is_replaced_once_the_model_answers(tmp_path, monkeypa
     asyncio.run(daemon.label_tick())
     assert daemon.state.state.clusters["semantic_0"].label == ["note"]
 
-    async def _post(self, url, **kwargs):
-        return await fake.post(self, url, **kwargs)
-
-    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", fake.complete)
     asyncio.run(daemon.label_tick())
     assert daemon.state.state.clusters["semantic_0"].label == ["alpha topic"]
 
@@ -365,3 +346,221 @@ def test_fit_to_budget_keeps_short_bodies_whole():
     marker = _approx_tokens("\n[…truncated]")
     assert sum(_approx_tokens(body) for _, _, body in fitted) <= 1_000 + 2 * marker
     assert fitted[1][2].endswith("[…truncated]") and fitted[2][2].endswith("[…truncated]")
+
+
+# ── Through complete(): request shape per backend, and failure handling ─────
+
+
+def _two_labeled_clusters(tmp_path, monkeypatch):
+    daemon, fake, members = _cluster_daemon(tmp_path, monkeypatch, n_members=6)
+    clusters = daemon.state.state.clusters
+    clusters["semantic_0"].member_files = members[:3]
+    clusters["semantic_1"] = ClusterState(cluster_id=1, cluster_type="semantic", member_files=members[3:])
+    asyncio.run(daemon.label_tick())
+    assert all(c.label == ["alpha topic"] for c in clusters.values())
+    return daemon, fake
+
+
+def test_flag_off_label_and_synthesis_reach_ollama_as_chat_calls(tmp_path, monkeypatch):
+    """The two raw /api/generate POSTs now go through complete(): same host,
+    model and think:false, the prompt as the only (user) message, as the old
+    calls had no system prompt; num_predict now bounds the answer."""
+    daemon, _, _ = _cluster_daemon(tmp_path, monkeypatch)
+    from alfred.core import local_llm
+
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", local_llm.complete)
+    seen: list[dict] = []
+
+    def _post(url, json=None, timeout=None):
+        seen.append({"url": url, "json": json, "timeout": timeout})
+        prompt = json["messages"][-1]["content"]
+        text = "## Insight\nS." if prompt.startswith("You are synthesizing") else "LABEL: alpha topic"
+        return httpx.Response(200, json={"message": {"content": text}}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", _post)
+
+    asyncio.run(daemon.label_tick())
+    asyncio.run(daemon.synthesis_tick())
+
+    assert [s["url"] for s in seen] == ["http://localhost:11434/api/chat"] * 2
+    label, synthesis = (s["json"] for s in seen)
+    for payload, budget in ((label, 256), (synthesis, 2048)):
+        assert payload["model"] == daemon.cfg.ollama_llm_model
+        assert payload["think"] is False and payload["stream"] is False
+        assert [m["role"] for m in payload["messages"]] == ["user"]
+        assert payload["options"] == {"num_predict": budget}
+        assert "format" not in payload
+    assert label["messages"][0]["content"].startswith("You are summarizing a semantic cluster")
+    assert synthesis["messages"][0]["content"].startswith("You are synthesizing")
+    assert all(s["timeout"] == 180.0 for s in seen)
+    assert daemon.state.state.clusters["semantic_0"].consolidated_chunk_id == "synthesis/alpha-topic.md"
+
+
+def test_flag_on_label_goes_to_the_openai_backend(tmp_path, monkeypatch):
+    import json as _json
+
+    import openai
+
+    from alfred.core import local_llm
+
+    daemon, _, _ = _cluster_daemon(tmp_path, monkeypatch)
+    daemon.cfg.llm_api = "openai"
+    daemon.cfg.llm_base_url = "http://spark.test:8000/v1"
+    daemon.cfg.llm_model = "qwen3-30b"
+    monkeypatch.setattr("alfred.config.SPARK_ENV_PATH", tmp_path / "no-spark-env")
+    monkeypatch.delenv("SPARK_API_KEY", raising=False)
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", local_llm.complete)
+    monkeypatch.setattr(httpx, "post", lambda *a, **kw: pytest.fail("flag on, yet Ollama was called"))
+    seen: list[httpx.Request] = []
+
+    def _spark(request):
+        seen.append(request)
+        return httpx.Response(200, json={
+            "id": "x", "object": "chat.completion", "created": 0, "model": "qwen3-30b",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": "LABEL: spark topic\nSUMMARY: s."}}],
+        })
+
+    monkeypatch.setattr(local_llm, "_openai_client", lambda base_url, api_key, timeout: openai.OpenAI(
+        base_url=base_url, api_key=api_key, max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(_spark)),
+    ))
+
+    asyncio.run(daemon.label_tick())
+
+    (request,) = seen
+    body = _json.loads(request.content)
+    assert str(request.url) == "http://spark.test:8000/v1/chat/completions"
+    assert body["model"] == "qwen3-30b"
+    assert [m["role"] for m in body["messages"]] == ["user"]
+    assert body["max_tokens"] == 256
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert daemon.state.state.clusters["semantic_0"].label == ["spark topic"]
+
+
+def test_synthesis_backend_down_stops_the_pass_and_stamps_nothing(tmp_path, monkeypatch):
+    """This used to become "" (read as "the model said nothing") and the pass
+    went on to wait on the dead backend once per cluster."""
+    from alfred.core.local_llm import LocalLLMUnavailable
+
+    daemon, fake = _two_labeled_clusters(tmp_path, monkeypatch)
+    calls: list[str] = []
+
+    def _down(system, prompt, **kw):
+        calls.append(prompt)
+        raise LocalLLMUnavailable("connection refused")
+
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", _down)
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.synthesis_tick())
+
+    assert len(calls) == 1, "the pass kept calling a backend it knew was down"
+    for cluster in daemon.state.state.clusters.values():
+        assert not cluster.synthesized_members and not cluster.consolidated_chunk_id
+    assert [e for e in logs if e.get("event") == "consolidator.synthesis_backend_unavailable"]
+
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", fake.complete)
+    asyncio.run(daemon.synthesis_tick())
+    assert len(fake.syntheses) >= 1, "the deferred clusters were not retried"
+
+
+def test_synthesis_too_large_retries_once_at_half_the_cap(tmp_path, monkeypatch):
+    import re
+
+    from alfred.core.local_llm import LocalLLMRequestTooLarge
+
+    daemon, fake, _ = _cluster_daemon(tmp_path, monkeypatch)
+    asyncio.run(daemon.label_tick())
+    for i in range(3):  # ~20K estimated tokens each
+        (daemon.cfg.vault_path / "note" / f"m{i}.md").write_text(
+            f"---\ntype: note\nname: m{i}\n---\n" + "word " * 20_000, encoding="utf-8"
+        )
+    prompts: list[str] = []
+
+    def _complete(system, prompt, **kw):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            raise LocalLLMRequestTooLarge("400: maximum context length is 32768 tokens")
+        return "## Insight\nSmaller."
+
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", _complete)
+
+    asyncio.run(daemon.synthesis_tick())
+
+    estimate = [len(re.findall(r"[^\W\d_]{1,5}|\d|\S", p)) for p in prompts]
+    assert len(prompts) == 2
+    assert estimate[0] <= 24_000 + 500 and estimate[1] <= 12_000 + 500, estimate
+    assert daemon.state.state.clusters["semantic_0"].consolidated_chunk_id == "synthesis/alpha-topic.md"
+
+
+def test_synthesis_too_large_twice_settles_the_cluster(tmp_path, monkeypatch):
+    """Deferring it would re-send the same oversized prompt every 30 minutes."""
+    from alfred.core.local_llm import LocalLLMRequestTooLarge
+
+    daemon, fake, members = _cluster_daemon(tmp_path, monkeypatch)
+    asyncio.run(daemon.label_tick())
+    calls: list[str] = []
+
+    def _too_large(system, prompt, **kw):
+        calls.append(prompt)
+        raise LocalLLMRequestTooLarge("400: maximum context length is 32768 tokens")
+
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", _too_large)
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.synthesis_tick())
+        asyncio.run(daemon.synthesis_tick())
+
+    assert len(calls) == 2, "retried beyond the one smaller attempt"
+    cluster = daemon.state.state.clusters["semantic_0"]
+    assert cluster.synthesized_members and not cluster.consolidated_chunk_id
+    assert [e for e in logs if e.get("event") == "consolidator.synthesis_request_too_large"]
+
+
+def test_label_too_large_leaves_an_unstamped_placeholder(tmp_path, monkeypatch):
+    from alfred.core.local_llm import LocalLLMRequestTooLarge
+
+    daemon, fake, _ = _cluster_daemon(tmp_path, monkeypatch)
+
+    def _too_large(system, prompt, **kw):
+        raise LocalLLMRequestTooLarge("finish_reason=length")
+
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", _too_large)
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.label_tick())
+
+    cluster = daemon.state.state.clusters["semantic_0"]
+    assert cluster.label == ["note"] and not cluster.labeled_members
+    assert [e for e in logs if e.get("event") == "consolidator.label_request_too_large"
+            and e.get("log_level") == "warning"]
+
+
+def test_label_pass_stops_asking_a_down_backend_but_still_names_every_cluster(tmp_path, monkeypatch):
+    """One timeout per cluster was up to 761 waits on the main vault's pass."""
+    from alfred.core.local_llm import LocalLLMUnavailable
+
+    daemon, fake, members = _cluster_daemon(tmp_path, monkeypatch, n_members=6)
+    clusters = daemon.state.state.clusters
+    clusters["semantic_0"].member_files = members[:3]
+    clusters["semantic_1"] = ClusterState(cluster_id=1, cluster_type="semantic", member_files=members[3:])
+    calls: list[str] = []
+
+    def _down(system, prompt, **kw):
+        calls.append(prompt)
+        raise LocalLLMUnavailable("timed out")
+
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", _down)
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.label_tick())
+
+    assert len(calls) == 1
+    for cluster in clusters.values():
+        assert cluster.label == ["note"] and not cluster.labeled_members
+    assert len([e for e in logs if e.get("event") == "consolidator.label_backend_unavailable"]) == 1
+
+    monkeypatch.setattr("alfred.daemons.consolidator.complete", fake.complete)
+    asyncio.run(daemon.label_tick())
+    assert [c.label for c in clusters.values()] == [["alpha topic"], ["alpha topic"]]
