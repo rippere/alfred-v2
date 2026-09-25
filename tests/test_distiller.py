@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from structlog.testing import capture_logs
@@ -350,3 +351,106 @@ def test_request_too_large_skips_the_file_and_the_sweep_goes_on(tmp_path, monkey
 
 async def _no_sleep(_seconds: float) -> None:
     return None
+
+
+# ── Per-sweep cap: the {items} fix turns writes on for ~15K stale files ──────
+
+
+def _stale_files(daemon: DistillerDaemon, names, last_distilled: str = "") -> None:
+    from alfred.core.models import FileState
+
+    for name in names:
+        daemon.state.state.files[name] = FileState(md5=name, last_distilled=last_distilled)
+
+
+def test_sweep_distills_at_most_the_cap_and_the_rest_waits(tmp_path, monkeypatch):
+    """The main vault had ~15K unstamped files, each worth up to 3 topic
+    appends: without a cap the first sweep would write ~45K appends in one
+    night. The cap bounds files, LLM calls and appends per sweep."""
+    daemon = _make_daemon(tmp_path)
+    daemon.cfg.distiller_max_files_per_sweep = 2
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _no_sleep)
+    calls: list[str] = []
+
+    def _complete(system, user, **kw):
+        calls.append(user)
+        items = [{"title": f"t{n}", "body": "b", "tags": ["misc"]} for n in range(3)]
+        return json.dumps({"items": items})
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _complete)
+    _stale_files(daemon, [f"f{n}.md" for n in range(5)])
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.tick())
+
+    assert len(calls) == 2
+    assert len(appended) == 6, "3 appends per file, 2 files"
+    stamped = sorted(p for p, fs in daemon.state.state.files.items() if fs.last_distilled)
+    assert stamped == ["f0.md", "f1.md"]
+    run = daemon.state.state.distiller_runs[-1]
+    assert (run["files_scanned"], run["learn_records_created"], run["stale_remaining"]) == (2, 6, 3)
+    assert [e for e in logs if e.get("event") == "distiller.sweep_capped"
+            and e.get("cap") == 2 and e.get("stale") == 5]
+
+    calls.clear()
+    asyncio.run(daemon.tick())
+    asyncio.run(daemon.tick())
+    assert len(calls) == 3, "the next sweeps take the remaining 2, then 1"
+    assert all(fs.last_distilled for fs in daemon.state.state.files.values())
+    assert daemon.state.state.distiller_runs[-1]["stale_remaining"] == 0
+
+
+def test_capped_sweep_takes_never_distilled_then_oldest_first(tmp_path, monkeypatch):
+    """With a cap, dict order would re-take the same leading files each time
+    they went stale again, and the tail of a 15K-file vault would never be
+    reached. Never-distilled files go first, then the oldest stamp."""
+    daemon = _make_daemon(tmp_path)
+    daemon.cfg.distiller_max_files_per_sweep = 3
+    _stub_vault(monkeypatch)
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _no_sleep)
+    seen: list[str] = []
+
+    def _complete(system, user, **kw):
+        seen.append(next(line for line in user.splitlines() if line.startswith("File: "))[6:])
+        return json.dumps({"items": []})
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _complete)
+    _stale_files(daemon, ["stale-newer.md"], "2026-07-01T00:00:00+00:00")
+    _stale_files(daemon, ["stale-older.md"], "2026-05-01T00:00:00+00:00")
+    _stale_files(daemon, ["fresh.md"], datetime.now(timezone.utc).isoformat())
+    _stale_files(daemon, ["never-a.md", "never-b.md"])
+
+    asyncio.run(daemon.tick())
+
+    assert seen == ["never-a.md", "never-b.md", "stale-older.md"]
+
+
+def test_default_cap_is_200_and_config_sets_it(tmp_path):
+    import pytest
+    import yaml
+
+    daemon = _make_daemon(tmp_path)
+    assert daemon.cfg.distiller_max_files_per_sweep == 200
+
+    base = {"distiller": {"mode": "scheduled", "max_files_per_sweep": 200}}
+    (tmp_path / "config-base.yaml").write_text(yaml.safe_dump(base))
+    vault = {"vault": {"path": str(tmp_path / "v")}, "data_dir": "./d"}
+    path = tmp_path / "config-x.yaml"
+    path.write_text(yaml.safe_dump(vault))
+    assert AlfredConfig.load(path).distiller_max_files_per_sweep == 200
+
+    path.write_text(yaml.safe_dump({**vault, "distiller": {"max_files_per_sweep": 50}}))
+    assert AlfredConfig.load(path).distiller_max_files_per_sweep == 50
+
+    for bad in (0, -1, "lots", True):
+        path.write_text(yaml.safe_dump({**vault, "distiller": {"max_files_per_sweep": bad}}))
+        with pytest.raises(ValueError, match="max_files_per_sweep"):
+            AlfredConfig.load(path)
+
+
+def test_real_base_config_caps_the_distiller_at_200():
+    cfg = AlfredConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
+    assert cfg.distiller_mode == "scheduled"
+    assert cfg.distiller_max_files_per_sweep == 200

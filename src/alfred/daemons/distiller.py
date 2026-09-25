@@ -161,49 +161,67 @@ class DistillerDaemon(BaseDaemon):
         deferred = False
         self.failed_appends_this_tick = 0
 
-        for rel_path, fs in list(state.files.items()):
-            if is_daemon_generated(rel_path, generated_by=fs.__dict__.get("generated_by")):
-                continue  # daemon output — never re-distill
-            if _is_stale(fs.last_distilled):
-                try:
-                    created = await self._distill_file(vault_path, rel_path)
-                    fs.last_distilled = now_iso
-                    learn_count += created
-                    distilled_count += 1
-                    if distilled_count % 50 == 0:
-                        await self.save_state()
-                        self.log.debug("distiller.incremental_save", files=distilled_count)
-                    await asyncio.sleep(1.5)
-                except LocalLLMRequestTooLarge as e:
-                    # Retrying sends the same request, so stamp it like a file
-                    # with nothing to distill: it comes back when it goes stale.
-                    self.log.warning("distiller.request_too_large", path=rel_path, error=str(e))
-                    fs.last_distilled = now_iso
-                except LocalLLMUnavailable as e:
-                    # Stop the sweep instead of retrying a dead backend once per
-                    # file. last_distilled is only stamped on success (line
-                    # above), so everything not yet reached stays stale and the
-                    # next sweep resumes from here.
-                    self.log.warning(
-                        "distiller.backend_unavailable",
-                        error=str(e),
-                        deferred_from=rel_path,
-                        distilled_before_stop=distilled_count,
-                    )
-                    deferred = True
-                    break
-                except Exception as e:
-                    self.log.warning("distiller.file_error", path=rel_path, error=str(e))
+        stale = [
+            (rel_path, fs)
+            for rel_path, fs in list(state.files.items())
+            # daemon output — never re-distill
+            if not is_daemon_generated(rel_path, generated_by=fs.__dict__.get("generated_by"))
+            and _is_stale(fs.last_distilled)
+        ]
+        # Never-distilled first, then the oldest stamp. With a cap, dict order
+        # would take the same leading files again each time they went stale
+        # and never reach the rest of the vault.
+        stale.sort(key=lambda item: item[1].last_distilled or "")
+        cap = max(1, int(getattr(self.cfg, "distiller_max_files_per_sweep", 200)))
+        batch = stale[:cap]
+        if len(stale) > cap:
+            # Up to 3 topic appends per file, so an uncapped first sweep over
+            # the main vault's ~15K unstamped files would be ~45K writes in
+            # one night. The rest waits for the next sweeps, oldest first.
+            self.log.info("distiller.sweep_capped", cap=cap, stale=len(stale))
+
+        for rel_path, fs in batch:
+            try:
+                created = await self._distill_file(vault_path, rel_path)
+                fs.last_distilled = now_iso
+                learn_count += created
+                distilled_count += 1
+                if distilled_count % 50 == 0:
+                    await self.save_state()
+                    self.log.debug("distiller.incremental_save", files=distilled_count)
+                await asyncio.sleep(1.5)
+            except LocalLLMRequestTooLarge as e:
+                # Retrying sends the same request, so stamp it like a file
+                # with nothing to distill: it comes back when it goes stale.
+                self.log.warning("distiller.request_too_large", path=rel_path, error=str(e))
+                fs.last_distilled = now_iso
+            except LocalLLMUnavailable as e:
+                # Stop the sweep instead of retrying a dead backend once per
+                # file. last_distilled is only stamped on success (line
+                # above), so everything not yet reached stays stale and the
+                # next sweep resumes from here.
+                self.log.warning(
+                    "distiller.backend_unavailable",
+                    error=str(e),
+                    deferred_from=rel_path,
+                    distilled_before_stop=distilled_count,
+                )
+                deferred = True
+                break
+            except Exception as e:
+                self.log.warning("distiller.file_error", path=rel_path, error=str(e))
 
         # Every finished sweep is a run, including one that found nothing
         # stale — runner.py's startup catch-up reads the last entry, and a
         # quiet vault must not look overdue. A sweep that hit a dead backend
         # before doing anything is not a run, so the catch-up retries it.
+        stale_remaining = sum(1 for _, fs in stale if _is_stale(fs.last_distilled))
         if distilled_count or not deferred:
             state.distiller_runs.append({
                 "timestamp": now_iso,
                 "files_scanned": distilled_count,
                 "learn_records_created": learn_count,
+                "stale_remaining": stale_remaining,
             })
             if len(state.distiller_runs) > 30:
                 state.distiller_runs = state.distiller_runs[-30:]
@@ -212,6 +230,7 @@ class DistillerDaemon(BaseDaemon):
                 files=distilled_count,
                 learned=learn_count,
                 failed_appends=self.failed_appends_this_tick,
+                stale_remaining=stale_remaining,
             )
             await self.save_state()
 

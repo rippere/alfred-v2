@@ -54,6 +54,7 @@ _CONSUMED_KEYS: frozenset[tuple[str, ...]] = frozenset({
     ("janitor", "reap_scan_batch_size"),
     ("janitor", "reap_delete_batch"),
     ("distiller", "mode"),
+    ("distiller", "max_files_per_sweep"),
     ("api_budget", "max_calls_per_day"),
     ("api_budget", "warn_at_calls"),
 })
@@ -200,6 +201,12 @@ class AlfredConfig:
 
     # Distiller
     distiller_mode: str = "on_demand"   # "scheduled" | "on_demand"
+    # Stale files distilled per sweep, oldest stamp first. Each can append up
+    # to 3 learnings to topic/ notes, so this bounds a sweep's vault writes
+    # (and its LLM calls). The main vault had ~15K unstamped files when the
+    # {items} fix landed: 200 a night works through them in ~75 nights
+    # instead of ~45K appends in one.
+    distiller_max_files_per_sweep: int = 200
 
     # API budget
     api_max_calls_per_day: int = 500
@@ -384,6 +391,16 @@ class AlfredConfig:
         # Distiller mode
         if d := raw.get("distiller"):
             cfg.distiller_mode = d.get("mode", cfg.distiller_mode)
+            cfg.distiller_max_files_per_sweep = d.get(
+                "max_files_per_sweep", cfg.distiller_max_files_per_sweep
+            )
+        cap = cfg.distiller_max_files_per_sweep
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            # No "0 = unlimited": an uncapped sweep is the write burst this
+            # setting exists to prevent. Set a large number to mean it.
+            raise ValueError(
+                f"{path}: distiller.max_files_per_sweep must be a positive integer, got {cap!r}"
+            )
 
         # API budget
         if b := raw.get("api_budget"):

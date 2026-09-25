@@ -45,6 +45,9 @@ janitor:
 
 distiller:
   mode: scheduled         # scheduled = nightly at 2am | on_demand = explicit trigger only
+  # Stale files per sweep, never-distilled and oldest first. Each file can
+  # append up to 3 learnings to topic/, so this caps a night's writes at ~600.
+  max_files_per_sweep: 200
 
 api_budget:
   max_calls_per_day: 500
