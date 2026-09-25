@@ -6,23 +6,30 @@ vault:
 data_dir: ./data-employment
 
 # Betson carve-out: this vault's text never leaves benderman. Completions
-# (llm:) and embeddings (ollama.base_url) are both pinned to the local Ollama
-# on loopback, so nothing config-base.yaml says about llm or ollama can move
-# them. The meta MCP server loads this file too.
+# (llm:) and embeddings (ollama:) are pinned here, URL and model both, to the
+# local Ollama on loopback, so nothing config-base.yaml says about llm or
+# ollama can move them. The meta MCP server loads this file too.
 #
 # local_only makes AlfredConfig.load() refuse any llm.api other than ollama,
-# and any llm or ollama URL that is not http://127.0.0.1|localhost|[::1]:11434,
-# instead of starting the daemon. The loader also treats this file (by name)
-# and /mnt/external/vault-employment (by path) as local-only when the flag is
-# missing, so deleting a line here fails closed.
+# any llm or ollama URL that is not http://127.0.0.1|localhost|[::1]:11434,
+# and any Ollama cloud model name (*cloud, *:cloud), instead of starting the
+# daemon. Before each send the local Ollama is also asked (/api/show) whether
+# the model runs remotely, which catches a cloud model behind a local alias.
+# The loader also treats this file (by name) and /mnt/external/vault-employment
+# (by path) as local-only when the flag is missing, so deleting a line here
+# fails closed.
 #
-# model is blank on purpose: blank means this vault's ollama.llm_model, and
-# it overrides any llm.model set in config-base.yaml (a Spark model name the
-# local Ollama doesn't have).
+# The models are today's fleet models, copied rather than inherited so that a
+# model named in config-base.yaml cannot reach this vault. When the fleet
+# changes local models, change them here too. llm.model is blank on purpose:
+# blank means this file's ollama.llm_model, and it overrides any llm.model set
+# in config-base.yaml (a Spark model name the local Ollama doesn't have).
 local_only: true
 
 ollama:
   base_url: http://127.0.0.1:11434
+  embed_model: nomic-embed-text
+  llm_model: orcarouter/Qwen3.8-27B-Uncensored:q5_K_M
 
 llm:
   api: ollama

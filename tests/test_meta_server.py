@@ -101,8 +101,9 @@ def test_meta_server_synthesis_follows_each_vaults_own_llm_block(tmp_path, monke
     monkeypatch.setenv("SPARK_MODEL", "qwen3-30b")
     monkeypatch.setattr("alfred.config.SPARK_ENV_PATH", tmp_path / "no-spark-env")
 
-    # The real base, flipped the way step 15 will flip it, next to the real
-    # vault files with their vaults pointed at synthetic tmp dirs.
+    # The real base flipped to openai (the fleet-wide flip the PR no longer
+    # documents), next to the real vault files with their vaults pointed at
+    # synthetic tmp dirs.
     base = yaml.safe_load((repo / "config-base.yaml").read_text())
     base["llm"]["api"] = "openai"
     (tmp_path / "config-base.yaml").write_text(yaml.safe_dump(base))
@@ -127,7 +128,7 @@ def test_meta_server_synthesis_follows_each_vaults_own_llm_block(tmp_path, monke
 
     ollama_urls: list[str] = []
 
-    def _ollama_post(url, json=None, timeout=None):
+    def _ollama_post(url, json=None, timeout=None, trust_env=True):
         ollama_urls.append(url)
         return httpx.Response(
             200, json={"message": {"content": "local answer"}}, request=httpx.Request("POST", url)
@@ -150,10 +151,13 @@ def test_meta_server_synthesis_follows_each_vaults_own_llm_block(tmp_path, monke
         http_client=httpx.Client(transport=httpx.MockTransport(_spark)),
     ))
 
+    # Employment asks its loopback Ollama whether the model runs there
+    # (/api/show), then sends to it; nothing reaches the Spark.
+    local = ["http://127.0.0.1:11434/api/show", "http://127.0.0.1:11434/api/chat"]
     assert _query_one_vault("employment", engines["employment"], "q", 3, True)
-    assert ollama_urls == ["http://127.0.0.1:11434/api/chat"]
+    assert ollama_urls == local
     assert spark_urls == []
 
     assert _query_one_vault("personal", engines["personal"], "q", 3, True)
     assert spark_urls == ["https://spark.test:8000/v1/chat/completions"]
-    assert ollama_urls == ["http://127.0.0.1:11434/api/chat"]
+    assert ollama_urls == local

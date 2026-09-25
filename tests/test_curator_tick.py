@@ -195,7 +195,7 @@ def test_classification_request_per_backend(tmp_path, monkeypatch):
 
     ollama: list[dict] = []
 
-    def _ollama_post(url, json=None, timeout=None):
+    def _ollama_post(url, json=None, timeout=None, trust_env=True):
         ollama.append({"url": url, "json": json})
         return httpx.Response(
             200, json={"message": {"content": '{"type": "note", "name": "one"}'}},

@@ -96,6 +96,7 @@ def test_openai_takes_base_url_and_model_from_the_environment(tmp_path, monkeypa
         "base_url": "https://spark.test:8000/v1",
         "model": "qwen3-30b",
         "api_key_env": "SPARK_API_KEY",
+        "local_only": False,
     }
     # The key is read per call from the variable named here, never held.
     assert "sk-secret" not in repr(cfg)
@@ -135,6 +136,7 @@ def test_explicit_block_values_win_over_the_environment(tmp_path, monkeypatch):
         "base_url": "https://pinned.test/v1",
         "model": "pinned",
         "api_key_env": "OTHER_KEY",
+        "local_only": False,
     }
 
 
@@ -187,6 +189,7 @@ def test_employment_stays_local_when_the_fleet_flips(tmp_path, monkeypatch, flip
         "api": "ollama",
         "base_url": "http://127.0.0.1:11434",
         "model": "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M",
+        "local_only": True,
     }
     assert employment.embed_base_url == "http://127.0.0.1:11434"
     assert personal.llm["api"] == "openai"
@@ -215,7 +218,7 @@ def test_employment_chat_and_embeddings_hit_loopback_when_base_llm_and_ollama_fl
     )
     seen: list[str] = []
 
-    def _post(url, json=None, timeout=None):
+    def _post(url, json=None, timeout=None, trust_env=True):
         seen.append(url)
         body = {"message": {"content": "ok"}, "embedding": [0.0]}
         return httpx.Response(200, json=body, request=httpx.Request("POST", url))
@@ -228,8 +231,12 @@ def test_employment_chat_and_embeddings_hit_loopback_when_base_llm_and_ollama_fl
 
     surveyor = SurveyorDaemon(cfg, None, asyncio.Queue(), store=None)
 
+    # Each model is checked with the local Ollama (/api/show) before its
+    # first send; the checks go to loopback too.
     assert seen == [
+        "http://127.0.0.1:11434/api/show",
         "http://127.0.0.1:11434/api/chat",
+        "http://127.0.0.1:11434/api/show",
         "http://127.0.0.1:11434/api/embeddings",
     ]
     assert surveyor._get_embedder().url == "http://127.0.0.1:11434/api/embeddings"

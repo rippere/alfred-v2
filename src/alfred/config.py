@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -34,6 +35,12 @@ LOCAL_ONLY_VAULT_ROOTS = (
 )
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 LOCAL_OLLAMA_PORT = 11434
+
+# Ollama cloud models (gpt-oss:120b-cloud, glm-4.6:cloud, foo-cloud:latest):
+# the local server accepts the request on loopback and forwards the prompt to
+# ollama.com. The name or the tag ends in "cloud". An alias can hide one under
+# any name, so alfred.core.ollama_guard also asks Ollama before each send.
+_CLOUD_MODEL_RE = re.compile(r"cloud(?::[^/:]*)?$", re.IGNORECASE)
 
 # Every YAML key path AlfredConfig.load() actually consumes. Keys present in a
 # merged config but absent here are dead weight — load() warns on them (the
@@ -147,6 +154,11 @@ def is_local_ollama_url(url: str) -> bool:
     )
 
 
+def is_ollama_cloud_model(model: str) -> bool:
+    """True for an Ollama cloud model name, which runs on ollama.com, not here."""
+    return bool(_CLOUD_MODEL_RE.search((model or "").strip()))
+
+
 def _is_local_only_vault(vault_path: Path) -> bool:
     """Is this vault under a local-only root, as written or after symlinks?"""
     candidates = [Path(os.path.abspath(vault_path.expanduser()))]
@@ -166,7 +178,12 @@ class LocalOnlyViolation(ValueError):
 
 
 def load_env(config_path: Path) -> None:
-    """Load .env from the same directory as config.yaml."""
+    """Load .env from the same directory as config.yaml.
+
+    Proxy settings (HTTP_PROXY, ALL_PROXY, ...) are skipped: they would route
+    requests meant for the loopback Ollama through another host. The Ollama
+    clients also ignore the environment's proxies (trust_env=False).
+    """
     env_path = Path(config_path).parent / ".env"
     if not env_path.exists():
         return
@@ -177,8 +194,11 @@ def load_env(config_path: Path) -> None:
         key, _, val = line.partition("=")
         key = key.strip()
         val = val.strip().strip('"').strip("'")
-        if key not in __import__("os").environ:
-            __import__("os").environ[key] = val
+        if key.upper().endswith("_PROXY"):
+            log.warning("config_env_proxy_ignored", key=key, file=str(env_path))
+            continue
+        if key not in os.environ:
+            os.environ[key] = val
 
 
 @dataclass
@@ -320,11 +340,20 @@ class AlfredConfig:
             problems.append(f"llm base_url {llm_url!r} is not loopback Ollama")
         if not is_local_ollama_url(self.ollama_base_url):
             problems.append(f"ollama.base_url {self.ollama_base_url!r} is not loopback Ollama")
+        # A loopback URL is not enough: the local Ollama forwards a cloud
+        # model's prompts to ollama.com.
+        for label, model in (
+            ("llm model", self.llm_model or self.ollama_llm_model),
+            ("ollama.embed_model", self.ollama_embed_model),
+        ):
+            if is_ollama_cloud_model(model):
+                problems.append(f"{label} {model!r} is an Ollama cloud model (runs on ollama.com)")
         if problems:
             raise LocalOnlyViolation(
                 f"local-only vault {self.vault_path}: "
                 + "; ".join(problems)
-                + f" (only http://127.0.0.1:{LOCAL_OLLAMA_PORT} or localhost/[::1] is allowed)"
+                + f" (only models that run on http://127.0.0.1:{LOCAL_OLLAMA_PORT}"
+                " or localhost/[::1] are allowed)"
             )
 
     @property
@@ -335,19 +364,25 @@ class AlfredConfig:
 
     @property
     def llm(self) -> dict:
-        """Backend keyword arguments for local_llm.complete() / complete_json()."""
+        """Backend keyword arguments for local_llm.complete() / complete_json().
+
+        local_only rides along so complete() asks the local Ollama, before it
+        sends, whether the model really runs here (alfred.core.ollama_guard).
+        """
         self.check_local_only()
         if self.llm_api == "ollama":
             return {
                 "api": "ollama",
                 "base_url": self.llm_base_url or self.ollama_base_url,
                 "model": self.llm_model or self.ollama_llm_model,
+                "local_only": self.local_only,
             }
         return {
             "api": self.llm_api,
             "base_url": self.llm_base_url,
             "model": self.llm_model,
             "api_key_env": self.llm_api_key_env,
+            "local_only": self.local_only,
         }
 
     @property

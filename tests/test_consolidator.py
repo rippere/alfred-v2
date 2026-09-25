@@ -371,7 +371,7 @@ def test_flag_off_label_and_synthesis_reach_ollama_as_chat_calls(tmp_path, monke
     monkeypatch.setattr("alfred.daemons.consolidator.complete", local_llm.complete)
     seen: list[dict] = []
 
-    def _post(url, json=None, timeout=None):
+    def _post(url, json=None, timeout=None, trust_env=True):
         seen.append({"url": url, "json": json, "timeout": timeout})
         prompt = json["messages"][-1]["content"]
         text = "## Insight\nS." if prompt.startswith("You are synthesizing") else "LABEL: alpha topic"

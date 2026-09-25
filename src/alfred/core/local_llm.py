@@ -28,8 +28,9 @@ import re
 import httpx
 import structlog
 
-from alfred.config import spark_env
+from alfred.config import LocalOnlyViolation, spark_env
 from alfred.core.failures import record_failure
+from alfred.core.ollama_guard import ModelCheckFailed, check_model_runs_here
 
 log = structlog.get_logger()
 
@@ -54,6 +55,16 @@ class LocalLLMBadRequest(LocalLLMUnavailable):
     error_counts (local_llm.bad_request) when raised, so a fleet stalled on it
     is loud. Before this, every 400 was LocalLLMRequestTooLarge, and a setup
     mistake would have silently skipped the whole inbox.
+    """
+
+
+class LocalLLMRemoteModel(LocalLLMUnavailable, LocalOnlyViolation):
+    """A local-only call named a model the local Ollama would run remotely.
+
+    Nothing was sent. It is a LocalLLMUnavailable, so callers leave the work
+    undone and retry later, and a LocalOnlyViolation, so code that asks "is
+    this the carve-out refusing?" can tell. Logged at error level and counted
+    (local_llm.remote_model_refused) every time, so a stalled vault is loud.
     """
 
 
@@ -118,6 +129,7 @@ def complete(
     schema: dict | None = None,
     max_tokens: int = 2048,
     timeout: float = 180.0,
+    local_only: bool = False,
 ) -> str:
     """Run one completion and return the assistant's text.
 
@@ -130,15 +142,24 @@ def complete(
     An empty system prompt sends the user message alone, as the consolidator's
     old /api/generate calls did.
 
+    local_only (a local-only vault's cfg.llm sets it) first asks the local
+    Ollama whether the model runs there; see alfred.core.ollama_guard.
+
     Raises LocalLLMUnavailable on any transport error, any non-2xx status
     (bar the OpenAI path's context-length 400), or a malformed response body;
     LocalLLMBadRequest (a LocalLLMUnavailable) on any other OpenAI-path 400;
-    and LocalLLMRequestTooLarge / LocalLLMOutputTruncated as described there.
-    Never returns "" to signal failure.
+    LocalLLMRemoteModel (a LocalLLMUnavailable) when local_only and the model
+    would run remotely; and LocalLLMRequestTooLarge / LocalLLMOutputTruncated
+    as described there. Never returns "" to signal failure.
     """
     messages = [{"role": "user", "content": user}]
     if system:
         messages.insert(0, {"role": "system", "content": system})
+
+    if local_only:
+        if api != "ollama":
+            raise LocalOnlyViolation(f"a local-only call asked for llm api {api!r}")
+        _ensure_model_runs_here(base_url, model)
 
     if api == "openai":
         return _complete_openai(
@@ -162,7 +183,9 @@ def complete(
         payload["format"] = "json"
 
     try:
-        resp = httpx.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
+        # trust_env=False: Ollama is on loopback, and an HTTP(S)_PROXY or
+        # ALL_PROXY in the environment must not carry vault text elsewhere.
+        resp = httpx.post(f"{base_url}/api/chat", json=payload, timeout=timeout, trust_env=False)
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
         raise LocalLLMUnavailable(
@@ -182,6 +205,18 @@ def complete(
         ) from e
 
     return content or ""
+
+
+def _ensure_model_runs_here(base_url: str, model: str) -> None:
+    """Refuse, before anything is sent, a model the local Ollama runs remotely."""
+    try:
+        check_model_runs_here(base_url, model)
+    except LocalOnlyViolation as e:
+        log.error("local_llm.remote_model_refused", base_url=base_url, model=model, error=str(e))
+        record_failure("local_llm.remote_model_refused")
+        raise LocalLLMRemoteModel(str(e)) from e
+    except ModelCheckFailed as e:
+        raise LocalLLMUnavailable(str(e)) from e
 
 
 def _openai_client(base_url: str, api_key: str, timeout: float):
@@ -288,6 +323,7 @@ def complete_json(
     schema: dict | None = None,
     max_tokens: int = 1024,
     timeout: float = 180.0,
+    local_only: bool = False,
 ) -> dict:
     """complete() in JSON mode, parsed to a dict.
 
@@ -300,6 +336,7 @@ def complete_json(
         system, user,
         base_url=base_url, model=model, api=api, api_key_env=api_key_env,
         json_mode=True, schema=schema, max_tokens=max_tokens, timeout=timeout,
+        local_only=local_only,
     ).strip()
 
     # Belt and braces: format=json should make fences impossible, but a model

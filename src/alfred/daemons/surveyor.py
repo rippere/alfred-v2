@@ -45,7 +45,11 @@ class SurveyorDaemon(BaseDaemon):
     def _get_embedder(self):
         if self._embedder is None:
             from alfred.embed.ollama import OllamaEmbedder
-            self._embedder = OllamaEmbedder(self.cfg.embed_base_url, self.cfg.ollama_embed_model)
+            self._embedder = OllamaEmbedder(
+                self.cfg.embed_base_url,
+                self.cfg.ollama_embed_model,
+                local_only=getattr(self.cfg, "local_only", False),
+            )
         return self._embedder
 
     def _get_bm25(self):

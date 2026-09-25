@@ -35,6 +35,7 @@ def synthesize(
     *,
     api: str = "ollama",
     api_key_env: str | None = None,
+    local_only: bool = False,
 ) -> tuple[str, str, str]:
     """Returns (answer, backend_label, model_label). Pass **cfg.llm.
 
@@ -52,6 +53,7 @@ def synthesize(
         api=api,
         api_key_env=api_key_env,
         max_tokens=2048,
+        local_only=local_only,
     )
     if api == "ollama":
         return answer, "Ollama (local)", model

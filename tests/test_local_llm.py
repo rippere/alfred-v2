@@ -75,8 +75,8 @@ def _no_real_spark_env(tmp_path, monkeypatch):
 def _capture_ollama(monkeypatch, content="ok"):
     seen: list[dict] = []
 
-    def _post(url, json=None, timeout=None):
-        seen.append({"url": url, "json": json, "timeout": timeout})
+    def _post(url, json=None, timeout=None, trust_env=True):
+        seen.append({"url": url, "json": json, "timeout": timeout, "trust_env": trust_env})
         return httpx.Response(
             200, json={"message": {"role": "assistant", "content": content}},
             request=httpx.Request("POST", url),
@@ -96,6 +96,7 @@ def test_default_config_selects_todays_ollama_backend(tmp_path):
         "api": "ollama",
         "base_url": cfg.ollama_base_url,
         "model": cfg.ollama_llm_model,
+        "local_only": False,
     }
 
 
@@ -124,6 +125,8 @@ def test_ollama_request_is_unchanged(monkeypatch):
             "format": "json",
         },
         "timeout": 180.0,
+        # The payload is byte-identical; only proxy variables are ignored now.
+        "trust_env": False,
     }]
 
 
@@ -152,7 +155,7 @@ def test_ollama_400_still_means_unavailable(monkeypatch):
     """Only the OpenAI path gets the new 400 mapping; Ollama never 400s on size."""
     monkeypatch.setattr(
         httpx, "post",
-        lambda url, json=None, timeout=None: httpx.Response(
+        lambda url, json=None, timeout=None, trust_env=True: httpx.Response(
             400, text="bad", request=httpx.Request("POST", url)
         ),
     )
