@@ -197,6 +197,68 @@ def test_employment_stays_local_when_the_fleet_flips(tmp_path, monkeypatch, flip
     assert personal.embed_base_url == (ollama_url or "http://localhost:11434")
 
 
+@pytest.mark.parametrize("flip", [
+    pytest.param({"api": "openai", "api_key_env": "SPARK_API_KEY"}, id="base-sets-api-only"),
+    pytest.param(
+        {"api": "openai", "base_url": "https://spark.test:8000/v1",
+         "model": "qwen3-30b", "api_key_env": "SPARK_API_KEY"},
+        id="base-also-sets-url-and-model",
+    ),
+])
+def test_main_vault_stays_on_ollama_when_the_base_flips(tmp_path, monkeypatch, flip):
+    """config.yaml pins llm to ollama until the pre-flip gates close: the main
+    vault holds twin-provenance records. A base flip (the old step-15
+    instructions) moves the satellites and leaves main where it is."""
+    monkeypatch.setenv("SPARK_BASE_URL", "https://spark.test:8000/v1")
+    monkeypatch.setenv("SPARK_MODEL", "qwen3-30b")
+
+    main = AlfredConfig.load(_copy_real(tmp_path, "config.yaml", flip))
+    personal = AlfredConfig.load(_copy_real(tmp_path, "config-personal.yaml", flip))
+
+    assert main.llm == {
+        "api": "ollama",
+        "base_url": "http://localhost:11434",
+        "model": "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M",
+        "local_only": False,
+    }
+    assert personal.llm["api"] == "openai"
+
+
+def _flip_one_vault(tmp_path: Path, name: str) -> Path:
+    """The documented step-15 enablement: `llm: {api: openai}` in that vault's
+    own file, base untouched."""
+    path = _copy_real(tmp_path, name)
+    raw = yaml.safe_load(path.read_text())
+    raw["llm"] = {"api": "openai"}
+    path.write_text(yaml.safe_dump(raw))
+    return path
+
+
+def test_the_documented_enablement_moves_one_satellite_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPARK_BASE_URL", "https://spark.test:8000/v1")
+    monkeypatch.setenv("SPARK_MODEL", "qwen3-30b")
+
+    personal = AlfredConfig.load(_flip_one_vault(tmp_path, "config-personal.yaml"))
+    assert personal.llm == {
+        "api": "openai",
+        "base_url": "https://spark.test:8000/v1",
+        "model": "qwen3-30b",
+        "api_key_env": "SPARK_API_KEY",
+        "local_only": False,
+    }
+    assert personal.embed_base_url == "http://localhost:11434"
+    for name in REAL_CONFIGS:
+        if name != "config-personal.yaml":
+            assert AlfredConfig.load(_copy_real(tmp_path, name)).llm["api"] == "ollama", name
+
+
+def test_employment_refuses_the_documented_enablement(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPARK_BASE_URL", "https://spark.test:8000/v1")
+    monkeypatch.setenv("SPARK_MODEL", "qwen3-30b")
+    with pytest.raises(LocalOnlyViolation):
+        AlfredConfig.load(_flip_one_vault(tmp_path, "config-employment.yaml"))
+
+
 def test_employment_chat_and_embeddings_hit_loopback_when_base_llm_and_ollama_flip(
     tmp_path, monkeypatch
 ):
