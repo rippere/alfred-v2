@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import hashlib
 import json
+import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -12,7 +14,7 @@ import structlog
 
 from alfred.core.local_llm import LocalLLMUnavailable, complete_json
 from alfred.core.schema import KNOWN_TYPES, STATUS_BY_TYPE, TYPE_DIRECTORY, correct_status, correct_type
-from alfred.core.vault_ops import VaultError, vault_create, vault_move
+from alfred.core.vault_ops import VaultError, vault_create, vault_edit, vault_move
 from alfred.daemons.base import BaseDaemon
 
 log = structlog.get_logger()
@@ -44,6 +46,68 @@ Note content:
 ---
 {content}
 ---"""
+
+
+# A recurring feed marks every drop with `<!-- alfred:source <key> -->` (or a
+# `source_key` frontmatter field): one stable identity for the feed, each drop
+# a full snapshot meant to replace the last. Nothing honoured it, so the ECC
+# instinct bridge's hourly-when-changed drops became ~40 near-identical 1.2-1.5
+# MB records across ten type directories, then `curator.duplicate_skip` once
+# every name was taken — and each of those records costs ~5.9K embedded chunks.
+_SOURCE_KEY_RE = re.compile(r"<!--\s*alfred:source\s+([A-Za-z0-9._:-]+)\s*-->")
+
+# How much of a candidate record is read to confirm its key. Frontmatter and
+# marker sit at the top; the bodies run past a megabyte.
+_FEED_HEAD_BYTES = 4096
+
+
+def _extract_source_key(fm: dict, body: str) -> str:
+    """The feed identity a drop declares, or "". Frontmatter wins over the marker."""
+    declared = fm.get("source_key")
+    if isinstance(declared, str) and declared.strip():
+        return declared.strip()
+    m = _SOURCE_KEY_RE.search(body[:_FEED_HEAD_BYTES])
+    return m.group(1) if m else ""
+
+
+def _find_feed_record(vault_path: Path, key: str, slug: str, ignore_dirs) -> str | None:
+    """The record a keyed feed's drops update, or None.
+
+    Looks for files named after the drop's slug in EVERY top-level directory:
+    the instinct drop's type is not in the schema, so the model classified each
+    sync afresh and its records landed in note/, drafts/, process/, topic/,
+    task/, synthesis/, input/, asset/, wiki/ and session/. Searching only the
+    classified type's directory (36fe293, reverted) could not find them. A
+    title change therefore makes one new record, stamped with the key, which
+    the next drop finds by its new name.
+
+    A candidate counts only if its head carries the key. Among several, prefer
+    the key in frontmatter (stamped on create), then the bare slug, then newest.
+    """
+    skip = set(ignore_dirs or ())
+    found: list[tuple[bool, bool, float, str]] = []
+    for fp in vault_path.glob(f"*/{glob.escape(slug)}*.md"):
+        top = fp.parent.name
+        # inbox/ always: the default ignore_dirs lists only inbox/processed,
+        # and a drop named after its own slug must never be its own record.
+        if top == "inbox" or top in skip or top.startswith("."):
+            continue
+        try:
+            with fp.open("rb") as fh:
+                head = fh.read(_FEED_HEAD_BYTES).decode("utf-8", "replace")
+            mtime = fp.stat().st_mtime
+        except OSError:
+            continue
+        fm_block = head.split("\n---", 1)[0] if head.startswith("---") else ""
+        in_fm = bool(re.search(
+            rf"^source_key:\s*['\"]?{re.escape(key)}['\"]?\s*$", fm_block, re.MULTILINE
+        ))
+        marker = _SOURCE_KEY_RE.search(head)
+        if not in_fm and not (marker and marker.group(1) == key):
+            continue
+        rel = str(fp.relative_to(vault_path)).replace("\\", "/")
+        found.append((not in_fm, fp.stem != slug, -mtime, rel))
+    return min(found)[3] if found else None
 
 
 def _json_default(obj):
@@ -130,6 +194,35 @@ class CuratorDaemon(BaseDaemon):
             fm = {}
             body = inbox_file.read_text(encoding="utf-8", errors="replace")
 
+        # A drop from a recurring feed replaces that feed's record in place —
+        # before classification, so it costs no LLM call either.
+        source_key = _extract_source_key(fm, body)
+        feed_title = fm.get("title") or fm.get("name") or fm.get("subject") or _extract_heading(body)
+        if source_key and feed_title:
+            existing = await asyncio.to_thread(
+                _find_feed_record,
+                self.cfg.vault_path,
+                source_key,
+                _slugify(feed_title),
+                getattr(self.cfg, "ignore_dirs", ()),
+            )
+            if existing:
+                vault_edit(
+                    self.cfg.vault_path,
+                    existing,
+                    set_fields={"source_key": source_key},
+                    body_replace=body.strip() or None,
+                )
+                self.log.info(
+                    "curator.source_key_updated",
+                    path=existing,
+                    source_key=source_key,
+                    source=inbox_file.name,
+                )
+                _archive_drop(inbox_file, processed_dir, content_hash)
+                self.emit("curator_ingested", source=inbox_file.name, type=fm.get("type", ""))
+                return True
+
         content_preview = (body[:2000]).strip()
         if fm:
             fm_str = json.dumps({k: v for k, v in fm.items() if v}, indent=2, default=_json_default)
@@ -200,6 +293,8 @@ class CuratorDaemon(BaseDaemon):
             self.log.debug("curator.content_signal", path=inbox_file.name)
         if tags:
             set_fields["tags"] = tags
+        if source_key:
+            set_fields["source_key"] = source_key  # so the next drop finds it
 
         record_body = body.strip() or classification.get("summary", "")
 
@@ -250,10 +345,7 @@ class CuratorDaemon(BaseDaemon):
         # has already been ingested at this point, but deleting it here would
         # destroy the only raw copy of the newly-recovered content with no
         # archived fallback.
-        dest = processed_dir / inbox_file.name
-        if dest.exists():
-            dest = processed_dir / f"{inbox_file.stem}.{content_hash}{inbox_file.suffix}"
-        inbox_file.rename(dest)
+        _archive_drop(inbox_file, processed_dir, content_hash)
 
         self.emit("curator_ingested", source=inbox_file.name, type=rec_type)
         return True
@@ -350,6 +442,13 @@ def _has_content_signal(text: str) -> bool:
     """Return True if the text contains strong content-creation signals."""
     lower = text.lower()
     return sum(1 for term in _CONTENT_SIGNAL_TERMS if term in lower) >= 2
+
+
+def _archive_drop(inbox_file: Path, processed_dir: Path, content_hash: str) -> None:
+    dest = processed_dir / inbox_file.name
+    if dest.exists():
+        dest = processed_dir / f"{inbox_file.stem}.{content_hash}{inbox_file.suffix}"
+    inbox_file.rename(dest)
 
 
 def _slugify(text: str) -> str:

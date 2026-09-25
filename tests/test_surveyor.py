@@ -411,3 +411,38 @@ def test_recluster_keeps_the_cluster_object_and_its_bookkeeping(tmp_path, monkey
     assert held.label == ["alpha"]
     assert held.consolidated_chunk_id == "synthesis/alpha.md"
     assert (held.labeled_members, held.synthesized_members) == ("fp-labeled", "fp-synth")
+
+
+def test_embed_that_outlasts_a_save_is_not_redone(tmp_path, monkeypatch):
+    """The re-embed churn: on 2026-09-24 the main vault re-embedded ~517K
+    chunks, nearly all from ~1.3 MB instinct snapshots (5.9K chunks each) that
+    had not changed. Embedding one took longer than the 5-min periodic save,
+    and save() used to swap out the state object _process_diff was writing
+    into, so the new md5 never reached disk and every tick saw the file as
+    changed again. (Fixed by StateStore._fold_into; this pins the symptom.)"""
+    vault_path = tmp_path / "vault"
+    vault_path.mkdir()
+    (vault_path / "big.md").write_text(
+        "---\ntype: note\n---\nA long feed snapshot body.\n", encoding="utf-8"
+    )
+    cfg = AlfredConfig(vault_path=vault_path, data_dir=tmp_path / "data")
+    cfg.data_dir.mkdir()
+    state_store = StateStore(tmp_path / "state.json")
+    state_store.load()
+    daemon = SurveyorDaemon(cfg, state_store, asyncio.Queue(), store=_RecordingStore())
+
+    class _SlowEmbedder:
+        async def embed(self, text: str) -> list[float]:
+            state_store.save()  # the periodic save lands mid-embed
+            return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr(daemon, "_get_embedder", lambda: _SlowEmbedder())
+    monkeypatch.setattr(daemon, "_get_bm25", lambda: _StubBM25())
+
+    asyncio.run(daemon.tick())
+
+    restarted = StateStore(tmp_path / "state.json")
+    restarted.load()
+    assert restarted.state.files.get("big.md") is not None, "embed not recorded"
+    daemon.state = restarted
+    assert daemon._compute_diff()["changed"] == [], "unchanged file queued for re-embed"
