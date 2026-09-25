@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import structlog
 import yaml
@@ -19,10 +20,26 @@ LLM_APIS = ("ollama", "openai")
 # hooks). Read when a SPARK_* variable is not in the environment.
 SPARK_ENV_PATH = Path.home() / ".config" / "spark" / "env"
 
+# Local-only vaults: every completion AND embedding goes to benderman's own
+# Ollama on loopback, and nowhere else. There is no allow-list and no knob
+# that lifts it. A vault is local-only when its file says `local_only: true`,
+# and also, whatever the file says, when it is the employment vault by name or
+# by path: deleting the flag (a bad merge, a revert) must fail closed, not
+# quietly move Betson twin text to the Spark.
+LOCAL_ONLY_CONFIG_NAMES = frozenset({"config-employment.yaml"})
+LOCAL_ONLY_VAULT_ROOTS = (
+    Path("/mnt/external/vault-employment"),
+    Path("/mnt/external/Employment"),
+    Path.home() / "betson-it-review",
+)
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+LOCAL_OLLAMA_PORT = 11434
+
 # Every YAML key path AlfredConfig.load() actually consumes. Keys present in a
 # merged config but absent here are dead weight — load() warns on them (the
 # check that would have caught `distiller.stale_days` / `consolidator.*`).
 _CONSUMED_KEYS: frozenset[tuple[str, ...]] = frozenset({
+    ("local_only",),
     ("vault", "path"),
     ("vault", "ignore_dirs"),
     ("data_dir",),
@@ -112,6 +129,40 @@ def spark_env(name: str) -> str | None:
         if sep and key.strip() == name:
             return val.strip().strip('"').strip("'") or None
     return None
+
+
+def is_local_ollama_url(url: str) -> bool:
+    """True only for plain http to benderman's own Ollama on loopback:11434."""
+    try:
+        parts = urlsplit(url or "")
+        port = parts.port
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "http"
+        and (parts.hostname or "") in LOOPBACK_HOSTS
+        and port == LOCAL_OLLAMA_PORT
+        and not parts.username
+        and parts.path in ("", "/")
+    )
+
+
+def _is_local_only_vault(vault_path: Path) -> bool:
+    """Is this vault under a local-only root, as written or after symlinks?"""
+    candidates = [Path(os.path.abspath(vault_path.expanduser()))]
+    try:
+        candidates.append(vault_path.expanduser().resolve())
+    except OSError:
+        pass
+    return any(
+        path == root or root in path.parents
+        for path in candidates
+        for root in LOCAL_ONLY_VAULT_ROOTS
+    )
+
+
+class LocalOnlyViolation(ValueError):
+    """A local-only vault's config points a completion or embedding off-box."""
 
 
 def load_env(config_path: Path) -> None:
@@ -252,9 +303,40 @@ class AlfredConfig:
     # Synthesis runs on the local model (ollama_llm_model above). The former
     # anthropic_model / openrouter_model keys were removed with the cloud chain.
 
+    # Completions and embeddings only ever go to loopback Ollama (see
+    # LOCAL_ONLY_CONFIG_NAMES). load() refuses a config that says otherwise,
+    # and llm / embed_base_url re-check it on every use.
+    local_only: bool = False
+
+    def check_local_only(self) -> None:
+        """Raise LocalOnlyViolation if a local-only vault would leave loopback."""
+        if not self.local_only:
+            return
+        problems = []
+        if self.llm_api != "ollama":
+            problems.append(f"llm.api is {self.llm_api!r}, not 'ollama'")
+        llm_url = self.llm_base_url or self.ollama_base_url
+        if not is_local_ollama_url(llm_url):
+            problems.append(f"llm base_url {llm_url!r} is not loopback Ollama")
+        if not is_local_ollama_url(self.ollama_base_url):
+            problems.append(f"ollama.base_url {self.ollama_base_url!r} is not loopback Ollama")
+        if problems:
+            raise LocalOnlyViolation(
+                f"local-only vault {self.vault_path}: "
+                + "; ".join(problems)
+                + f" (only http://127.0.0.1:{LOCAL_OLLAMA_PORT} or localhost/[::1] is allowed)"
+            )
+
+    @property
+    def embed_base_url(self) -> str:
+        """The Ollama URL embeddings go to, re-checked for a local-only vault."""
+        self.check_local_only()
+        return self.ollama_base_url
+
     @property
     def llm(self) -> dict:
         """Backend keyword arguments for local_llm.complete() / complete_json()."""
+        self.check_local_only()
         if self.llm_api == "ollama":
             return {
                 "api": "ollama",
@@ -332,6 +414,16 @@ class AlfredConfig:
         if cfg.llm_api not in LLM_APIS:
             # A typo must not quietly fall back to either backend.
             raise ValueError(f"{path}: llm.api is {cfg.llm_api!r}; expected one of {LLM_APIS}")
+        # Local-only by the file's flag, or by provenance whatever the flag
+        # says. Checked before the Spark env is read, so a local-only vault
+        # never even resolves a Spark URL.
+        cfg.local_only = (
+            bool(raw.get("local_only", False))
+            or path.name in LOCAL_ONLY_CONFIG_NAMES
+            or _is_local_only_vault(vault_path)
+        )
+        if cfg.local_only:
+            cfg.check_local_only()
         if cfg.llm_api == "openai":
             cfg.llm_base_url = (cfg.llm_base_url or spark_env("SPARK_BASE_URL") or "").rstrip("/")
             cfg.llm_model = cfg.llm_model or spark_env("SPARK_MODEL") or ""

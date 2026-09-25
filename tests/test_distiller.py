@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from structlog.testing import capture_logs
@@ -419,7 +419,7 @@ def test_capped_sweep_takes_never_distilled_then_oldest_first(tmp_path, monkeypa
     monkeypatch.setattr("alfred.daemons.distiller.complete", _complete)
     _stale_files(daemon, ["stale-newer.md"], "2026-07-01T00:00:00+00:00")
     _stale_files(daemon, ["stale-older.md"], "2026-05-01T00:00:00+00:00")
-    _stale_files(daemon, ["fresh.md"], datetime.now(timezone.utc).isoformat())
+    _stale_files(daemon, ["fresh.md"], datetime.now(UTC).isoformat())
     _stale_files(daemon, ["never-a.md", "never-b.md"])
 
     asyncio.run(daemon.tick())

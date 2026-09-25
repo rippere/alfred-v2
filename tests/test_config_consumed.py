@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from alfred.config import AlfredConfig, _deep_merge
+from alfred.config import AlfredConfig, LocalOnlyViolation, _deep_merge
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -95,10 +95,18 @@ def test_every_yaml_key_is_consumed(config_name, tmp_path, monkeypatch):
 
     dead: list[str] = []
     for key_path, value in _leaf_paths(raw):
+        if key_path == ("local_only",):
+            # The employment vault is local-only by file name and vault path
+            # too (fail closed), so clearing the flag alone changes nothing
+            # here. test_config_llm covers the flag on a vault it doesn't force.
+            continue
         perturbed = copy.deepcopy(raw)
         _set_in(perturbed, key_path, _perturb(key_path, value))
         work.write_text(yaml.safe_dump(perturbed))
-        cfg2 = _snapshot(AlfredConfig.load(work))
+        try:
+            cfg2 = _snapshot(AlfredConfig.load(work))
+        except LocalOnlyViolation:
+            continue  # a local-only vault refused the change: the key is enforced
         if cfg2 == baseline:
             dead.append(".".join(key_path))
 

@@ -102,7 +102,7 @@ class QueryEngine:
         if self._embedder is None:
             import httpx
             self._embedder = _SyncEmbedder(
-                url=f"{self.cfg.ollama_base_url}/api/embeddings",
+                url=f"{self.cfg.embed_base_url}/api/embeddings",
                 model=self.cfg.ollama_embed_model,
             )
         return self._embedder
