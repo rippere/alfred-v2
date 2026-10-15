@@ -60,7 +60,7 @@ def test_vault_file_wins_and_base_fills_gaps(tmp_path):
     assert cfg.janitor_sweep_interval_s == 22222
     # Base wins over dataclass default (default is 24, base sets it too — use
     # sweep partner key deep_interval_h which only base sets vs default 24;
-    # llm_model is the unambiguous one: default is the Qwen3.8 27B)
+    # llm_model is the unambiguous one: the dataclass default is the Qwen model)
     assert cfg.ollama_llm_model == "base-model:latest"
     assert cfg.default_top_k == 8
     # Dataclass default survives where neither file sets a key
@@ -202,6 +202,9 @@ def test_real_config_loads_with_expected_effective_values(config_name):
     assert cfg.janitor_dedup_enabled is False         # gated until dry-run tested
     assert cfg.ollama_llm_model == QWEN_27B
     assert cfg.ollama_embed_model == "nomic-embed-text"
+    # Every vault — main and employment included — must stay on the loopback
+    # Ollama. Their data never goes to the Spark or any cloud endpoint.
+    assert cfg.ollama_base_url in ("http://localhost:11434", "http://127.0.0.1:11434")
     # No cloud model fields: synthesis and every daemon call use ollama_llm_model.
     assert not hasattr(cfg, "anthropic_model")
     assert not hasattr(cfg, "openrouter_model")
