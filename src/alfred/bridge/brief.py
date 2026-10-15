@@ -11,13 +11,14 @@ Given a contact already resolved to a vault `person/*.md` entity (see
      directly also lets this module ask for retrieval without the engine's
      built-in generic Q&A synthesis (`include_synthesis=False`), since a CRM
      brief needs its own prompt, not "answer this query" framing.
-  2. Synthesizes a short 2-4 sentence brief from that context using the same
-     ad hoc `anthropic_client.get_client()` call shape every other Alfred
-     caller uses (see `alfred.query.synth._anthropic` for the canonical
-     example) — recon confirmed `anthropic_client.py` exposes only the bare
-     client singleton, no `synthesize()`/`brief()` helper to reuse, so this
-     module writes its own thin wrapper following that shape rather than
-     inventing a new call pattern.
+  2. Synthesizes a short 2-4 sentence brief from that context on the LOCAL
+     model (`alfred.core.local_llm.complete`, the same single backend every
+     daemon and `alfred.query.synth` use). Retrieved vault text never goes to
+     a cloud LLM: the former `anthropic_client.get_client()` call here was the
+     last cloud path left after the local-LLM swap, and it would have failed
+     open (main-vault context to Anthropic) the moment API credits returned.
+     If the local backend is down, `LocalLLMUnavailable` propagates — there is
+     no fallback ladder.
 
 If the query returns no relevant context at all, `synthesize_entity_brief`
 returns `None` — "nothing worth writing" is a normal, silent outcome for a
@@ -87,28 +88,28 @@ def compute_brief_hash(entity_rel_path: str, brief_text: str) -> str:
     return digest[:12]
 
 
-def _call_llm(entity: EntityMatch, context: str, *, model: str, max_tokens: int) -> str:
-    from alfred.core.anthropic_client import get_client
+def _call_llm(
+    entity: EntityMatch, context: str, *, base_url: str, model: str, max_tokens: int
+) -> str:
+    """One brief completion on the local backend. Raises LocalLLMUnavailable."""
+    from alfred.core.local_llm import complete
 
-    client = get_client()
-    resp = client.messages.create(
+    return complete(
+        SYSTEM_PROMPT,
+        f"Contact: {entity.name}\n\nVault context:\n\n{context}",
+        base_url=base_url,
         model=model,
         max_tokens=max_tokens,
-        system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": f"Contact: {entity.name}\n\nVault context:\n\n{context}",
-        }],
-    )
-    return resp.content[0].text.strip()
+    ).strip()
 
 
 def synthesize_entity_brief(
     engine: Any,
     entity: EntityMatch,
     *,
+    base_url: str,
+    model: str,
     top_k: int = 6,
-    model: str = C.BRIEF_SYNTHESIS_MODEL,
     max_tokens: int = C.BRIEF_MAX_TOKENS,
 ) -> Optional[Brief]:
     """Query the vault for `entity`, then synthesize a brief if there's
@@ -118,13 +119,19 @@ def synthesize_entity_brief(
     usable context — a contact with no related vault knowledge is the
     expected common case, not a failure, and the caller should simply skip
     posting for that contact.
+
+    `base_url`/`model` are the local LLM settings (`cfg.ollama_base_url`,
+    `cfg.ollama_llm_model`); they are required so no caller can fall back to
+    a cloud default by omission.
     """
     result = query_vault_context(engine, entity, top_k=top_k)
     context = (getattr(result, "context", "") or "").strip()
     if not context:
         return None
 
-    text = _call_llm(entity, context, model=model, max_tokens=max_tokens)
+    text = _call_llm(
+        entity, context, base_url=base_url, model=model, max_tokens=max_tokens
+    )
     if not text:
         return None
 
