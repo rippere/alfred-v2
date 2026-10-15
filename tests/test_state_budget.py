@@ -15,9 +15,10 @@ not, the budget counts down and clamps at zero, a stale api_calls_date rolls the
 daily counter over, and an expired/malformed pause timestamp clears itself. No
 source change — pure characterization of the existing gates.
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 from alfred.store.state import StateStore
 
@@ -40,7 +41,7 @@ def test_credit_low_failure_pauses_all_daemons(tmp_path):
 
     assert store.state.api_paused_until, "credit-low error left no pause timestamp"
     resume_at = datetime.fromisoformat(store.state.api_paused_until)
-    assert resume_at > datetime.now(timezone.utc), "pause must be in the future"
+    assert resume_at > datetime.now(UTC), "pause must be in the future"
     assert store.can_make_api_call() is False
     assert store.can_make_api_call(daemon="distiller") is False
 
@@ -89,14 +90,16 @@ def test_stale_api_calls_date_resets_daily_counter(tmp_path):
     assert store.budget_remaining() == 500
     assert store.state.api_calls_today == 0
     assert store.state.api_cost_usd_today == 0.0
-    assert store.state.api_calls_date == datetime.now(timezone.utc).date().isoformat()
+    # The store rolls over on its *local* calendar date (date.today()), not UTC,
+    # so compare against the same clock or this fails 17:00-24:00 PDT.
+    assert store.state.api_calls_date == date.today().isoformat()
 
 
 def test_expired_pause_clears_and_reopens_calls(tmp_path):
     """Once the recorded pause window has passed, the gate reopens and the
     stale timestamp is cleared."""
     store = _store(tmp_path)
-    past = datetime.now(timezone.utc) - timedelta(seconds=1)
+    past = datetime.now(UTC) - timedelta(seconds=1)
     store.state.api_paused_until = past.isoformat()
 
     assert store.can_make_api_call() is True
