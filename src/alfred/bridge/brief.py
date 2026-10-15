@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any, Optional
 
 from alfred.bridge import config as C
 from alfred.bridge.resolve import EntityMatch
