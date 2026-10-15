@@ -10,7 +10,13 @@ import anyio
 import structlog
 
 from alfred.config import AlfredConfig
-from alfred.store.state import StateStore
+from alfred.store.state import StateSaveTimeout, StateStore
+
+# Upper bound on a routine daemon save. Without one, a process stuck holding
+# the state.json flock (e.g. a frozen MCP query server) would park the save's
+# worker thread forever and hold StateStore._lock, queueing every later save,
+# including the shutdown one, behind it.
+DAEMON_SAVE_TIMEOUT_S = 60.0
 
 
 @dataclass
@@ -59,4 +65,14 @@ class BaseDaemon:
                 )
 
     async def save_state(self) -> None:
-        self.state.save()
+        # Off-loop: the blocking read/merge/dump/write runs in a worker thread.
+        # The surveyor calls this every 25 files, and the old synchronous
+        # save() froze the whole event loop each time, long enough under
+        # memory pressure that SIGTERM wasn't even handled before systemd's
+        # SIGKILL.
+        # A timeout leaves state.json as it was and the changes in memory; the
+        # next save retries them. Keep the tick going rather than abort it.
+        try:
+            await self.state.async_save(timeout=DAEMON_SAVE_TIMEOUT_S)
+        except StateSaveTimeout as e:
+            self.log.warning("daemon.save_state_timeout", timeout_s=DAEMON_SAVE_TIMEOUT_S, error=str(e))

@@ -76,11 +76,13 @@ class SurveyorDaemon(BaseDaemon):
         except Exception as e:
             self.log.error("surveyor.recluster_error", error=str(e))
 
-    async def teardown(self) -> None:
-        """Clean shutdown: flush embedder and save state."""
+    async def teardown(self, save: bool = True) -> None:
+        """Clean shutdown: flush embedder and (unless the caller just did a
+        bounded final save itself, as the runner does) save state."""
         if self._embedder:
             await self._embedder.close()
-        await self.save_state()
+        if save:
+            await self.save_state()
 
     async def _tick(self) -> None:
         diff = self._compute_diff()

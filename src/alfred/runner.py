@@ -19,13 +19,31 @@ import asyncio
 import signal
 from datetime import datetime, timedelta, timezone
 
+import time
+
 import anyio
 import anyio.to_thread
 import structlog
 
+from alfred.daemons.base import DAEMON_SAVE_TIMEOUT_S
+from alfred.store.state import StateSaveTimeout
+
 # Must stay comfortably under alfred.service's TimeoutStopSec=30, so the final
 # state save gets a turn before systemd escalates to SIGKILL.
 SHUTDOWN_GRACE_S = 15.0
+
+# Shutdown budget, measured from when the SIGTERM handler runs: TimeoutStopSec=30
+# minus ~3s for surveyor teardown and interpreter exit. The final save gets
+# whatever the scheduler grace leaves, clamped to [MIN, MAX]. A save that
+# can't finish in time gives up cleanly (StateSaveTimeout): state.json keeps
+# the previous complete save instead of the process dying mid-write.
+SHUTDOWN_BUDGET_S = 27.0
+FINAL_SAVE_MAX_S = 10.0
+FINAL_SAVE_MIN_S = 3.0
+# Backstop on top of the save's own deadline. The deadline already covers the
+# lock wait and the replace; this only matters if the worker stalls in
+# between (e.g. a read under swap thrash).
+FINAL_SAVE_BACKSTOP_S = 2.0
 
 log = structlog.get_logger()
 
@@ -34,6 +52,39 @@ log = structlog.get_logger()
 # often enough to keep up, and daily is plenty. (config.py is owned by another
 # workstream — new intervals live here as constants per the split design.)
 SESSION_ARCHIVE_INTERVAL_H = 24
+
+
+def final_save_timeout(signal_at: float | None, now: float | None = None) -> float:
+    """Seconds the final save may take, given when the stop signal was handled."""
+    now = time.monotonic() if now is None else now
+    elapsed = 0.0 if signal_at is None else max(0.0, now - signal_at)
+    return max(FINAL_SAVE_MIN_S, min(FINAL_SAVE_MAX_S, SHUTDOWN_BUDGET_S - elapsed))
+
+
+async def final_save(state_store, timeout_s: float) -> bool:
+    """Bounded final state save. Returns True if it committed.
+
+    Logs ``alfred.final_save`` on success and ``alfred.final_save_timeout`` when
+    the deadline wins. Either way state.json is a complete file: the old one,
+    or the new one, swapped in by os.replace()."""
+    started = time.monotonic()
+    try:
+        with anyio.fail_after(timeout_s + FINAL_SAVE_BACKSTOP_S):
+            await state_store.async_save(timeout=timeout_s)
+    except (StateSaveTimeout, TimeoutError) as e:
+        log.warning(
+            "alfred.final_save_timeout",
+            timeout_s=round(timeout_s, 1),
+            elapsed_s=round(time.monotonic() - started, 2),
+            error=str(e) or type(e).__name__,
+            detail="previous state.json left intact",
+        )
+        return False
+    except Exception as e:
+        log.warning("alfred.final_save_failed", error=str(e))
+        return False
+    log.info("alfred.final_save", elapsed_s=round(time.monotonic() - started, 2))
+    return True
 
 
 async def run_daemons(cfg, only: set[str] | None = None) -> None:
@@ -209,7 +260,7 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
     # ── Periodic state save every 5 minutes ───────────────────────────────────
     async def _periodic_save() -> None:
         try:
-            await state_store.async_save()
+            await state_store.async_save(timeout=DAEMON_SAVE_TIMEOUT_S)
             log.debug("alfred.periodic_save")
         except Exception as e:
             log.warning("alfred.periodic_save_failed", error=str(e))
@@ -290,9 +341,12 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
 
     # ── Event drain task ───────────────────────────────────────────────────────
     stop_event = anyio.Event()
+    signal_at: list[float] = []   # monotonic time the stop signal was handled
 
     def _handle_signal() -> None:
         log.info("alfred.shutdown_signal")
+        if not signal_at:
+            signal_at.append(time.monotonic())
         stop_event.set()
 
     async def _event_drain() -> None:
@@ -329,8 +383,15 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
     # Bounded instead. A job that overruns the grace loses its partial pass,
     # which the next tick redoes; a SIGKILL during the final state save is not
     # recoverable. Getting to the save is what matters.
+    #
+    # abandon_on_cancel=True is what lets the grace actually fire: a plain
+    # to_thread.run_sync() is not cancellable, so move_on_after() could only
+    # take effect after shutdown() had returned on its own. That is why
+    # alfred.shutdown_grace_expired has never once appeared in the log.
     with anyio.move_on_after(SHUTDOWN_GRACE_S) as scope:
-        await anyio.to_thread.run_sync(lambda: scheduler.shutdown(wait=True))
+        await anyio.to_thread.run_sync(
+            lambda: scheduler.shutdown(wait=True), abandon_on_cancel=True
+        )
     if scope.cancelled_caught:
         log.warning(
             "alfred.shutdown_grace_expired",
@@ -343,17 +404,18 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
             log.debug("alfred.scheduler_force_shutdown_noop", error=str(e))
     log.info("alfred.scheduler_stopped")
 
-    # Final state save
-    try:
-        state_store.save()
-        log.info("alfred.final_save")
-    except Exception as e:
-        log.warning("alfred.final_save_failed", error=str(e))
+    # Final state save: off the loop, and bounded to what's left of the
+    # TimeoutStopSec budget. It used to be a bare synchronous save(), which
+    # under memory pressure ran past the 30s stop timeout. Every stop from
+    # 2026-10-13 on ended in SIGKILL with no alfred.final_save logged.
+    await final_save(state_store, final_save_timeout(signal_at[0] if signal_at else None))
 
-    # Surveyor teardown: close embedder HTTP session
+    # Surveyor teardown: close embedder HTTP session. save=False because the
+    # bounded final save above just ran; a second, unbounded one here would
+    # spend the remaining stop budget for nothing.
     if "surveyor" in active_names:
         try:
-            await surveyor.teardown()
+            await surveyor.teardown(save=False)
         except Exception as e:
             log.warning("alfred.surveyor_teardown_failed", error=str(e))
 
