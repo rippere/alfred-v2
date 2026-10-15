@@ -25,6 +25,13 @@ from alfred.core.failures import record_failure
 
 log = structlog.get_logger()
 
+# Where an auto-quarantine drops its operator alert. Module-level so the test
+# suite can point it away from the live vault: the quarantine tests used to
+# write a real "corruption" note here on every run (76 of the 77 alerts in the
+# inbox by 2026-10-15 came from pytest tmp dirs), and the curator then ingested
+# each one into the vault as an event record.
+CORRUPTION_ALERT_INBOX = Path("/mnt/external/obsidian-vault/inbox")
+
 # glibc hands freed heap back to the process's per-thread arenas, not to the
 # OS, so a long delete sweep ratchets RSS upward even when every individual
 # call is small — this box has 16 cores, so up to 128 arenas. That ratchet, not
@@ -311,7 +318,7 @@ class LanceDBStore:
         if kill_ctx:
             log.info("lancedb.quarantine_kill_context", name=collection, context=kill_ctx)
         try:
-            inbox = Path("/mnt/external/obsidian-vault/inbox")
+            inbox = CORRUPTION_ALERT_INBOX
             if not inbox.is_dir():
                 return
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
