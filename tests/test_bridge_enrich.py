@@ -127,6 +127,18 @@ class _CrmFake:
         return [u for u in self.post_calls if "auth/v1/token" not in u]
 
 
+LOCAL_LLM_URL = "http://127.0.0.1:11434"
+LOCAL_LLM_MODEL = "local-test-model"
+
+
+LOCAL_LLM = {"api": "ollama", "base_url": LOCAL_LLM_URL, "model": LOCAL_LLM_MODEL,
+             "local_only": False}
+
+
+def _cfg():
+    return SimpleNamespace(vault_path=Path("/does/not/matter"), llm=dict(LOCAL_LLM))
+
+
 def _fake_resolve(vault_path, *, email, name=None, ignore_dirs=None):
     if email == "alice@example.com":
         return EntityMatch(rel_path="person/Alice.md", entity_type="person", name="Alice")
@@ -135,7 +147,10 @@ def _fake_resolve(vault_path, *, email, name=None, ignore_dirs=None):
     return None  # bob: no vault match
 
 
-def _fake_synthesize(engine, entity, *, top_k=6, **kwargs):
+def _fake_synthesize(engine, entity, *, top_k=6, llm=None, **kwargs):
+    # Briefs must be synthesized on the vault's configured backend (cfg.llm),
+    # never a cloud default picked up by omission.
+    assert llm == LOCAL_LLM, llm
     if entity.name == "Alice":
         return Brief(
             entity_rel_path=entity.rel_path, entity_name="Alice",
@@ -161,7 +176,7 @@ def test_run_enrich_full_dry_run_flow(monkeypatch):
     crm = _CrmFake()
     _patch_flow(monkeypatch, crm)
 
-    cfg = SimpleNamespace(vault_path=Path("/does/not/matter"))
+    cfg = _cfg()
     summary = enrich_crm.run_enrich(cfg, object(), dry_run=True)
 
     assert summary.deals_seen == 4          # 5 total minus 1 closed_won
@@ -191,7 +206,7 @@ def test_run_enrich_missing_creds_makes_zero_http_calls(monkeypatch):
     crm = _CrmFake()
     _patch_flow(monkeypatch, crm)
 
-    cfg = SimpleNamespace(vault_path=Path("/does/not/matter"))
+    cfg = _cfg()
     summary = enrich_crm.run_enrich(cfg, object(), dry_run=True)
 
     assert summary.as_dict() == {
@@ -211,7 +226,7 @@ def test_run_enrich_dry_run_true_never_posts_even_when_push_flag_semantics_check
     crm = _CrmFake()
     _patch_flow(monkeypatch, crm)
 
-    cfg = SimpleNamespace(vault_path=Path("/does/not/matter"))
+    cfg = _cfg()
     enrich_crm.run_enrich(cfg, object(), dry_run=True)
 
     # Every POST that happened was a Supabase auth grant, never a CRM write.
@@ -229,7 +244,7 @@ def test_run_enrich_push_true_still_skips_all_duplicates(monkeypatch):
     crm = _CrmFake(existing_notes=notes)
     _patch_flow(monkeypatch, crm)
 
-    cfg = SimpleNamespace(vault_path=Path("/does/not/matter"))
+    cfg = _cfg()
     summary = enrich_crm.run_enrich(cfg, object(), dry_run=False)
 
     assert summary.would_post == 0
@@ -254,9 +269,29 @@ def test_run_enrich_auth_failure_reports_error_and_makes_no_deal_calls(monkeypat
     monkeypatch.setattr(enrich_crm, "resolve_contact_to_entity", _fake_resolve)
     monkeypatch.setattr(enrich_crm, "synthesize_entity_brief", _fake_synthesize)
 
-    cfg = SimpleNamespace(vault_path=Path("/does/not/matter"))
+    cfg = _cfg()
     summary = enrich_crm.run_enrich(cfg, object(), dry_run=True)
 
     assert summary.errors == 1
     assert summary.deals_seen == 0
     assert summary.decisions == []
+
+
+def test_run_enrich_refuses_a_local_only_vault_before_any_call(monkeypatch):
+    """The bridge writes briefs with Anthropic over retrieved vault context.
+    `alfred bridge enrich --config config-employment.yaml` must not do that."""
+    from alfred.config import LocalOnlyViolation
+
+    _set_all_creds(monkeypatch)
+    crm = _CrmFake()
+    _patch_flow(monkeypatch, crm)
+    synthesized: list = []
+    monkeypatch.setattr(
+        enrich_crm, "synthesize_entity_brief", lambda *a, **kw: synthesized.append(a)
+    )
+
+    cfg = SimpleNamespace(vault_path=Path("/mnt/external/vault-employment"), local_only=True)
+    with pytest.raises(LocalOnlyViolation, match="local-only"):
+        enrich_crm.run_enrich(cfg, object(), dry_run=True)
+
+    assert crm.get_calls == [] and crm.post_calls == [] and synthesized == []

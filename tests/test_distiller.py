@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from structlog.testing import capture_logs
 
 from alfred.config import AlfredConfig
@@ -199,3 +201,404 @@ def test_tick_exception_is_caught_and_logged_not_propagated(tmp_path, monkeypatc
               and e.get("event") == "distiller.tick_error"]
     assert len(errors) == 1
     assert "simulated distiller sweep failure" in errors[0]["error"]
+
+
+def _stub_vault(monkeypatch, appended: list[str] | None = None) -> None:
+    monkeypatch.setattr(
+        "alfred.daemons.distiller.vault_read",
+        lambda vault_path, rel_path: {
+            "path": rel_path,
+            "frontmatter": {"type": "note"},
+            "body": "w" * 300,
+        },
+    )
+
+    def _fake_append_to_topic(vault_path, topic_slug, title, body_text, tags=None, source=None):
+        if appended is not None:
+            appended.append(title)
+        return {"path": f"topic/{topic_slug}.md"}
+
+    monkeypatch.setattr("alfred.daemons.distiller.vault_append_to_topic", _fake_append_to_topic)
+
+
+def test_items_object_reply_is_unwrapped(tmp_path, monkeypatch):
+    """json_mode constrains the reply to a JSON object, so the model answers
+    {"items": [...]} — the old `isinstance(list)` check scored every such
+    reply as learned=0."""
+    daemon = _make_daemon(tmp_path)
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    reply = {"items": [{"title": "wrapped-learning", "body": "insight", "tags": ["misc"]}]}
+    monkeypatch.setattr("alfred.daemons.distiller.complete", lambda *a, **kw: json.dumps(reply))
+
+    created = asyncio.run(daemon._distill_file(daemon.cfg.vault_path, "inbox/note.md"))
+
+    assert created == 1
+    assert appended == ["wrapped-learning"]
+
+
+def test_unreadable_json_shape_is_counted_not_silent(tmp_path, monkeypatch):
+    daemon = _make_daemon(tmp_path)
+    _stub_vault(monkeypatch)
+    reply = {"title": "a-lone-object", "body": "no items key", "tags": []}
+    monkeypatch.setattr("alfred.daemons.distiller.complete", lambda *a, **kw: json.dumps(reply))
+
+    with capture_logs() as logs:
+        created = asyncio.run(daemon._distill_file(daemon.cfg.vault_path, "inbox/note.md"))
+
+    assert created == 0
+    assert [e for e in logs if e.get("event") == "distiller.unexpected_json_shape"]
+
+
+def test_sweep_spanning_another_save_is_recorded_on_disk(tmp_path, monkeypatch):
+    """The live failure: every sweep ran through the 5-min periodic save, so
+    its stamps and run entry landed in a detached copy of the state. After a
+    restart (fresh StateStore) the last run must be this sweep, which is what
+    runner.py's catch-up reads, and no file may be stale again."""
+    from alfred.core.models import FileState
+
+    daemon = _make_daemon(tmp_path)
+    _stub_vault(monkeypatch)
+    reply = {"items": [{"title": "t", "body": "b", "tags": ["misc"]}]}
+    monkeypatch.setattr("alfred.daemons.distiller.complete", lambda *a, **kw: json.dumps(reply))
+    for name in ("a.md", "b.md", "c.md"):
+        daemon.state.state.files[name] = FileState(md5=name)
+    daemon.state.save()
+
+    async def _sleep_while_another_job_saves(_seconds: float) -> None:
+        daemon.state.save()
+
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _sleep_while_another_job_saves)
+
+    asyncio.run(daemon.tick())
+
+    restarted = StateStore(daemon.state.path)
+    restarted.load()
+    runs = restarted.state.distiller_runs
+    assert len(runs) == 1, f"sweep not recorded on disk: {runs!r}"
+    assert runs[0]["files_scanned"] == 3
+    assert runs[0]["learn_records_created"] == 3
+    stale = [p for p, fs in restarted.state.files.items() if not fs.last_distilled]
+    assert not stale, f"last_distilled lost for {stale}"
+
+
+def test_sweep_with_nothing_stale_still_records_a_run(tmp_path):
+    """A quiet vault must not look overdue to the startup catch-up."""
+    daemon = _make_daemon(tmp_path)
+
+    asyncio.run(daemon.tick())
+
+    assert len(daemon.state.state.distiller_runs) == 1
+    assert daemon.state.state.distiller_runs[0]["files_scanned"] == 0
+
+
+def test_sweep_deferred_before_any_progress_records_no_run(tmp_path, monkeypatch):
+    """Backend down on the first file: nothing was done, so the catch-up must
+    still see the vault as overdue and retry after the next start."""
+    from alfred.core.local_llm import LocalLLMUnavailable
+    from alfred.core.models import FileState
+
+    daemon = _make_daemon(tmp_path)
+    _stub_vault(monkeypatch)
+
+    def _down(*a, **kw):
+        raise LocalLLMUnavailable("connection refused")
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _down)
+    daemon.state.state.files["a.md"] = FileState(md5="a")
+
+    asyncio.run(daemon.tick())
+
+    assert daemon.state.state.distiller_runs == []
+    assert not daemon.state.state.files["a.md"].last_distilled
+
+
+def test_request_too_large_skips_the_file_and_the_sweep_goes_on(tmp_path, monkeypatch):
+    """An oversized request (the Spark's 400, or an answer cut at max_tokens)
+    gets the same answer next sweep. It must not stop the sweep the way a down
+    backend does, and must not leave the file stale to be re-sent tomorrow."""
+    from alfred.core.local_llm import LocalLLMRequestTooLarge
+    from alfred.core.models import FileState
+
+    daemon = _make_daemon(tmp_path)
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _no_sleep)
+    calls: list[str] = []
+
+    def _complete(system, user, **kw):
+        calls.append(user)
+        if "a.md" in user:
+            raise LocalLLMRequestTooLarge("400: over the window")
+        return json.dumps({"items": [{"title": "from-b", "body": "b", "tags": ["misc"]}]})
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _complete)
+    for name in ("a.md", "b.md"):
+        daemon.state.state.files[name] = FileState(md5=name)
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.tick())
+
+    assert len(calls) == 2, "the sweep stopped at the oversized file"
+    assert appended == ["from-b"]
+    assert daemon.state.state.files["a.md"].last_distilled, "a.md would be re-sent next sweep"
+    assert [e for e in logs if e.get("event") == "distiller.request_too_large"
+            and e.get("path") == "a.md"]
+
+    calls.clear()
+    asyncio.run(daemon.tick())
+    assert calls == []
+
+
+async def _no_sleep(_seconds: float) -> None:
+    return None
+
+
+# ── Per-sweep cap: the {items} fix turns writes on for ~15K stale files ──────
+
+
+def _stale_files(daemon: DistillerDaemon, names, last_distilled: str = "") -> None:
+    from alfred.core.models import FileState
+
+    for name in names:
+        daemon.state.state.files[name] = FileState(md5=name, last_distilled=last_distilled)
+
+
+def test_sweep_distills_at_most_the_cap_and_the_rest_waits(tmp_path, monkeypatch):
+    """The main vault had ~15K unstamped files, each worth up to 3 topic
+    appends: without a cap the first sweep would write ~45K appends in one
+    night. The cap bounds files, LLM calls and appends per sweep."""
+    daemon = _make_daemon(tmp_path)
+    daemon.cfg.distiller_max_files_per_sweep = 2
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _no_sleep)
+    calls: list[str] = []
+
+    def _complete(system, user, **kw):
+        calls.append(user)
+        items = [{"title": f"t{n}", "body": "b", "tags": ["misc"]} for n in range(3)]
+        return json.dumps({"items": items})
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _complete)
+    _stale_files(daemon, [f"f{n}.md" for n in range(5)])
+
+    with capture_logs() as logs:
+        asyncio.run(daemon.tick())
+
+    assert len(calls) == 2
+    assert len(appended) == 6, "3 appends per file, 2 files"
+    stamped = sorted(p for p, fs in daemon.state.state.files.items() if fs.last_distilled)
+    assert stamped == ["f0.md", "f1.md"]
+    run = daemon.state.state.distiller_runs[-1]
+    assert (run["files_scanned"], run["learn_records_created"], run["stale_remaining"]) == (2, 6, 3)
+    assert [e for e in logs if e.get("event") == "distiller.sweep_capped"
+            and e.get("cap") == 2 and e.get("stale") == 5]
+
+    calls.clear()
+    asyncio.run(daemon.tick())
+    asyncio.run(daemon.tick())
+    assert len(calls) == 3, "the next sweeps take the remaining 2, then 1"
+    assert all(fs.last_distilled for fs in daemon.state.state.files.values())
+    assert daemon.state.state.distiller_runs[-1]["stale_remaining"] == 0
+
+
+def test_capped_sweep_takes_never_distilled_then_oldest_first(tmp_path, monkeypatch):
+    """With a cap, dict order would re-take the same leading files each time
+    they went stale again, and the tail of a 15K-file vault would never be
+    reached. Never-distilled files go first, then the oldest stamp."""
+    daemon = _make_daemon(tmp_path)
+    daemon.cfg.distiller_max_files_per_sweep = 3
+    _stub_vault(monkeypatch)
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _no_sleep)
+    seen: list[str] = []
+
+    def _complete(system, user, **kw):
+        seen.append(next(line for line in user.splitlines() if line.startswith("File: "))[6:])
+        return json.dumps({"items": []})
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _complete)
+    _stale_files(daemon, ["stale-newer.md"], "2026-07-01T00:00:00+00:00")
+    _stale_files(daemon, ["stale-older.md"], "2026-05-01T00:00:00+00:00")
+    _stale_files(daemon, ["fresh.md"], datetime.now(UTC).isoformat())
+    _stale_files(daemon, ["never-a.md", "never-b.md"])
+
+    asyncio.run(daemon.tick())
+
+    assert seen == ["never-a.md", "never-b.md", "stale-older.md"]
+
+
+def test_default_cap_is_200_and_config_sets_it(tmp_path):
+    import pytest
+    import yaml
+
+    daemon = _make_daemon(tmp_path)
+    assert daemon.cfg.distiller_max_files_per_sweep == 200
+
+    base = {"distiller": {"mode": "scheduled", "max_files_per_sweep": 200}}
+    (tmp_path / "config-base.yaml").write_text(yaml.safe_dump(base))
+    vault = {"vault": {"path": str(tmp_path / "v")}, "data_dir": "./d"}
+    path = tmp_path / "config-x.yaml"
+    path.write_text(yaml.safe_dump(vault))
+    assert AlfredConfig.load(path).distiller_max_files_per_sweep == 200
+
+    path.write_text(yaml.safe_dump({**vault, "distiller": {"max_files_per_sweep": 50}}))
+    assert AlfredConfig.load(path).distiller_max_files_per_sweep == 50
+
+    for bad in (0, -1, "lots", True):
+        path.write_text(yaml.safe_dump({**vault, "distiller": {"max_files_per_sweep": bad}}))
+        with pytest.raises(ValueError, match="max_files_per_sweep"):
+            AlfredConfig.load(path)
+
+
+def test_real_base_config_caps_the_distiller_at_200():
+    cfg = AlfredConfig.load(Path(__file__).resolve().parents[1] / "config.yaml")
+    assert cfg.distiller_max_files_per_sweep == 200
+
+
+REAL_CONFIGS = ("config.yaml", "config-content.yaml", "config-employment.yaml",
+                "config-finance.yaml", "config-neuroscience.yaml", "config-personal.yaml")
+
+
+def test_the_write_ramp_waits_for_an_explicit_flip(tmp_path, monkeypatch):
+    """Deploying this branch must not start the ~75-night topic/ write ramp
+    on its own (Ben's rule d): every real vault is on_demand, so runner.py
+    registers neither the 2am job nor the startup catch-up."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    from alfred.runner import run_daemons
+
+    repo = Path(__file__).resolve().parents[1]
+    for name in REAL_CONFIGS:
+        assert AlfredConfig.load(repo / name).distiller_mode == "on_demand", name
+
+    class _Started(Exception):
+        pass
+
+    class _StubVectorStore:
+        was_recreated = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    captured = {}
+
+    def _fake_start(self, *args, **kwargs):
+        captured["jobs"] = {job.id for job in self.get_jobs()}
+        raise _Started
+
+    monkeypatch.setattr(AsyncIOScheduler, "start", _fake_start)
+    monkeypatch.setattr("alfred.store.lancedb_store.LanceDBStore", _StubVectorStore)
+    (tmp_path / "config-base.yaml").write_text((repo / "config-base.yaml").read_text())
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (tmp_path / "config-x.yaml").write_text(f"vault:\n  path: {vault}\ndata_dir: ./data\n")
+    cfg = AlfredConfig.load(tmp_path / "config-x.yaml")
+
+    with pytest.raises(_Started):
+        asyncio.run(run_daemons(cfg))
+    assert not {j for j in captured["jobs"] if j.startswith("distiller")}
+
+
+# ── Twin provenance stays out of shared topic/ notes ────────────────────────
+
+
+def _one_record(monkeypatch, body: str, frontmatter: dict | None = None) -> None:
+    monkeypatch.setattr(
+        "alfred.daemons.distiller.vault_read",
+        lambda vault_path, rel_path: {
+            "path": rel_path,
+            "frontmatter": frontmatter or {"type": "session"},
+            "body": body,
+        },
+    )
+
+
+def _count_calls(monkeypatch) -> list[str]:
+    calls: list[str] = []
+
+    def _complete(system, user, **kw):
+        calls.append(user)
+        return json.dumps({"items": [{"title": "t", "body": "b", "tags": ["misc"]}]})
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _complete)
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _no_sleep)
+    return calls
+
+
+@pytest.mark.parametrize("body, frontmatter", [
+    ("cwd /mnt/external/Employment/Betson/betson-gameroom-twin\n" + "x" * 300, None),
+    ("worked on the floorplan wizard " + "x" * 300,
+     {"type": "session", "project": "betson-gameroom-twin"}),
+    ("ran the audit in ~/betson-it-review " + "x" * 300, None),
+    ("indexed /mnt/external/vault-employment " + "x" * 300, None),
+])
+def test_twin_provenance_records_are_not_distilled_into_the_main_vault(
+    tmp_path, monkeypatch, body, frontmatter,
+):
+    daemon = _make_daemon(tmp_path)
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    _one_record(monkeypatch, body, frontmatter)
+    calls = _count_calls(monkeypatch)
+    _stale_files(daemon, ["session/twin-work.md"])
+
+    asyncio.run(daemon.tick())
+
+    assert calls == [] and appended == []
+    # Stamped, so it doesn't hold a place at the head of the capped queue.
+    assert daemon.state.state.files["session/twin-work.md"].last_distilled
+
+
+def test_a_note_that_only_mentions_betson_is_distilled(tmp_path, monkeypatch):
+    """Rule (b): the word "Betson" is not provenance."""
+    daemon = _make_daemon(tmp_path)
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    _one_record(monkeypatch, "Lunch with someone from Betson about arcades. " + "x" * 300)
+    calls = _count_calls(monkeypatch)
+    _stale_files(daemon, ["note/lunch.md"])
+
+    asyncio.run(daemon.tick())
+
+    assert len(calls) == 1 and appended == ["t"]
+
+
+def test_the_employment_vault_still_distills_its_own_records(tmp_path, monkeypatch):
+    """Inside the local-only vault, twin text only reaches its own topic/."""
+    daemon = _make_daemon(tmp_path)
+    daemon.cfg.local_only = True
+    monkeypatch.setattr(AlfredConfig, "check_local_only", lambda self: None)
+    appended: list[str] = []
+    _stub_vault(monkeypatch, appended)
+    _one_record(monkeypatch, "cwd /mnt/external/Employment/Betson/betson-gameroom-twin " + "x" * 300)
+    calls = _count_calls(monkeypatch)
+    _stale_files(daemon, ["session/twin-work.md"])
+
+    asyncio.run(daemon.tick())
+
+    assert len(calls) == 1 and appended == ["t"]
+
+
+def test_bad_request_stops_the_sweep_and_stamps_nothing(tmp_path, monkeypatch):
+    """A 400 that is not about size is the setup's fault: retry later, like a
+    down backend. Stamping would skip the file for 30 days."""
+    from alfred.core.local_llm import LocalLLMBadRequest
+
+    daemon = _make_daemon(tmp_path)
+    _stub_vault(monkeypatch)
+    monkeypatch.setattr("alfred.daemons.distiller.asyncio.sleep", _no_sleep)
+    calls: list[str] = []
+
+    def _rejected(system, user, **kw):
+        calls.append(user)
+        raise LocalLLMBadRequest("400: json_object not supported")
+
+    monkeypatch.setattr("alfred.daemons.distiller.complete", _rejected)
+    _stale_files(daemon, ["a.md", "b.md"])
+
+    asyncio.run(daemon.tick())
+
+    assert len(calls) == 1
+    assert not any(fs.last_distilled for fs in daemon.state.state.files.values())
+    assert daemon.state.state.distiller_runs == []

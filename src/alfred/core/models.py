@@ -89,6 +89,11 @@ class ClusterState:
     member_files: list[str] = field(default_factory=list)
     last_labeled: str = ""
     consolidated_chunk_id: str = ""
+    # Fingerprints of member_files when the label / the synthesis was last
+    # made (see consolidator._members_fingerprint). The consolidator skips a
+    # cluster whose members still match — no LLM call for unchanged input.
+    labeled_members: str = ""
+    synthesized_members: str = ""
 
 
 @dataclass

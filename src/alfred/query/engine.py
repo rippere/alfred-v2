@@ -101,9 +101,12 @@ class QueryEngine:
     def _get_embedder(self):
         if self._embedder is None:
             import httpx
+            base_url = self.cfg.embed_base_url
             self._embedder = _SyncEmbedder(
-                url=f"{self.cfg.ollama_base_url}/api/embeddings",
+                url=f"{base_url}/api/embeddings",
                 model=self.cfg.ollama_embed_model,
+                base_url=base_url,
+                local_only=getattr(self.cfg, "local_only", False),
             )
         return self._embedder
 
@@ -211,12 +214,7 @@ class QueryEngine:
         if opts.include_synthesis and context:
             t0 = time.perf_counter()
             from alfred.query.synth import synthesize
-            answer, backend, model = synthesize(
-                query=text,
-                context=context,
-                ollama_base_url=self.cfg.ollama_base_url,
-                ollama_model=self.cfg.ollama_llm_model,
-            )
+            answer, backend, model = synthesize(query=text, context=context, **self.cfg.llm)
             t["synth"] = time.perf_counter() - t0
 
         # Record memory access asynchronously
@@ -317,12 +315,7 @@ class QueryEngine:
         if opts.include_synthesis and context:
             t0 = time.perf_counter()
             from alfred.query.synth import synthesize
-            answer, backend, model = synthesize(
-                query=text,
-                context=context,
-                ollama_base_url=self.cfg.ollama_base_url,
-                ollama_model=self.cfg.ollama_llm_model,
-            )
+            answer, backend, model = synthesize(query=text, context=context, **self.cfg.llm)
             t["synth"] = time.perf_counter() - t0
 
         return QueryResult(
@@ -432,12 +425,24 @@ class QueryEngine:
 
 class _SyncEmbedder:
     """Synchronous Ollama embed wrapper for use in the query CLI."""
-    def __init__(self, url: str, model: str) -> None:
+    def __init__(
+        self, url: str, model: str, *, base_url: str = "", local_only: bool = False,
+    ) -> None:
         self.url = url
         self.model = model
+        self.base_url = base_url
+        self.local_only = local_only
 
     def embed(self, text: str) -> list[float]:
         import httpx
-        resp = httpx.post(self.url, json={"model": self.model, "prompt": text}, timeout=30.0)
+        if self.local_only:
+            # Raises LocalOnlyViolation for a model Ollama runs remotely, and
+            # ModelCheckFailed when Ollama can't be asked. Nothing is sent.
+            from alfred.core.ollama_guard import check_model_runs_here
+            check_model_runs_here(self.base_url, self.model)
+        # trust_env=False: no proxy variable may carry query text off loopback.
+        resp = httpx.post(
+            self.url, json={"model": self.model, "prompt": text}, timeout=30.0, trust_env=False,
+        )
         resp.raise_for_status()
         return resp.json()["embedding"]

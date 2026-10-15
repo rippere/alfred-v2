@@ -5,7 +5,7 @@ import copy
 import fcntl
 import json
 import os
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -202,6 +202,51 @@ def _merge_pipeline_state(base: dict, theirs: dict, mine: dict) -> dict:
     return merged
 
 
+# PipelineState fields that map a key to a record dataclass (FileState,
+# ClusterState, ...) — the objects a daemon picks up and holds across awaits.
+_RECORD_FIELDS = ("files", "clusters", "memory", "wiki_pages")
+
+
+def _fold_into(live: PipelineState, fresh: PipelineState) -> None:
+    """Make `live` equal to `fresh` without replacing any object a caller holds.
+
+    save() used to rebind self._state to a freshly decoded PipelineState. Every
+    daemon pass starts with `state = self.state.state` and then awaits (an LLM
+    call, a sleep), so the first save by ANY job during that pass — the 5-min
+    periodic save, a surveyor tick — detached the daemon's `state` and every
+    FileState/ClusterState it held. Its later writes went into objects nothing
+    saved: the distiller's last_distilled stamps and its distiller_runs entry
+    were dropped on every sweep longer than the gap between two saves, so the
+    runner's catch-up saw a stale last run and re-swept after every restart.
+
+    Records are updated attribute-by-attribute instead, and keys are added or
+    removed only when the merge actually changed the key set (another process
+    added or deleted an entry) — so a thread iterating state.files (the reaper)
+    never sees the dict change size just because this process saved.
+    """
+    for f in fields(PipelineState):
+        cur = getattr(live, f.name)
+        new = getattr(fresh, f.name)
+        if f.name in _RECORD_FIELDS:
+            for key in [k for k in cur if k not in new]:
+                del cur[key]
+            for key, rec in new.items():
+                existing = cur.get(key)
+                if existing is None:
+                    cur[key] = rec
+                elif existing != rec:
+                    existing.__dict__.update(rec.__dict__)
+        elif isinstance(cur, dict):
+            if cur != new:
+                cur.clear()
+                cur.update(new)
+        elif isinstance(cur, list):
+            if cur != new:
+                cur[:] = new
+        elif cur != new:
+            setattr(live, f.name, new)
+
+
 class StateStore:
     def __init__(self, path: Path, cfg=None) -> None:
         self.path = path
@@ -283,6 +328,7 @@ class StateStore:
                 # Fold the merge result back into memory so this instance
                 # reflects the other writer's changes too, and so the next
                 # save() diffs against this save rather than a stale base.
+                # In place, never by rebinding _state — see _fold_into.
                 #
                 # The base MUST be a deep copy: _decode_state passes the
                 # dict/list-valued fields (curator_processed, distiller_runs,
@@ -292,7 +338,7 @@ class StateStore:
                 # against — the merge then saw "unchanged" and dropped the
                 # write entirely. Only bites a long-lived instance that saves
                 # more than once, i.e. the daemon. See test_state_lock.py.
-                self._state = _decode_state(merged)
+                _fold_into(self._state, _decode_state(merged))
                 self._base_raw = copy.deepcopy(merged)
                 drained = {}  # committed to disk; nothing to put back
             finally:

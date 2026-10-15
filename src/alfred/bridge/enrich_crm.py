@@ -41,6 +41,7 @@ from alfred.bridge import config as C
 from alfred.bridge.brief import synthesize_entity_brief
 from alfred.bridge.notes import post_note
 from alfred.bridge.resolve import resolve_contact_to_entity
+from alfred.config import LocalOnlyViolation
 from alfred.ledger.push import _AuthError, _authenticate, ensure_env_scaffold
 
 log = structlog.get_logger()
@@ -129,6 +130,14 @@ def run_enrich(
     GET is made, returning an all-zero (or errors=1) summary rather than a
     partial/garbled run.
     """
+    if getattr(cfg, "local_only", False):
+        # Briefs are synthesized locally (cfg.llm), but the bridge's whole job
+        # is to put vault-derived text into NovaCRM, which is off-box. A
+        # local-only vault (the employment vault) never sends text off-box.
+        raise LocalOnlyViolation(
+            f"alfred bridge posts vault-derived briefs to NovaCRM; {cfg.vault_path} is local-only"
+        )
+
     summary = EnrichSummary()
 
     ensure_env_scaffold()
@@ -209,7 +218,7 @@ def run_enrich(
             entity=match.rel_path, confidence=match.confidence,
         )
 
-        brief_obj = synthesize_entity_brief(engine, match, top_k=top_k)
+        brief_obj = synthesize_entity_brief(engine, match, top_k=top_k, llm=cfg.llm)
         if brief_obj is None:
             log.info(
                 "bridge.enrich.no_brief", deal_id=deal_id, contact_id=contact_id,

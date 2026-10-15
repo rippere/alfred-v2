@@ -36,9 +36,33 @@ log = structlog.get_logger()
 SESSION_ARCHIVE_INTERVAL_H = 24
 
 
+def refuse_remote_models(cfg) -> None:
+    """A local-only vault refuses to start on a model its Ollama runs remotely.
+
+    Raises LocalOnlyViolation when /api/show says the llm or embed model is an
+    Ollama cloud model. An Ollama that cannot be asked right now (stopped by
+    ollama-game-guard, say) does not block the start: every send asks again
+    first (alfred.core.ollama_guard), so nothing leaves meanwhile.
+    """
+    if not getattr(cfg, "local_only", False):
+        return
+    from alfred.core.ollama_guard import ModelCheckFailed, check_model_runs_here
+
+    llm = cfg.llm
+    for base_url, model in ((llm["base_url"], llm["model"]),
+                            (cfg.embed_base_url, cfg.ollama_embed_model)):
+        try:
+            check_model_runs_here(base_url, model)
+        except ModelCheckFailed as e:
+            log.warning("alfred.local_model_unverified", model=model, error=str(e),
+                        note="checked again before every send")
+
+
 async def run_daemons(cfg, only: set[str] | None = None) -> None:
     """Start selected (or all) daemons via APScheduler. Runs until SIGINT/SIGTERM."""
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    refuse_remote_models(cfg)
 
     from alfred.daemons.consolidator import ConsolidatorDaemon
     from alfred.daemons.curator import CuratorDaemon

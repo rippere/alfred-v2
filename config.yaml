@@ -5,6 +5,19 @@ vault:
 
 data_dir: ./data
 
+# Completions stay on the local Ollama whatever config-base.yaml's llm: block
+# says. This vault holds twin/employment-provenance records (session and inbox
+# drops from work in /mnt/external/Employment, the twin repo and its
+# worktrees), and those never leave benderman. Lift this pin only in step 15,
+# after the pre-flip gates have closed: twin-provenance drops routed out of
+# this vault, the records already here (and daemon notes derived from them)
+# moved out, and MCP query synthesis unable to carry them to the Spark.
+# Blank base_url/model mean the ollama: block, as they do in the base.
+llm:
+  api: ollama
+  base_url: ""
+  model: ""
+
 # Explicit clustering tuning for the main vault (matches current defaults but
 # pinned deliberately — this is the largest vault and recluster cost is real).
 surveyor:

@@ -258,3 +258,68 @@ def test_concurrent_edit_wins_over_stale_delete(state_path):
     assert final.state.files["shared.md"].md5 == "updated", (
         "expected theirs's (B's) concurrent edit to win over A's stale delete"
     )
+
+
+def test_reference_held_across_save_keeps_persisting(state_path):
+    """Detached-state regression: save() rebound self._state to a freshly
+    decoded PipelineState, so every object a daemon picked up before an await
+    — `state = self.state.state`, a FileState from state.files — stopped being
+    the one that gets saved the moment ANY other job saved (the 5-min periodic
+    save, a surveyor tick). The distiller's last_distilled stamps and its
+    distiller_runs entry went into those orphans, which is why its runs were
+    never recorded and runner.py's catch-up re-swept after every restart.
+
+    The tests above never hit it: they all re-read `store.state` after a save."""
+    store = StateStore(state_path)
+    store.load()
+    store.state.files["note.md"] = FileState(md5="m1")
+    store.state.clusters["semantic_0"] = ClusterState(cluster_id=0, member_files=["note.md"])
+    store.save()
+
+    # What a daemon pass captures before its first await.
+    held = store.state
+    fs = held.files["note.md"]
+    cluster = held.clusters["semantic_0"]
+
+    store.save()  # another job saves while the pass is awaiting
+
+    fs.last_distilled = "2026-09-24T09:00:00+00:00"
+    cluster.label = ["held label"]
+    held.distiller_runs.append({"timestamp": "2026-09-24T09:00:00+00:00"})
+    store.save()
+
+    assert held is store.state, "save() replaced the live PipelineState"
+
+    final = StateStore(state_path)
+    final.load()
+    assert final.state.files["note.md"].last_distilled == "2026-09-24T09:00:00+00:00"
+    assert final.state.clusters["semantic_0"].label == ["held label"]
+    assert final.state.distiller_runs == [{"timestamp": "2026-09-24T09:00:00+00:00"}]
+
+
+def test_save_still_folds_in_another_writers_changes(state_path):
+    """Keeping object identity must not cost the merge: another process's new
+    entry, edit and delete all show up in this instance's live objects."""
+    seed = StateStore(state_path)
+    seed.load()
+    seed.state.files["kept.md"] = FileState(md5="old")
+    seed.state.files["gone.md"] = FileState(md5="bye")
+    seed.save()
+
+    daemon = StateStore(state_path)
+    daemon.load()
+    held_kept = daemon.state.files["kept.md"]
+
+    other = StateStore(state_path)
+    other.load()
+    other.state.files["kept.md"].md5 = "new"
+    del other.state.files["gone.md"]
+    other.state.files["added.md"] = FileState(md5="hi")
+    other.save()
+
+    daemon.save()
+
+    assert daemon.state.files["kept.md"] is held_kept
+    assert held_kept.md5 == "new"
+    assert "gone.md" not in daemon.state.files
+    assert daemon.state.files["added.md"].md5 == "hi"

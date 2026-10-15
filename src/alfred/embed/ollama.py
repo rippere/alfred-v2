@@ -6,6 +6,10 @@ import asyncio
 import httpx
 import structlog
 
+from alfred.config import LocalOnlyViolation
+from alfred.core.failures import record_failure
+from alfred.core.ollama_guard import ModelCheckFailed, acheck_model_runs_here
+
 log = structlog.get_logger()
 
 MAX_RETRIES = 5
@@ -23,15 +27,29 @@ class EmbeddingBackendUnavailable(RuntimeError):
     """
 
 
+class EmbeddingModelRefused(EmbeddingBackendUnavailable, LocalOnlyViolation):
+    """A local-only vault's embed model runs remotely (an Ollama cloud model).
+
+    Nothing was sent. An EmbeddingBackendUnavailable, so the surveyor leaves
+    the file's state untouched and retries later; logged at error and counted.
+    """
+
+
 class OllamaEmbedder:
-    def __init__(self, base_url: str, model: str) -> None:
+    def __init__(self, base_url: str, model: str, *, local_only: bool = False) -> None:
+        self.base_url = base_url
         self.url = f"{base_url}/api/embeddings"
         self.model = model
+        # A local-only vault asks Ollama, before it sends, whether the model
+        # runs here (alfred.core.ollama_guard).
+        self.local_only = local_only
         self._http: httpx.AsyncClient | None = None
 
     async def _client(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(timeout=60.0)
+            # trust_env=False: Ollama is on loopback, and a proxy variable in
+            # the environment must not carry chunk text anywhere else.
+            self._http = httpx.AsyncClient(timeout=60.0, trust_env=False)
         return self._http
 
     async def close(self) -> None:
@@ -42,6 +60,8 @@ class OllamaEmbedder:
         client = await self._client()
         for attempt in range(MAX_RETRIES):
             try:
+                if self.local_only:
+                    await acheck_model_runs_here(client, self.base_url, self.model)
                 resp = await client.post(self.url, json={"model": self.model, "prompt": text})
                 resp.raise_for_status()
                 return resp.json()["embedding"]
@@ -53,7 +73,11 @@ class OllamaEmbedder:
                 delay = RETRY_BASE * (2 ** attempt)
                 log.warning("ollama.embed_retry", attempt=attempt + 1, error=str(e), delay=delay)
                 await asyncio.sleep(delay)
-            except (httpx.ConnectError, httpx.TimeoutException) as e:
+            except LocalOnlyViolation as e:
+                log.error("ollama.embed_remote_model_refused", model=self.model, error=str(e))
+                record_failure("ollama.embed_remote_model_refused")
+                raise EmbeddingModelRefused(str(e)) from e
+            except (httpx.ConnectError, httpx.TimeoutException, ModelCheckFailed) as e:
                 delay = RETRY_BASE * (2 ** attempt)
                 log.warning("ollama.embed_retry", attempt=attempt + 1, error=str(e), delay=delay)
                 await asyncio.sleep(delay)

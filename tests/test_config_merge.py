@@ -18,8 +18,10 @@ import pytest
 from alfred.config import AlfredConfig, _deep_merge
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# The local LLM every vault runs on (config-base.yaml and the config.py default).
-QWEN_MODEL = "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M"
+
+# The fleet's local model since 031c0e1 (was mistral:latest): the dataclass
+# default and config-base.yaml's ollama.llm_model.
+QWEN_27B = "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M"
 
 BASE = """\
 ollama:
@@ -73,7 +75,7 @@ def test_lists_replaced_wholesale_not_concatenated(tmp_path):
 def test_missing_base_is_harmless(tmp_path):
     cfg = AlfredConfig.load(_write(tmp_path, None))
     assert cfg.janitor_sweep_interval_s == 22222
-    assert cfg.ollama_llm_model == QWEN_MODEL  # dataclass default
+    assert cfg.ollama_llm_model == QWEN_27B  # dataclass default
 
 
 def test_deep_merge_does_not_mutate_inputs():
@@ -196,13 +198,13 @@ def test_real_config_loads_with_expected_effective_values(config_name):
 
     # Fleet-wide invariants every vault must inherit (base or dataclass default)
     assert cfg.vector_store == "lancedb"
-    assert cfg.distiller_mode == "scheduled"          # from config-base.yaml
+    assert cfg.distiller_mode == "on_demand"          # from config-base.yaml: ramp gated
     assert cfg.janitor_dedup_enabled is False         # gated until dry-run tested
-    assert cfg.ollama_llm_model == QWEN_MODEL
+    assert cfg.ollama_llm_model == QWEN_27B
     assert cfg.ollama_embed_model == "nomic-embed-text"
     # Every vault — main and employment included — must stay on the loopback
     # Ollama. Their data never goes to the Spark or any cloud endpoint.
-    assert cfg.ollama_base_url == "http://localhost:11434"
+    assert cfg.ollama_base_url in ("http://localhost:11434", "http://127.0.0.1:11434")
     # No cloud model fields: synthesis and every daemon call use ollama_llm_model.
     assert not hasattr(cfg, "anthropic_model")
     assert not hasattr(cfg, "openrouter_model")
