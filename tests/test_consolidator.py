@@ -405,7 +405,7 @@ def test_flag_on_label_goes_to_the_openai_backend(tmp_path, monkeypatch):
 
     daemon, _, _ = _cluster_daemon(tmp_path, monkeypatch)
     daemon.cfg.llm_api = "openai"
-    daemon.cfg.llm_base_url = "http://spark.test:8000/v1"
+    daemon.cfg.llm_base_url = "https://spark.test:8000/v1"
     daemon.cfg.llm_model = "qwen3-30b"
     monkeypatch.setattr("alfred.config.SPARK_ENV_PATH", tmp_path / "no-spark-env")
     monkeypatch.delenv("SPARK_API_KEY", raising=False)
@@ -430,7 +430,7 @@ def test_flag_on_label_goes_to_the_openai_backend(tmp_path, monkeypatch):
 
     (request,) = seen
     body = _json.loads(request.content)
-    assert str(request.url) == "http://spark.test:8000/v1/chat/completions"
+    assert str(request.url) == "https://spark.test:8000/v1/chat/completions"
     assert body["model"] == "qwen3-30b"
     assert [m["role"] for m in body["messages"]] == ["user"]
     assert body["max_tokens"] == 256

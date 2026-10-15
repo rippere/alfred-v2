@@ -131,10 +131,11 @@ def run_enrich(
     partial/garbled run.
     """
     if getattr(cfg, "local_only", False):
-        # Briefs are written by Anthropic over this vault's retrieved context.
-        # A local-only vault (the employment vault) never sends text off-box.
+        # Briefs are synthesized locally (cfg.llm), but the bridge's whole job
+        # is to put vault-derived text into NovaCRM, which is off-box. A
+        # local-only vault (the employment vault) never sends text off-box.
         raise LocalOnlyViolation(
-            f"alfred bridge sends vault context to Anthropic; {cfg.vault_path} is local-only"
+            f"alfred bridge posts vault-derived briefs to NovaCRM; {cfg.vault_path} is local-only"
         )
 
     summary = EnrichSummary()
@@ -217,10 +218,7 @@ def run_enrich(
             entity=match.rel_path, confidence=match.confidence,
         )
 
-        brief_obj = synthesize_entity_brief(
-            engine, match, top_k=top_k,
-            base_url=cfg.ollama_base_url, model=cfg.ollama_llm_model,
-        )
+        brief_obj = synthesize_entity_brief(engine, match, top_k=top_k, llm=cfg.llm)
         if brief_obj is None:
             log.info(
                 "bridge.enrich.no_brief", deal_id=deal_id, contact_id=contact_id,

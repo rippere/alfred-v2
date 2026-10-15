@@ -75,7 +75,7 @@ def _snapshot(cfg: AlfredConfig) -> dict:
 def test_every_yaml_key_is_consumed(config_name, tmp_path, monkeypatch):
     # Flipping llm.api to openai makes load() resolve the Spark settings; give
     # it synthetic ones and keep the real ~/.config/spark/env out of it.
-    monkeypatch.setenv("SPARK_BASE_URL", "http://spark.test:8000/v1")
+    monkeypatch.setenv("SPARK_BASE_URL", "https://spark.test:8000/v1")
     monkeypatch.setenv("SPARK_MODEL", "test-model")
     monkeypatch.setattr("alfred.config.SPARK_ENV_PATH", tmp_path / "no-spark-env")
     src = REPO_ROOT / config_name

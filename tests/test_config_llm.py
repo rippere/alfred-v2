@@ -440,3 +440,28 @@ def test_other_vaults_are_not_local_only(tmp_path):
         if name == "config-employment.yaml":
             continue
         assert not AlfredConfig.load(_copy_real(tmp_path, name)).local_only, name
+
+
+@pytest.mark.parametrize("url", [
+    "http://spark.test:8000/v1",       # Bearer key and vault text in clear
+    "file:///etc/passwd",
+    "ftp://spark.test/v1",
+    "spark.test:8000/v1",              # no scheme
+    "https:///v1",                     # no host
+])
+def test_openai_base_url_must_be_https(tmp_path, monkeypatch, url):
+    monkeypatch.setenv("SPARK_BASE_URL", url)
+    monkeypatch.setenv("SPARK_MODEL", "qwen3-30b")
+
+    with pytest.raises(ValueError, match="https"):
+        AlfredConfig.load(_write(tmp_path, {"llm": {"api": "openai"}}, {}))
+
+
+def test_insecure_block_base_url_fails_even_with_a_good_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPARK_BASE_URL", "https://spark.test:8000/v1")
+    monkeypatch.setenv("SPARK_MODEL", "qwen3-30b")
+
+    with pytest.raises(ValueError, match="https"):
+        AlfredConfig.load(_write(
+            tmp_path, {"llm": {"api": "openai"}}, {"llm": {"base_url": "http://pinned.test/v1"}},
+        ))

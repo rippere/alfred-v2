@@ -28,7 +28,7 @@ from alfred.core.local_llm import (
     complete_json,
 )
 
-SPARK = "http://spark.test:8000/v1"
+SPARK = "https://spark.test:8000/v1"
 
 
 def _chat_response(content, finish_reason="stop", status=200):
@@ -405,3 +405,25 @@ def test_openai_other_400_is_a_loud_retry_later(monkeypatch, reason):
     assert event["response_format"] == "json_schema"
     assert reason in event["error"]
     assert drain_failures().get("local_llm.bad_request") == 1
+
+
+def test_real_client_ignores_proxy_environment(monkeypatch):
+    """A proxy env var must not carry vault text or the key off the Spark path."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.invalid:3128")
+    with local_llm._openai_client(SPARK, "k", 42.0) as client:
+        http = client._client
+        assert http.trust_env is False
+        assert not http._mounts  # no proxy transports picked up from env
+
+
+@pytest.mark.parametrize("url", ["http://spark.test:8000/v1", "file:///tmp/x", "https:///v1"])
+def test_openai_path_refuses_non_https_before_sending(monkeypatch, url):
+    def _never(*a, **k):
+        raise AssertionError("no client may be built for a non-https base_url")
+
+    monkeypatch.setattr(local_llm, "_openai_client", _never)
+    monkeypatch.setattr(local_llm, "spark_env", _never)  # the key is never read
+
+    with pytest.raises(LocalLLMUnavailable, match="https"):
+        complete("s", "u", api="openai", base_url=url, model="m", api_key_env="SPARK_API_KEY")

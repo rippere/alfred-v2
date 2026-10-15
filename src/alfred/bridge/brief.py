@@ -11,9 +11,9 @@ Given a contact already resolved to a vault `person/*.md` entity (see
      directly also lets this module ask for retrieval without the engine's
      built-in generic Q&A synthesis (`include_synthesis=False`), since a CRM
      brief needs its own prompt, not "answer this query" framing.
-  2. Synthesizes a short 2-4 sentence brief from that context on the LOCAL
-     model (`alfred.core.local_llm.complete`, the same single backend every
-     daemon and `alfred.query.synth` use). Retrieved vault text never goes to
+  2. Synthesizes a short 2-4 sentence brief from that context on the vault's
+     configured local backend (`alfred.core.local_llm.complete(**cfg.llm)`,
+     the same path every daemon and `alfred.query.synth` use). Retrieved vault text never goes to
      a cloud LLM: the former `anthropic_client.get_client()` call here was the
      last cloud path left after the local-LLM swap, and it would have failed
      open (main-vault context to Anthropic) the moment API credits returned.
@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from alfred.bridge import config as C
 from alfred.bridge.resolve import EntityMatch
@@ -89,17 +89,21 @@ def compute_brief_hash(entity_rel_path: str, brief_text: str) -> str:
 
 
 def _call_llm(
-    entity: EntityMatch, context: str, *, base_url: str, model: str, max_tokens: int
+    entity: EntityMatch, context: str, *, llm: Mapping[str, Any], max_tokens: int
 ) -> str:
-    """One brief completion on the local backend. Raises LocalLLMUnavailable."""
+    """One brief completion on the vault's configured backend (`cfg.llm`).
+
+    `llm` carries api/base_url/model/local_only, so a local-only vault keeps
+    its loopback-Ollama guard here exactly as on every daemon path. Raises
+    LocalLLMUnavailable.
+    """
     from alfred.core.local_llm import complete
 
     return complete(
         SYSTEM_PROMPT,
         f"Contact: {entity.name}\n\nVault context:\n\n{context}",
-        base_url=base_url,
-        model=model,
         max_tokens=max_tokens,
+        **llm,
     ).strip()
 
 
@@ -107,8 +111,7 @@ def synthesize_entity_brief(
     engine: Any,
     entity: EntityMatch,
     *,
-    base_url: str,
-    model: str,
+    llm: Mapping[str, Any],
     top_k: int = 6,
     max_tokens: int = C.BRIEF_MAX_TOKENS,
 ) -> Optional[Brief]:
@@ -120,18 +123,16 @@ def synthesize_entity_brief(
     expected common case, not a failure, and the caller should simply skip
     posting for that contact.
 
-    `base_url`/`model` are the local LLM settings (`cfg.ollama_base_url`,
-    `cfg.ollama_llm_model`); they are required so no caller can fall back to
-    a cloud default by omission.
+    `llm` is the vault's backend (`cfg.llm`: loopback Ollama by default, the
+    Spark only where a satellite config opts in). It is required so no caller
+    can fall back to a cloud default by omission.
     """
     result = query_vault_context(engine, entity, top_k=top_k)
     context = (getattr(result, "context", "") or "").strip()
     if not context:
         return None
 
-    text = _call_llm(
-        entity, context, base_url=base_url, model=model, max_tokens=max_tokens
-    )
+    text = _call_llm(entity, context, llm=llm, max_tokens=max_tokens)
     if not text:
         return None
 

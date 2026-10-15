@@ -131,12 +131,12 @@ LOCAL_LLM_URL = "http://127.0.0.1:11434"
 LOCAL_LLM_MODEL = "local-test-model"
 
 
+LOCAL_LLM = {"api": "ollama", "base_url": LOCAL_LLM_URL, "model": LOCAL_LLM_MODEL,
+             "local_only": False}
+
+
 def _cfg():
-    return SimpleNamespace(
-        vault_path=Path("/does/not/matter"),
-        ollama_base_url=LOCAL_LLM_URL,
-        ollama_llm_model=LOCAL_LLM_MODEL,
-    )
+    return SimpleNamespace(vault_path=Path("/does/not/matter"), llm=dict(LOCAL_LLM))
 
 
 def _fake_resolve(vault_path, *, email, name=None, ignore_dirs=None):
@@ -147,11 +147,10 @@ def _fake_resolve(vault_path, *, email, name=None, ignore_dirs=None):
     return None  # bob: no vault match
 
 
-def _fake_synthesize(engine, entity, *, top_k=6, base_url=None, model=None, **kwargs):
-    # Briefs must be synthesized on the vault's local LLM settings, never a
-    # cloud default picked up by omission.
-    assert base_url == LOCAL_LLM_URL, base_url
-    assert model == LOCAL_LLM_MODEL, model
+def _fake_synthesize(engine, entity, *, top_k=6, llm=None, **kwargs):
+    # Briefs must be synthesized on the vault's configured backend (cfg.llm),
+    # never a cloud default picked up by omission.
+    assert llm == LOCAL_LLM, llm
     if entity.name == "Alice":
         return Brief(
             entity_rel_path=entity.rel_path, entity_name="Alice",

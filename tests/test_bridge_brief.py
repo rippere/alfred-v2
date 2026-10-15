@@ -44,6 +44,7 @@ class _FakeEngine:
 
 LLM_URL = "http://127.0.0.1:11434"
 LLM_MODEL = "local-test-model"
+LLM = {"api": "ollama", "base_url": LLM_URL, "model": LLM_MODEL, "local_only": False}
 
 
 class _FakeLocalLLM:
@@ -105,7 +106,7 @@ def test_synthesize_entity_brief_returns_none_when_no_vault_context(monkeypatch)
     monkeypatch.setattr("alfred.core.local_llm.complete", llm)
     _no_cloud(monkeypatch)
 
-    result = brief.synthesize_entity_brief(engine, ENTITY, base_url=LLM_URL, model=LLM_MODEL)
+    result = brief.synthesize_entity_brief(engine, ENTITY, llm=LLM)
 
     assert result is None
     assert llm.calls == []
@@ -117,7 +118,7 @@ def test_synthesize_entity_brief_returns_none_when_context_is_whitespace_only(mo
     monkeypatch.setattr("alfred.core.local_llm.complete", llm)
     _no_cloud(monkeypatch)
 
-    result = brief.synthesize_entity_brief(engine, ENTITY, base_url=LLM_URL, model=LLM_MODEL)
+    result = brief.synthesize_entity_brief(engine, ENTITY, llm=LLM)
 
     assert result is None
     assert llm.calls == []
@@ -133,7 +134,7 @@ def test_synthesize_entity_brief_calls_local_llm_and_builds_brief(monkeypatch):
     _no_cloud(monkeypatch)
 
     result = brief.synthesize_entity_brief(
-        engine, ENTITY, top_k=3, base_url=LLM_URL, model=LLM_MODEL, max_tokens=256
+        engine, ENTITY, top_k=3, llm=LLM, max_tokens=256
     )
 
     assert result is not None
@@ -146,8 +147,10 @@ def test_synthesize_entity_brief_calls_local_llm_and_builds_brief(monkeypatch):
     # Local LLM was called exactly once, with the caller's local settings.
     assert len(llm.calls) == 1
     call = llm.calls[0]
+    assert call["api"] == "ollama"
     assert call["base_url"] == LLM_URL
     assert call["model"] == LLM_MODEL
+    assert call["local_only"] is False
     assert call["max_tokens"] == 256
     assert call["system"] == brief.SYSTEM_PROMPT
     assert "David works on the WSU project." in call["user"]
@@ -159,7 +162,7 @@ def test_synthesize_entity_brief_returns_none_when_llm_returns_blank_text(monkey
     monkeypatch.setattr("alfred.core.local_llm.complete", llm)
     _no_cloud(monkeypatch)
 
-    result = brief.synthesize_entity_brief(engine, ENTITY, base_url=LLM_URL, model=LLM_MODEL)
+    result = brief.synthesize_entity_brief(engine, ENTITY, llm=LLM)
 
     assert result is None
     assert len(llm.calls) == 1
@@ -173,7 +176,7 @@ def test_synthesize_entity_brief_uses_default_max_tokens_from_config(monkeypatch
     monkeypatch.setattr("alfred.core.local_llm.complete", llm)
     _no_cloud(monkeypatch)
 
-    brief.synthesize_entity_brief(engine, ENTITY, base_url=LLM_URL, model=LLM_MODEL)
+    brief.synthesize_entity_brief(engine, ENTITY, llm=LLM)
 
     assert llm.calls[0]["max_tokens"] == C.BRIEF_MAX_TOKENS
 
@@ -191,11 +194,11 @@ def test_synthesize_entity_brief_propagates_local_llm_unavailable(monkeypatch):
     _no_cloud(monkeypatch)
 
     with pytest.raises(LocalLLMUnavailable):
-        brief.synthesize_entity_brief(engine, ENTITY, base_url=LLM_URL, model=LLM_MODEL)
+        brief.synthesize_entity_brief(engine, ENTITY, llm=LLM)
 
 
 def test_synthesize_entity_brief_requires_local_llm_settings():
-    """No implicit model default: omitting base_url/model is a TypeError."""
+    """No implicit backend default: omitting llm is a TypeError."""
     engine = _FakeEngine(_FakeQueryResult(context="some context"))
     with pytest.raises(TypeError):
         brief.synthesize_entity_brief(engine, ENTITY)

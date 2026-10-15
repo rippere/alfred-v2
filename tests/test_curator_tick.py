@@ -213,7 +213,7 @@ def test_classification_request_per_backend(tmp_path, monkeypatch):
     assert request["json"]["think"] is False
 
     daemon.cfg.llm_api = "openai"
-    daemon.cfg.llm_base_url = "http://spark.test:8000/v1"
+    daemon.cfg.llm_base_url = "https://spark.test:8000/v1"
     daemon.cfg.llm_model = "qwen3-30b"
     monkeypatch.setattr("alfred.config.SPARK_ENV_PATH", tmp_path / "no-spark-env")
     monkeypatch.delenv("SPARK_API_KEY", raising=False)

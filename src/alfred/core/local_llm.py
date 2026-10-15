@@ -28,7 +28,7 @@ import re
 import httpx
 import structlog
 
-from alfred.config import LocalOnlyViolation, spark_env
+from alfred.config import LocalOnlyViolation, require_https_llm_url, spark_env
 from alfred.core.failures import record_failure
 from alfred.core.ollama_guard import ModelCheckFailed, check_model_runs_here
 
@@ -226,7 +226,16 @@ def _openai_client(base_url: str, api_key: str, timeout: float):
     import openai  # only the OpenAI path needs the SDK
 
     # Contract §7: every call has a timeout, and at most one retry.
-    return openai.OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, max_retries=1)
+    # trust_env=False, as on the Ollama path: an HTTP(S)_PROXY / ALL_PROXY in
+    # the environment must not carry vault text (or the Bearer key) anywhere
+    # but the configured Spark host. Closed with the OpenAI client.
+    return openai.OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout,
+        max_retries=1,
+        http_client=openai.DefaultHttpxClient(trust_env=False, timeout=timeout),
+    )
 
 
 def _complete_openai(
@@ -242,6 +251,15 @@ def _complete_openai(
 ) -> str:
     """complete() against an OpenAI-compatible server (contract §2-4, §7)."""
     import openai
+
+    # Config load already enforces this; re-check before the key is read, so a
+    # base_url handed in directly can never send the key or vault text in clear.
+    try:
+        require_https_llm_url(base_url, source="local_llm")
+    except ValueError as e:
+        log.error("local_llm.insecure_base_url", error=str(e))
+        record_failure("local_llm.insecure_base_url")
+        raise LocalLLMUnavailable(str(e)) from e
 
     # Read per call, so a rotated key needs no restart. "dummy" is what an
     # unauthenticated vLLM accepts; once it has a key, a missing one is a 401.

@@ -115,6 +115,23 @@ def _warn_unused_keys(raw: dict, source: Path) -> None:
     _walk(raw, ())
 
 
+def require_https_llm_url(url: str, *, source: str = "llm.base_url") -> None:
+    """Refuse an OpenAI-compatible (Spark) base URL that is not https://host.
+
+    The Bearer key and vault text ride every request, so plain http (key in
+    clear on the tailnet), file://, or a hostless URL fail at config load
+    rather than at the first completion.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url or "")
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError(
+            f"{source}: llm base_url for api 'openai' must be https://<host>; got scheme "
+            f"{parsed.scheme or '(none)'!r}"
+        )
+
+
 def spark_env(name: str) -> str | None:
     """A Spark client setting: the environment first, then SPARK_ENV_PATH.
 
@@ -479,6 +496,7 @@ class AlfredConfig:
                     f"{path}: llm.api is openai but no base_url/model: set llm.base_url and "
                     f"llm.model, or SPARK_BASE_URL and SPARK_MODEL (environment or {SPARK_ENV_PATH})"
                 )
+            require_https_llm_url(cfg.llm_base_url, source=str(path))
 
         # Vault ignore dirs
         if v := raw.get("vault"):
