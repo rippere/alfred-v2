@@ -19,7 +19,8 @@ Module map (mirrors `alfred.ledger`'s shape):
     resolve.py      — CRM contact -> vault `person/*.md` entity, email-exact
                        match only; ambiguous or absent -> None, never a guess.
     brief.py        — vault-entity -> synthesized brief (QueryEngine +
-                       `anthropic_client.get_client()`); returns None when
+                       local LLM via `alfred.core.local_llm`, never a cloud
+                       model); returns None when
                        there's no relevant vault knowledge to write about.
     notes.py        — GET/POST NovaCRM deal & contact notes, the idempotency
                        hash-marker check, and the dry-run/--push split.
