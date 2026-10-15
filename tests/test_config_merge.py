@@ -18,6 +18,8 @@ import pytest
 from alfred.config import AlfredConfig, _deep_merge
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# The local LLM every vault runs on (config-base.yaml and the config.py default).
+QWEN_MODEL = "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M"
 
 BASE = """\
 ollama:
@@ -56,7 +58,7 @@ def test_vault_file_wins_and_base_fills_gaps(tmp_path):
     assert cfg.janitor_sweep_interval_s == 22222
     # Base wins over dataclass default (default is 24, base sets it too — use
     # sweep partner key deep_interval_h which only base sets vs default 24;
-    # llm_model is the unambiguous one: default "mistral:latest")
+    # llm_model is the unambiguous one: the dataclass default is the Qwen model)
     assert cfg.ollama_llm_model == "base-model:latest"
     assert cfg.default_top_k == 8
     # Dataclass default survives where neither file sets a key
@@ -71,7 +73,7 @@ def test_lists_replaced_wholesale_not_concatenated(tmp_path):
 def test_missing_base_is_harmless(tmp_path):
     cfg = AlfredConfig.load(_write(tmp_path, None))
     assert cfg.janitor_sweep_interval_s == 22222
-    assert cfg.ollama_llm_model == "mistral:latest"  # dataclass default
+    assert cfg.ollama_llm_model == QWEN_MODEL  # dataclass default
 
 
 def test_deep_merge_does_not_mutate_inputs():
@@ -196,8 +198,11 @@ def test_real_config_loads_with_expected_effective_values(config_name):
     assert cfg.vector_store == "lancedb"
     assert cfg.distiller_mode == "scheduled"          # from config-base.yaml
     assert cfg.janitor_dedup_enabled is False         # gated until dry-run tested
-    assert cfg.ollama_llm_model == "mistral:latest"
+    assert cfg.ollama_llm_model == QWEN_MODEL
     assert cfg.ollama_embed_model == "nomic-embed-text"
+    # Every vault — main and employment included — must stay on the loopback
+    # Ollama. Their data never goes to the Spark or any cloud endpoint.
+    assert cfg.ollama_base_url == "http://localhost:11434"
     # No cloud model fields: synthesis and every daemon call use ollama_llm_model.
     assert not hasattr(cfg, "anthropic_model")
     assert not hasattr(cfg, "openrouter_model")
