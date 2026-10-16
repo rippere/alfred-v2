@@ -1,0 +1,26 @@
+# Monthly x402 tripwire signals. Copy to data/tripwire-signals.yaml (gitignored
+# runtime data, not committed — real market numbers belong to the operator,
+# not the repo) and fill in before running `alfred tripwire check`.
+#
+# See: ADR-001 flip/abandon triggers, x402 x machine-readable-interfaces
+# strategy doc (2026-07-15 grilling session).
+
+# This month's observed x402 ecosystem payment volume, USD/month.
+ecosystem_volume_usd: 1800000
+
+# Optional override of the $1.6M/mo baseline (defaults to config.BASELINE_VOLUME_USD).
+# baseline_volume_usd: 1600000
+
+# Has Coinbase shipped a first-party seller dashboard? Explicit kill criterion —
+# true here always produces ABANDON-WEDGE regardless of every other signal.
+coinbase_seller_dashboard_shipped: false
+
+# Embedded-middleware moves from watched competitors this month. Use
+# "no major move" (or omit) when there's nothing to report.
+competitor_moves:
+  g402: "no major move"
+  monapi: "no major move"
+  Bankr: "no major move"
+
+# Optional free-text context carried into the inbox note verbatim.
+notes: ""

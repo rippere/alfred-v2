@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Alfred x402 tripwire watcher monthly
+Documentation=file:///home/rippere/alfred-v2/deploy/systemd/INSTALL.md
+
+[Timer]
+# First of the month, 09:00 local. Persistent=true runs a missed check on the
+# next boot (e.g. if the machine was asleep at the scheduled time).
+OnCalendar=*-*-01 09:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
