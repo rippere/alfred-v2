@@ -183,7 +183,9 @@ def build_plan(
         log.warning("reap.aborted", reason=plan.aborted)
         return plan
 
-    state_paths = {normalize_rel_path(k) for k in state.files}
+    # list() copies the keys atomically (one C call under the GIL). This runs
+    # in a worker thread while loop coroutines insert into the same dict.
+    state_paths = {normalize_rel_path(k) for k in list(state.files)}
     # An empty state must reap NOTHING, not everything. StateStore._read_raw
     # returns {} for a *missing* state.json — silently, no exception — so an
     # unreadable or not-yet-created state is indistinguishable here from "no
@@ -283,7 +285,9 @@ def execute_plan(
     if plan.aborted or not plan.orphans:
         return 0
 
-    state_paths = {normalize_rel_path(k) for k in state.files}
+    # list() copies the keys atomically (one C call under the GIL). This runs
+    # in a worker thread while loop coroutines insert into the same dict.
+    state_paths = {normalize_rel_path(k) for k in list(state.files)}
     # Re-walk the vault into the SAME normalized key space the plan uses.
     # `path` here is already apostrophe-stripped (normalize_rel_path, mirroring
     # core/vault.py's chunk-id construction), so the old `(vault_path /
