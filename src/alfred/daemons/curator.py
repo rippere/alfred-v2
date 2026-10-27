@@ -186,7 +186,9 @@ class CuratorDaemon(BaseDaemon):
             if "Already exists" in str(e):
                 # Retry with session_id suffix to avoid same-day slug collisions
                 session_id = fm.get("session_id", "")
-                sid_suffix = session_id[:8] if session_id else inbox_file.stem[-8:]
+                # Not stem[-8:]: fixed-tail stems (scribe's "<date>_<time>_meeting")
+                # all end "_meeting", so the third same-titled note was dropped.
+                sid_suffix = session_id[:8] if session_id else content_hash[:8]
                 fallback_name = f"{safe_name}-{sid_suffix}"
                 try:
                     result = vault_create(
