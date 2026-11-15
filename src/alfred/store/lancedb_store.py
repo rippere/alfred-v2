@@ -15,7 +15,7 @@ import gc
 import os
 import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,15 @@ log = structlog.get_logger()
 # inbox by 2026-10-15 came from pytest tmp dirs), and the curator then ingested
 # each one into the vault as an event record.
 CORRUPTION_ALERT_INBOX = Path("/mnt/external/obsidian-vault/inbox")
+
+# Strong read consistency: re-check the table's latest version before every
+# operation. The default (None) pins a handle to the version it opened at, so
+# once another process (scripts/compact_vault.py's cleanup_old_versions, or a
+# sibling daemon) prunes that manifest, every later merge_insert/delete on the
+# long-lived daemon handle fails with "Not found: ..._versions/<n>.manifest"
+# until the process restarts — 567 lost upserts in 30 min on 2026-11-15 after
+# the 12:56 compaction run. The extra cost is one manifest listing per op.
+READ_CONSISTENCY_INTERVAL = timedelta(0)
 
 # glibc hands freed heap back to the process's per-thread arenas, not to the
 # OS, so a long delete sweep ratchets RSS upward even when every individual
@@ -169,7 +178,7 @@ class LanceDBStore:
         self.dims = dims
 
         Path(uri).mkdir(parents=True, exist_ok=True)
-        self._db = lancedb.connect(uri)
+        self._db = lancedb.connect(uri, read_consistency_interval=READ_CONSISTENCY_INTERVAL)
 
         # Schema: id + vector + lightweight metadata columns
         self._schema = pa.schema([
@@ -246,7 +255,7 @@ class LanceDBStore:
         """
         import lancedb
 
-        self._db = lancedb.connect(self.uri)
+        self._db = lancedb.connect(self.uri, read_consistency_interval=READ_CONSISTENCY_INTERVAL)
         try:
             tbl = self._db.open_table(collection)
         except Exception:
@@ -301,7 +310,7 @@ class LanceDBStore:
 
         # Reconnect so the table_names cache reflects the move, then recreate.
         import lancedb
-        self._db = lancedb.connect(self.uri)
+        self._db = lancedb.connect(self.uri, read_consistency_interval=READ_CONSISTENCY_INTERVAL)
         tbl = self._db.create_table(collection, schema=self._schema, mode="create")
         self.was_recreated = True
         log.info("lancedb.table_recreated", name=collection)

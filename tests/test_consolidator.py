@@ -145,3 +145,51 @@ def test_stubs_tick_normal_path_creates_wiki_page(tmp_path):
     page = daemon.state.state.wiki_pages["jane doe"]
     assert page.rel_path == "wiki/jane-doe.md"
     assert (vault_path / "wiki" / "jane-doe.md").exists()
+
+
+def test_synthesis_pass_prunes_missing_members_and_skips_dead_cluster(tmp_path, monkeypatch):
+    """A cluster whose member files were deleted must not be retried every tick.
+
+    Regression for 2026-11-15: finance/neuroscience/personal logs carried
+    ~60k consolidator.member_read_failed each — stale clusters of vanished
+    topic/ and synthesis/ files kept ranking (by stale graph degree), failed
+    every read, and synthesized nothing, forever.
+    """
+    daemon = _make_daemon(tmp_path)
+    daemon.cfg.graph_path.parent.mkdir(parents=True, exist_ok=True)
+    vault = tmp_path / "vault"
+    (vault / "learn").mkdir()
+    for i in range(3):
+        (vault / "learn" / f"live{i}.md").write_text(f"---\nname: live{i}\n---\nbody {i}\n")
+    daemon.state.state.clusters["dead"] = ClusterState(
+        cluster_id=1, label=["gone"],
+        member_files=["topic/a.md", "topic/b.md", "topic/c.md"],
+    )
+    daemon.state.state.clusters["mixed"] = ClusterState(
+        cluster_id=2, label=["mixed"],
+        member_files=["learn/live0.md", "learn/live1.md", "learn/live2.md", "topic/gone.md"],
+    )
+
+    synthesized: list[list[str]] = []
+
+    async def _fake_synthesize(cluster, vault_path):
+        synthesized.append(list(cluster.member_files))
+
+    monkeypatch.setattr(daemon, "_synthesize_cluster", _fake_synthesize)
+    monkeypatch.setattr(asyncio, "sleep", _noop_sleep)  # skip the 2s inter-LLM rate limit
+
+    with capture_logs() as logs:
+        asyncio.run(daemon._synthesis_pass(vault))
+
+    assert daemon.state.state.clusters["dead"].member_files == []
+    assert daemon.state.state.clusters["mixed"].member_files == [
+        "learn/live0.md", "learn/live1.md", "learn/live2.md",
+    ]
+    # Only the cluster that still has live members reaches synthesis.
+    assert synthesized == [["learn/live0.md", "learn/live1.md", "learn/live2.md"]]
+    pruned = [e for e in logs if e["event"] == "consolidator.pruned_missing_members"]
+    assert pruned and pruned[0]["count"] == 4
+
+
+async def _noop_sleep(*_args, **_kwargs) -> None:
+    return None
