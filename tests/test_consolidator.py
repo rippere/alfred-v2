@@ -177,6 +177,12 @@ def test_synthesis_pass_prunes_missing_members_and_skips_dead_cluster(tmp_path, 
 
     monkeypatch.setattr(daemon, "_synthesize_cluster", _fake_synthesize)
     monkeypatch.setattr(asyncio, "sleep", _noop_sleep)  # skip the 2s inter-LLM rate limit
+    saves: list[int] = []
+
+    async def _count_save():
+        saves.append(1)
+
+    monkeypatch.setattr(daemon, "save_state", _count_save)
 
     with capture_logs() as logs:
         asyncio.run(daemon._synthesis_pass(vault))
@@ -189,6 +195,22 @@ def test_synthesis_pass_prunes_missing_members_and_skips_dead_cluster(tmp_path, 
     assert synthesized == [["learn/live0.md", "learn/live1.md", "learn/live2.md"]]
     pruned = [e for e in logs if e["event"] == "consolidator.pruned_missing_members"]
     assert pruned and pruned[0]["count"] == 4
+    assert saves, "pruned clusters must be persisted"
+
+
+def test_synthesis_pass_does_not_prune_when_vault_unmounted(tmp_path, monkeypatch):
+    """An unmounted vault makes every is_file() False; pruning then would wipe
+    every cluster's members and persist that. It must be skipped instead."""
+    daemon = _make_daemon(tmp_path)
+    daemon.cfg.graph_path.parent.mkdir(parents=True, exist_ok=True)
+    members = ["learn/a.md", "learn/b.md", "learn/c.md"]
+    daemon.state.state.clusters["c"] = ClusterState(cluster_id=1, label=["x"], member_files=list(members))
+    monkeypatch.setattr(daemon, "_synthesize_cluster", lambda *a, **k: _noop_sleep())
+    monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
+
+    asyncio.run(daemon._synthesis_pass(tmp_path / "not-mounted"))
+
+    assert daemon.state.state.clusters["c"].member_files == members
 
 
 async def _noop_sleep(*_args, **_kwargs) -> None:

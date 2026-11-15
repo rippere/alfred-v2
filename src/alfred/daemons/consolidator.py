@@ -160,6 +160,12 @@ class ConsolidatorDaemon(BaseDaemon):
 
         ranked: list[tuple[str, object, int]] = []
         pruned_members = 0
+        # Never prune against an unmounted/unreadable vault: every is_file()
+        # would be False and we'd persist empty clusters for every key.
+        try:
+            can_prune = vault_path.is_dir() and any(vault_path.iterdir())
+        except OSError:
+            can_prune = False
         # Hold the path-shared lock across load() + the degree reads below so
         # this never observes a graph mid-mutation by a surveyor GraphStore
         # instance operating on the same file (see GraphStore.transaction()).
@@ -171,7 +177,10 @@ class ConsolidatorDaemon(BaseDaemon):
                 # degree every tick, fails every member read (~60k
                 # member_read_failed per vault log), synthesizes nothing, and
                 # still occupies a SYNTHESIS_BATCH slot, starving live clusters.
-                live = [f for f in cluster.member_files if (vault_path / f).is_file()]
+                live = (
+                    [f for f in cluster.member_files if (vault_path / f).is_file()]
+                    if can_prune else cluster.member_files
+                )
                 if len(live) != len(cluster.member_files):
                     pruned_members += len(cluster.member_files) - len(live)
                     cluster.member_files = live
