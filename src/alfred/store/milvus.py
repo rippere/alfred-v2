@@ -13,7 +13,7 @@ from typing import Any
 
 import structlog
 
-from alfred.store.types import SearchHit  # noqa: F401  — moved to types.py; re-exported for back-compat
+from alfred.store.types import SearchHit, representative_chunks  # noqa: F401  — moved to types.py; re-exported for back-compat
 
 try:
     from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
@@ -237,6 +237,32 @@ class MilvusStore:
                 break
             offset += PAGE
         return all_rows
+
+    def file_vectors(self) -> tuple[list[str], Any]:
+        """One representative vector per file, as ``(rel_paths, float32 (n, dims))``.
+
+        Same contract as ``LanceDBStore.file_vectors``.  This legacy backend
+        has no streaming projection, so it pages ids + chunk_index first and
+        keeps only the representative embeddings while paging vectors.
+        """
+        import numpy as np
+
+        meta = self.query_all(output_fields=["id", "chunk_index"])
+        best = representative_chunks((r["id"], r.get("chunk_index")) for r in meta)
+        del meta
+        if not best:
+            return [], np.empty((0, self.embed_dims), dtype=np.float32)
+        paths = sorted(best)
+        slot = {best[p][1]: i for i, p in enumerate(paths)}
+        out = np.empty((len(paths), self.embed_dims), dtype=np.float32)
+        filled = np.zeros(len(paths), dtype=bool)
+        for r in self.query_all(output_fields=["id", "embedding"]):
+            i = slot.get(r["id"])
+            if i is not None and r.get("embedding") is not None:
+                out[i] = r["embedding"]
+                filled[i] = True
+        keep = np.flatnonzero(filled)
+        return [paths[i] for i in keep], np.ascontiguousarray(out[keep])
 
     @_auto_reconnect
     def count(self) -> int:

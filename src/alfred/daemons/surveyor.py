@@ -26,6 +26,72 @@ WATCH_INTERVAL = 60.0      # seconds between filesystem polls
 STATE_SAVE_EVERY = 25
 
 
+def cluster_labels(vectors, min_cluster_size: int, min_samples: int):
+    """HDBSCAN labels (``-1`` = noise) for one embedding per row of *vectors*.
+
+    Clusters by cosine distance without an n x n distance matrix.  sklearn's
+    HDBSCAN has no tree algorithm for ``metric="cosine"``, so it fell back to
+    brute force and materialised every pairwise distance — measured on the
+    live store (21,415 files, 2026-11-16) at ~8.5 GB over its input, growing
+    quadratically with vault size; that is what held alfred.service at its
+    MemoryHigh.  This path peaked at ~0.2 GB over its input.  On unit vectors
+    ``||a - b||^2 = 2 * (1 - cos(a, b))``, so Euclidean distance orders every
+    pair exactly as cosine distance does, and Euclidean gets the KD-tree +
+    Prim's path: O(n * min_samples) memory, the MST built from the data matrix.
+
+    The single-linkage hierarchy is unchanged by that monotone transform, but
+    HDBSCAN's excess-of-mass selection scores clusters by ``1/distance``
+    *values*, so a few borderline clusters can be selected differently than
+    they would be under cosine.
+
+    Rows that are all-zero or non-finite (cosine is undefined for them) are
+    labelled noise without being clustered.  *vectors* is not modified.
+    """
+    import numpy as np
+    from sklearn.cluster import HDBSCAN
+
+    x = np.array(vectors, dtype=np.float32, order="C", copy=True)
+    labels = np.full(len(x), -1, dtype=np.intp)
+    if len(x) == 0:
+        return labels
+    norms = np.linalg.norm(x, axis=1)
+    ok = np.isfinite(norms) & (norms > 0)
+    n_ok = int(ok.sum())
+    if n_ok < max(min_cluster_size, min_samples, 2):
+        return labels
+    x = x[ok] if n_ok != len(x) else x
+    x /= norms[ok][:, None]
+    labels[ok] = HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric="euclidean",
+        # Pin current (False) behaviour; the default flips to True in
+        # sklearn 1.10 and otherwise emits a FutureWarning every cluster.
+        copy=False,
+    ).fit_predict(x)
+    return labels
+
+
+def cluster_labels_isolated(vectors, min_cluster_size: int, min_samples: int):
+    """``cluster_labels`` in a short-lived spawned subprocess.
+
+    The tree path's MST step (sklearn ``mst_from_data_matrix``) holds the GIL
+    for its whole O(n^2) run — measured 140 s at 21k files — so running it
+    via ``asyncio.to_thread`` froze every other daemon's event loop for that
+    long.  A child process keeps the GIL free, returns its heap to the OS when
+    it exits, and turns an OOM kill into a failed recluster (BrokenProcessPool,
+    logged by the caller) instead of a dead daemon.  ``spawn`` rather than
+    ``fork``: the daemon is multi-threaded.  Blocking — call it from a worker
+    thread.
+    """
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+        return pool.submit(cluster_labels, vectors, min_cluster_size, min_samples).result()
+
+
 class SurveyorDaemon(BaseDaemon):
     name = "surveyor"
 
@@ -293,12 +359,13 @@ class SurveyorDaemon(BaseDaemon):
     async def _recluster(self) -> None:
         """HDBSCAN clustering over current embeddings.
 
-        The vector-store query_all (~48s for 4k vectors) and HDBSCAN run in a
-        thread pool so the event loop stays responsive for other daemons.
+        The vector load runs in a worker thread and HDBSCAN in a spawned
+        subprocess (see ``cluster_labels_isolated``) so the event loop stays
+        responsive for other daemons.
         """
         try:
-            import numpy as np
-            from sklearn.cluster import HDBSCAN
+            import numpy  # noqa: F401
+            from sklearn.cluster import HDBSCAN  # noqa: F401
         except ImportError as e:
             self.log.warning("surveyor.cluster_skip", reason=str(e))
             return
@@ -308,30 +375,11 @@ class SurveyorDaemon(BaseDaemon):
         store = self.store
 
         def _compute() -> tuple[dict[int, list[str]], list[tuple[str, int]]] | None:
-            rows = store.query_all(output_fields=["id", "embedding"])
-            if not rows:
-                return None
-
-            seen: dict[str, list[float]] = {}
-            for r in rows:
-                rel_path = r["id"].rsplit("::", 1)[0]
-                if rel_path not in seen:
-                    seen[rel_path] = r["embedding"]
-
-            paths = list(seen.keys())
-            vectors = np.array(list(seen.values()), dtype=np.float32)
-
+            paths, vectors = store.file_vectors()
             if len(paths) < min_cluster_size:
                 return None
 
-            labels = HDBSCAN(
-                min_cluster_size=min_cluster_size,
-                min_samples=min_samples,
-                metric="cosine",
-                # Pin current (False) behaviour; the default flips to True in
-                # sklearn 1.10 and otherwise emits a FutureWarning every cluster.
-                copy=False,
-            ).fit_predict(vectors)
+            labels = cluster_labels_isolated(vectors, min_cluster_size, min_samples)
 
             cluster_members: dict[int, list[str]] = {}
             path_labels: list[tuple[str, int]] = []
