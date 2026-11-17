@@ -6,9 +6,9 @@ import os
 import pickle
 import tempfile
 import threading
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Iterator
 
 import structlog
 
@@ -104,6 +104,34 @@ def _flock_state_for_path(path: Path) -> dict:
             state = {"thread_id": None, "depth": 0}
             _flock_state[key] = state
         return state
+
+
+def build_wikilink_index(rel_paths: Iterable[str]) -> dict[str, str]:
+    """Map every way a wikilink can spell a file to its canonical rel_path.
+
+    Wikilinks are bare stems (``[[foo]]``), never full paths, but graph nodes
+    for source files are keyed by full rel_path (``topic/foo.md``). Without
+    resolving link text through this index, the same file ends up as two
+    disconnected nodes — one keyed by rel_path (as an edge source), one keyed
+    by raw link text (as an edge target) — a graph.pkl node split-brain.
+    """
+    index: dict[str, str] = {}
+    for rel_str in rel_paths:
+        stem = Path(rel_str).stem
+        index.setdefault(stem, rel_str)
+        index.setdefault(rel_str.removesuffix(".md"), rel_str)
+        index.setdefault(rel_str, rel_str)
+    return index
+
+
+def _resolve_link(raw: str, link_index: dict[str, str]) -> str:
+    """Resolve raw wikilink text through build_wikilink_index; "" if unknown."""
+    key = " ".join(raw.split())
+    hit = link_index.get(key)
+    if hit:
+        return hit
+    norm = normalize_node(key)
+    return link_index.get(norm) or link_index.get(norm.removesuffix(".md"), "")
 
 
 class GraphStore:
@@ -262,12 +290,23 @@ class GraphStore:
         with self._lock:
             return self._graph().number_of_edges()
 
-    def add_edges_from_wikilinks(self, source_rel_path: str, targets: list[str]) -> None:
+    def add_edges_from_wikilinks(
+        self,
+        source_rel_path: str,
+        targets: list[str],
+        link_index: dict[str, str] | None = None,
+    ) -> None:
         """Add wikilink edges from a file to its link targets.
 
         Both ends are normalized into rel_path space (see normalize_node), so
         a target written as `note/foo` lands on the same node as the source
         `note/foo.md` instead of forking the file into two.
+
+        Wikilinks are usually bare stems (`[[foo]]`), which normalization alone
+        cannot place under their directory. Pass link_index (from
+        build_wikilink_index) to resolve them to the canonical rel_path of the
+        file they point to; with an index, links that resolve to no file are
+        dropped rather than added as phantom nodes.
         """
         with self._lock:
             g = self._graph()
@@ -276,7 +315,10 @@ class GraphStore:
                 return
             g.add_node(source)
             for raw in targets:
-                t = normalize_node(raw)
+                if link_index is not None:
+                    t = _resolve_link(raw, link_index)
+                else:
+                    t = normalize_node(raw)
                 if not t or t == source:      # a self-link adds no traversable edge
                     continue
                 g.add_node(t)
@@ -446,16 +488,21 @@ class GraphStore:
             ignore = set(ignore_dirs or [])
             self._g = nx.DiGraph()
 
+            md_files = []
             for md_file in vault_path.rglob("*.md"):
                 rel = md_file.relative_to(vault_path)
                 if any(part in ignore for part in rel.parts):
                     continue
-                rel_str = str(rel).replace("\\", "/")
+                md_files.append((md_file, str(rel).replace("\\", "/")))
+
+            link_index = build_wikilink_index(rel_str for _, rel_str in md_files)
+
+            for md_file, rel_str in md_files:
                 try:
                     raw = md_file.read_text(encoding="utf-8")
                     links = extract_wikilinks(raw)
                     if links:
-                        self.add_edges_from_wikilinks(rel_str, links)
+                        self.add_edges_from_wikilinks(rel_str, links, link_index=link_index)
                     else:
                         self._g.add_node(rel_str)
                 except (OSError, UnicodeDecodeError) as e:

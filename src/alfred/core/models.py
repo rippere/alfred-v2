@@ -104,14 +104,6 @@ class WikiPage:
 
 
 @dataclass
-class GraphEdge:
-    source: str
-    target: str
-    weight: float = 1.0
-    edge_type: str = "wikilink"
-
-
-@dataclass
 class PipelineState:
     version: int = 1
     last_run: str = ""

@@ -66,6 +66,29 @@ alfred query "what did I learn about content creation" -k 10 --json | jq .
 "answer", ...}`, or `{"error": ...}` with exit 1 if the query itself failed —
 so a caller can tell a broken backend from a genuinely empty result.
 
+### HTTP API authentication
+
+`ALFRED_HTTP_TOKEN` (env var, read by `src/alfred/mcp/server_http.py`) gates the HTTP/SSE
+server with Bearer auth. It has three modes, and the middle one is easy to get wrong:
+
+- **Unset** — server starts open, but only on a loopback bind (the code default,
+  127.0.0.1). A non-loopback bind, such as the deployed tailnet address, is refused
+  without a token.
+- **Set to a non-blank value** — server requires every request to send
+  `Authorization: Bearer <token>`; requests without it get `401 Unauthorized`.
+- **Set but blank/whitespace** (e.g. `Environment="ALFRED_HTTP_TOKEN=${SECRET}"` with `SECRET`
+  unset, expanding to `""`) — the server refuses to start at all (`SystemExit`). This is
+  deliberate: a blank-but-set token would otherwise look like "auth on" in every config check
+  while actually serving unauthenticated.
+
+To call the API with auth enabled (MCP JSON-RPC over `POST /mcp`):
+```bash
+curl -s http://<tailnet-ip>:8765/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -H 'Authorization: Bearer <PLACEHOLDER_TOKEN>' \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "vault_query", "arguments": {"query": "what did I learn about content creation"}}}'
+```
+
 ---
 
 ## Content creation workflow
