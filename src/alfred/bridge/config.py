@@ -62,9 +62,6 @@ NOTE_MARKER_SUFFIX: str = " -->"
 CLOSED_DEAL_STAGES: set[str] = {"closed_won", "closed_lost"}
 
 # ── Brief synthesis ──────────────────────────────────────────────────────
-# No shared LLM-call helper exists in alfred.core.anthropic_client beyond
-# get_client() itself (see query/synth.py for the ad hoc call-shape every
-# caller repeats) — the bridge defines its own default model here so it
-# isn't hardcoded inside enrich_crm.py's call site.
-BRIEF_SYNTHESIS_MODEL: str = "claude-sonnet-4-6"
+# Briefs are synthesized on the local model (cfg.ollama_llm_model via
+# alfred.core.local_llm) — there is deliberately no cloud model constant here.
 BRIEF_MAX_TOKENS: int = 512

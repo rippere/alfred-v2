@@ -5,7 +5,6 @@ for simplicity — filesystem-only. Wikilink updates on move are not automatic.
 """
 from __future__ import annotations
 
-import hashlib
 import re
 import threading
 from datetime import date
@@ -37,10 +36,6 @@ class VaultError(Exception):
 # threading.RLock rather than asyncio.Lock because these functions are
 # synchronous and must stay so — call sites across 5 daemons depend on it.
 _write_lock = threading.RLock()
-
-
-def compute_md5(path: Path) -> str:
-    return hashlib.md5(path.read_bytes()).hexdigest()
 
 
 def _resolve(vault_path: Path, rel_path: str) -> Path:
