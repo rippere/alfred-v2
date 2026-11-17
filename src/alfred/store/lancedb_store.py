@@ -17,11 +17,14 @@ import shutil
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from alfred.core.failures import record_failure
+
+if TYPE_CHECKING:
+    import numpy as np
 
 log = structlog.get_logger()
 
@@ -60,7 +63,7 @@ def _release_freed_memory() -> None:
         pass          # non-glibc (musl) — the sweep is still correct, just heavier
 
 # Re-export SearchHit from the shared types module so importers don't have to change.
-from alfred.store.types import SearchHit  # noqa: F401
+from alfred.store.types import SearchHit, representative_chunks  # noqa: F401
 
 # ANN probe settings for the IVF_PQ index that scripts/compact_vault.py
 # maintains on the vector column. Without an index every query flat-scans all
@@ -612,8 +615,100 @@ class LanceDBStore:
 
         return hits
 
+    def file_vectors(self, batch_size: int = 4096) -> tuple[list[str], np.ndarray]:
+        """One representative dense vector per file, for clustering.
+
+        Returns ``(rel_paths, vectors)``: ``rel_paths`` sorted, ``vectors`` a
+        C-contiguous ``np.float32`` array of shape ``(len(rel_paths), dims)``
+        whose row *i* belongs to ``rel_paths[i]``.  The representative is the
+        file's ``chunk_index == 0`` row, or its lowest-indexed chunk when a
+        file has no chunk 0 (see ``representative_chunks``).
+
+        Replaces ``query_all(["id", "embedding"])`` on the recluster path.
+        That call materialised *every* chunk's vector as a Python list of
+        Python floats (~2 GB at 83k rows x 768 dims, ~25 GB at the 1.07M rows
+        the store once reached) only for the surveyor to keep one per file.
+        Here:
+
+        * pass 1 reads ``id`` + ``chunk_index`` only (no vectors), to choose
+          the representative per file;
+        * pass 2 streams ``id`` + ``vector`` filtered to ``chunk_index = 0``,
+          copying each wanted vector straight from Arrow into a preallocated
+          float32 matrix — one batch in flight, no per-float Python objects;
+        * pass 3 runs only if some file lacks a chunk 0, streaming the other
+          rows the same way.  It is a streamed filter, not an ``id IN (...)``
+          lookup, because IN-clause cost scales with fragment count x terms
+          (see ``delete_ids``).
+
+        Rows whose vector is null, or which vanished between passes, are
+        dropped from the result.
+        """
+        import numpy as np
+
+        dims = self._tbl.schema.field("vector").type.list_size
+        meta = (
+            self._tbl.search()
+            .select(["id", "chunk_index"])
+            .limit(None)
+            .to_arrow()
+        )
+        best = representative_chunks(
+            zip(meta.column("id").to_pylist(), meta.column("chunk_index").to_pylist())
+        )
+        del meta
+        if not best:
+            return [], np.empty((0, dims), dtype=np.float32)
+
+        paths = sorted(best)
+        slot = {best[p][1]: i for i, p in enumerate(paths)}
+        out = np.empty((len(paths), dims), dtype=np.float32)
+        filled = np.zeros(len(paths), dtype=bool)
+
+        def _drain(where: str) -> None:
+            reader = (
+                self._tbl.search()
+                .where(where)
+                .select(["id", "vector"])
+                .limit(None)
+                .to_batches(batch_size=batch_size)
+            )
+            for batch in reader:
+                ids = batch.column("id").to_pylist()
+                hits = [(j, slot[c]) for j, c in enumerate(ids) if c in slot]
+                if not hits:
+                    continue
+                vec = batch.column("vector")
+                # .values ignores the array offset, so slice it explicitly.
+                mat = np.asarray(
+                    vec.values.slice(vec.offset * dims, len(vec) * dims)
+                    .to_numpy(zero_copy_only=False),
+                    dtype=np.float32,
+                ).reshape(len(vec), dims)
+                valid = (
+                    vec.is_valid().to_numpy(zero_copy_only=False)
+                    if vec.null_count else None
+                )
+                for j, i in hits:
+                    if valid is None or valid[j]:
+                        out[i] = mat[j]
+                        filled[i] = True
+
+        _drain("chunk_index = 0")
+        if any(idx != 0 for idx, _ in best.values()):
+            _drain("chunk_index IS NULL OR chunk_index <> 0")
+
+        if filled.all():
+            return paths, out
+        keep = np.flatnonzero(filled)
+        return [paths[i] for i in keep], np.ascontiguousarray(out[keep])
+
     def query_all(self, output_fields: list[str] | None = None) -> list[dict[str, Any]]:
-        """Return all rows.  Used by Surveyor for HDBSCAN clustering.
+        """Return all rows as Python dicts.
+
+        Memory-heavy: ``to_arrow()`` materialises every column of every row,
+        and an ``embedding`` field becomes a Python list of Python floats per
+        row.  Clustering uses ``file_vectors()`` instead; this is kept for
+        interface parity with MilvusStore (migration / ad-hoc tooling).
 
         Returns dicts with at least ``id`` and ``embedding`` keys to match the
         shape that Surveyor expects from the Milvus version.

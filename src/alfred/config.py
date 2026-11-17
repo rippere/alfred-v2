@@ -25,6 +25,7 @@ _CONSUMED_KEYS: frozenset[tuple[str, ...]] = frozenset({
     ("surveyor", "hdbscan_min_cluster_size"),
     ("surveyor", "hdbscan_min_samples"),
     ("surveyor", "embed_dims"),
+    ("surveyor", "recluster_timeout_s"),
     ("vector_store",),           # plain-string form
     ("vector_store", "backend"),  # mapping form
     ("query", "top_k"),
@@ -161,6 +162,11 @@ class AlfredConfig:
     # Surveyor
     hdbscan_min_cluster_size: int = 2
     hdbscan_min_samples: int = 1
+    # Wall-clock ceiling for the HDBSCAN subprocess in one recluster. Measured
+    # ~150 s at 21k files (O(n^2) Prim's MST); 15 min leaves room for ~3x the
+    # vault before a healthy run would trip it. On expiry the child is killed
+    # and the recluster is logged as surveyor.cluster_failed.
+    recluster_timeout_s: float = 900.0
     leiden_resolution: float = 1.0
 
     # Vector store backend: "lancedb" (default, no file-lock) or "milvus" (legacy)
@@ -262,6 +268,7 @@ class AlfredConfig:
             cfg.hdbscan_min_cluster_size = s.get("hdbscan_min_cluster_size", cfg.hdbscan_min_cluster_size)
             cfg.hdbscan_min_samples = s.get("hdbscan_min_samples", cfg.hdbscan_min_samples)
             cfg.embed_dims = s.get("embed_dims", cfg.embed_dims)
+            cfg.recluster_timeout_s = float(s.get("recluster_timeout_s", cfg.recluster_timeout_s))
 
         # Vector store backend
         if vs := raw.get("vector_store"):
