@@ -25,6 +25,13 @@ from alfred.core.failures import record_failure
 
 log = structlog.get_logger()
 
+# Where an auto-quarantine drops its operator alert. Module-level so the test
+# suite can point it away from the live vault: the quarantine tests used to
+# write a real "corruption" note here on every run (76 of the 77 alerts in the
+# inbox by 2026-10-15 came from pytest tmp dirs), and the curator then ingested
+# each one into the vault as an event record.
+CORRUPTION_ALERT_INBOX = Path("/mnt/external/obsidian-vault/inbox")
+
 # glibc hands freed heap back to the process's per-thread arenas, not to the
 # OS, so a long delete sweep ratchets RSS upward even when every individual
 # call is small — this box has 16 cores, so up to 128 arenas. That ratchet, not
@@ -45,6 +52,14 @@ def _release_freed_memory() -> None:
 
 # Re-export SearchHit from the shared types module so importers don't have to change.
 from alfred.store.types import SearchHit  # noqa: F401
+
+# ANN probe settings for the IVF_PQ index that scripts/compact_vault.py
+# maintains on the vector column. Without an index every query flat-scans all
+# ~300k vectors (~1.3 GB peak, ~7 s); with it, ~0.3 GB and ~0.2 s. Measured
+# 2026-09-24 against flat search: nprobes=128/512 partitions + refine 20 gives
+# recall@24 = 0.97. Both are ignored on a table with no index (flat scan).
+SEARCH_NPROBES = 128
+SEARCH_REFINE_FACTOR = 20
 
 # Substrings that mark a *corrupt table* (interrupted-write damage: zero-byte
 # manifests, truncated fragments) as opposed to a transient/operational error
@@ -303,7 +318,7 @@ class LanceDBStore:
         if kill_ctx:
             log.info("lancedb.quarantine_kill_context", name=collection, context=kill_ctx)
         try:
-            inbox = Path("/mnt/external/obsidian-vault/inbox")
+            inbox = CORRUPTION_ALERT_INBOX
             if not inbox.is_dir():
                 return
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -555,6 +570,8 @@ class LanceDBStore:
             self._tbl
             .search(dense_vec, vector_column_name="vector")
             .metric("cosine")
+            .nprobes(SEARCH_NPROBES)
+            .refine_factor(SEARCH_REFINE_FACTOR)
             .limit(top_k * 3)
             .select(["id", "record_type", "name", "_distance"])
             .to_list()

@@ -127,3 +127,30 @@ def test_rerank_calls_get_ranker_lazily_once_per_call(monkeypatch):
     reranker.rerank("q", hits, {"a::chunk_00": "text"}, top_n=5)
 
     assert len(calls) == 1
+
+
+class _ScoreByTextRanker:
+    """Scores each passage independently from its text, like a cross-encoder."""
+
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
+    def rerank(self, request):
+        self.batch_sizes.append(len(request.passages))
+        return [{"id": p["id"], "score": float(p["text"].split()[-1])} for p in request.passages]
+
+
+def test_rerank_batches_large_inputs_and_ranks_globally(monkeypatch):
+    fake = _ScoreByTextRanker()
+    monkeypatch.setattr(reranker, "_get_ranker", lambda: fake)
+
+    n = reranker._RERANK_BATCH * 2 + 5
+    scores = [(i * 37) % n for i in range(n)]  # permutation, so best hits span batches
+    hits = [SearchHit(chunk_id=f"c{i}", rel_path=f"notes/{i}.md", score=0.1) for i in range(n)]
+    texts = {f"c{i}": f"text {s}" for i, s in enumerate(scores)}
+
+    result = reranker.rerank("q", hits, texts, top_n=5)
+
+    assert max(fake.batch_sizes) <= reranker._RERANK_BATCH
+    assert sum(fake.batch_sizes) == n
+    assert [h.rerank_score for h in result] == sorted(scores, reverse=True)[:5]

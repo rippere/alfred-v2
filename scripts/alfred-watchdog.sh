@@ -33,6 +33,9 @@ _game_active() {
     [[ "$mode" == "off" ]] && return 1
     [[ "$mode" == "on" ]] && return 0
     pgrep -f 'reaper.*SteamLaunch AppId=' >/dev/null 2>&1 && return 0
+    # Minecraft client JVM — must match ollama-game-guard's game_running() or
+    # the watchdog heals what the guard is pausing (storm seen 2026-10-09).
+    pgrep -f 'java.*(org\.prismlauncher\.EntryPoint|org\.multimc\.EntryPoint|net\.minecraft\.client\.main\.Main)' >/dev/null 2>&1 && return 0
     gamemoded -s 2>/dev/null | grep -q 'gamemode is active' && return 0
     return 1
 }
