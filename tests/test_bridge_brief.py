@@ -1,6 +1,6 @@
 """Unit tests for alfred.bridge.brief — vault query -> LLM brief synthesis.
 
-The QueryEngine and the Anthropic client are both faked: these are unit
+The QueryEngine and the local LLM backend are both faked: these are unit
 tests of the bridge's own glue code (query construction, empty-context
 short-circuit, hash computation), not of retrieval or the model itself. No
 real network/API call is made.
@@ -42,19 +42,28 @@ class _FakeEngine:
         return self.result
 
 
-class _FakeMessages:
+LLM_URL = "http://127.0.0.1:11434"
+LLM_MODEL = "local-test-model"
+
+
+class _FakeLocalLLM:
+    """Stands in for alfred.core.local_llm.complete; records every call."""
+
     def __init__(self, text):
         self._text = text
         self.calls: list[dict] = []
 
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return SimpleNamespace(content=[SimpleNamespace(text=self._text)])
+    def __call__(self, system, user, **kwargs):
+        self.calls.append({"system": system, "user": user, **kwargs})
+        return self._text
 
 
-class _FakeClient:
-    def __init__(self, text):
-        self.messages = _FakeMessages(text)
+def _no_cloud(monkeypatch):
+    """Any cloud client construction fails the test."""
+    monkeypatch.setattr(
+        "alfred.core.anthropic_client.get_client",
+        lambda: (_ for _ in ()).throw(AssertionError("bridge brief must never use a cloud LLM")),
+    )
 
 
 def test_build_query_text_mentions_entity_name():
@@ -92,38 +101,40 @@ def test_compute_brief_hash_is_deterministic_and_content_sensitive():
 
 def test_synthesize_entity_brief_returns_none_when_no_vault_context(monkeypatch):
     engine = _FakeEngine(_FakeQueryResult(context=""))
+    llm = _FakeLocalLLM("should not be used")
+    monkeypatch.setattr("alfred.core.local_llm.complete", llm)
+    _no_cloud(monkeypatch)
 
-    def _boom():
-        raise AssertionError("LLM should never be called when there is no vault context")
-
-    monkeypatch.setattr("alfred.core.anthropic_client.get_client", _boom)
-
-    result = brief.synthesize_entity_brief(engine, ENTITY)
+    result = brief.synthesize_entity_brief(engine, ENTITY, base_url=LLM_URL, model=LLM_MODEL)
 
     assert result is None
+    assert llm.calls == []
 
 
 def test_synthesize_entity_brief_returns_none_when_context_is_whitespace_only(monkeypatch):
     engine = _FakeEngine(_FakeQueryResult(context="   \n  "))
-    monkeypatch.setattr(
-        "alfred.core.anthropic_client.get_client",
-        lambda: (_ for _ in ()).throw(AssertionError("LLM should not be called")),
-    )
+    llm = _FakeLocalLLM("should not be used")
+    monkeypatch.setattr("alfred.core.local_llm.complete", llm)
+    _no_cloud(monkeypatch)
 
-    result = brief.synthesize_entity_brief(engine, ENTITY)
+    result = brief.synthesize_entity_brief(engine, ENTITY, base_url=LLM_URL, model=LLM_MODEL)
 
     assert result is None
+    assert llm.calls == []
 
 
-def test_synthesize_entity_brief_calls_llm_and_builds_brief(monkeypatch):
+def test_synthesize_entity_brief_calls_local_llm_and_builds_brief(monkeypatch):
     fake_source = SimpleNamespace(rel_path="note/meeting-2026-01.md")
     engine = _FakeEngine(
         _FakeQueryResult(context="David works on the WSU project.", sources=[fake_source])
     )
-    fake_client = _FakeClient("David is a WSU collaborator focused on the platform migration.")
-    monkeypatch.setattr("alfred.core.anthropic_client.get_client", lambda: fake_client)
+    llm = _FakeLocalLLM("  David is a WSU collaborator focused on the platform migration.\n")
+    monkeypatch.setattr("alfred.core.local_llm.complete", llm)
+    _no_cloud(monkeypatch)
 
-    result = brief.synthesize_entity_brief(engine, ENTITY, top_k=3, model="test-model", max_tokens=256)
+    result = brief.synthesize_entity_brief(
+        engine, ENTITY, top_k=3, base_url=LLM_URL, model=LLM_MODEL, max_tokens=256
+    )
 
     assert result is not None
     assert result.entity_name == "David Szabo-Stuban"
@@ -132,34 +143,71 @@ def test_synthesize_entity_brief_calls_llm_and_builds_brief(monkeypatch):
     assert result.source_paths == ["note/meeting-2026-01.md"]
     assert result.note_hash == brief.compute_brief_hash(ENTITY.rel_path, result.text)
 
-    # LLM was called exactly once, with the expected model/max_tokens/context.
-    assert len(fake_client.messages.calls) == 1
-    call = fake_client.messages.calls[0]
-    assert call["model"] == "test-model"
+    # Local LLM was called exactly once, with the caller's local settings.
+    assert len(llm.calls) == 1
+    call = llm.calls[0]
+    assert call["base_url"] == LLM_URL
+    assert call["model"] == LLM_MODEL
     assert call["max_tokens"] == 256
-    assert "David works on the WSU project." in call["messages"][0]["content"]
+    assert call["system"] == brief.SYSTEM_PROMPT
+    assert "David works on the WSU project." in call["user"]
 
 
 def test_synthesize_entity_brief_returns_none_when_llm_returns_blank_text(monkeypatch):
     engine = _FakeEngine(_FakeQueryResult(context="some context"))
-    fake_client = _FakeClient("   ")
-    monkeypatch.setattr("alfred.core.anthropic_client.get_client", lambda: fake_client)
+    llm = _FakeLocalLLM("   ")
+    monkeypatch.setattr("alfred.core.local_llm.complete", llm)
+    _no_cloud(monkeypatch)
 
-    result = brief.synthesize_entity_brief(engine, ENTITY)
+    result = brief.synthesize_entity_brief(engine, ENTITY, base_url=LLM_URL, model=LLM_MODEL)
 
     assert result is None
-    assert len(fake_client.messages.calls) == 1
+    assert len(llm.calls) == 1
 
 
-def test_synthesize_entity_brief_uses_default_model_and_max_tokens_from_config(monkeypatch):
+def test_synthesize_entity_brief_uses_default_max_tokens_from_config(monkeypatch):
     from alfred.bridge import config as C
 
     engine = _FakeEngine(_FakeQueryResult(context="some context"))
-    fake_client = _FakeClient("A short brief.")
-    monkeypatch.setattr("alfred.core.anthropic_client.get_client", lambda: fake_client)
+    llm = _FakeLocalLLM("A short brief.")
+    monkeypatch.setattr("alfred.core.local_llm.complete", llm)
+    _no_cloud(monkeypatch)
 
-    brief.synthesize_entity_brief(engine, ENTITY)
+    brief.synthesize_entity_brief(engine, ENTITY, base_url=LLM_URL, model=LLM_MODEL)
 
-    call = fake_client.messages.calls[0]
-    assert call["model"] == C.BRIEF_SYNTHESIS_MODEL
-    assert call["max_tokens"] == C.BRIEF_MAX_TOKENS
+    assert llm.calls[0]["max_tokens"] == C.BRIEF_MAX_TOKENS
+
+
+def test_synthesize_entity_brief_propagates_local_llm_unavailable(monkeypatch):
+    """Backend down is 'work undone', never a silent None or a cloud fallback."""
+    from alfred.core.local_llm import LocalLLMUnavailable
+
+    engine = _FakeEngine(_FakeQueryResult(context="some context"))
+
+    def _down(*a, **k):
+        raise LocalLLMUnavailable("ollama unreachable")
+
+    monkeypatch.setattr("alfred.core.local_llm.complete", _down)
+    _no_cloud(monkeypatch)
+
+    with pytest.raises(LocalLLMUnavailable):
+        brief.synthesize_entity_brief(engine, ENTITY, base_url=LLM_URL, model=LLM_MODEL)
+
+
+def test_synthesize_entity_brief_requires_local_llm_settings():
+    """No implicit model default: omitting base_url/model is a TypeError."""
+    engine = _FakeEngine(_FakeQueryResult(context="some context"))
+    with pytest.raises(TypeError):
+        brief.synthesize_entity_brief(engine, ENTITY)
+
+
+def test_bridge_package_has_no_cloud_llm_reference():
+    """The bridge must not import or name a cloud LLM client or model."""
+    import pathlib
+
+    import alfred.bridge as pkg
+
+    for path in pathlib.Path(pkg.__file__).parent.glob("*.py"):
+        src = path.read_text()
+        assert "import anthropic" not in src and "anthropic_client import" not in src, path
+        assert "claude-" not in src, path

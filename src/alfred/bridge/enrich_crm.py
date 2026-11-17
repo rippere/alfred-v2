@@ -209,7 +209,10 @@ def run_enrich(
             entity=match.rel_path, confidence=match.confidence,
         )
 
-        brief_obj = synthesize_entity_brief(engine, match, top_k=top_k)
+        brief_obj = synthesize_entity_brief(
+            engine, match, top_k=top_k,
+            base_url=cfg.ollama_base_url, model=cfg.ollama_llm_model,
+        )
         if brief_obj is None:
             log.info(
                 "bridge.enrich.no_brief", deal_id=deal_id, contact_id=contact_id,

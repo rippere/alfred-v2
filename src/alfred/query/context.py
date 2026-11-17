@@ -14,6 +14,11 @@ log = structlog.get_logger()
 MAX_CONTEXT_CHARS = 60_000
 CHUNK_PREVIEW_CHARS = 200
 
+# rel_path -> chunk_record() output, valid for one query only. Never a module-level
+# cache (e.g. lru_cache): the vault is live and files change between queries, so a
+# cache shared across queries would serve stale chunk text.
+ChunkCache = dict[str, list[tuple[str, str]]]
+
 
 @dataclass
 class SourceRef:
@@ -28,8 +33,17 @@ class SourceRef:
 def assemble(
     hits: list[SearchHit],
     vault_path: Path,
+    cache: ChunkCache | None = None,
 ) -> tuple[str, list[SourceRef]]:
-    """Keep best chunk per source file, assemble up to MAX_CONTEXT_CHARS."""
+    """Keep best chunk per source file, assemble up to MAX_CONTEXT_CHARS.
+
+    ``cache`` should be a dict shared with the caller's other _chunk_text calls
+    (e.g. the reranker text map) for the same query, so each source file is
+    parsed at most once per query. Pass None for a call-local cache.
+    """
+    if cache is None:
+        cache = {}
+
     # Deduplicate: keep highest-scoring chunk per rel_path
     by_file: dict[str, SearchHit] = {}
     for h in hits:
@@ -43,7 +57,7 @@ def assemble(
     total = 0
 
     for hit in ranked:
-        text = _chunk_text(vault_path, hit.chunk_id)
+        text = _chunk_text(vault_path, hit.chunk_id, cache)
         if not text:
             continue
         if total + len(text) > MAX_CONTEXT_CHARS:
@@ -66,16 +80,18 @@ def assemble(
     return "\n\n---\n\n".join(parts), sources
 
 
-def chunk_preview(sources: list[SourceRef], vault_path: Path) -> dict[str, str]:
+def chunk_preview(sources: list[SourceRef], vault_path: Path, cache: ChunkCache | None = None) -> dict[str, str]:
     """Return {rel_path: preview_text} for display."""
+    if cache is None:
+        cache = {}
     previews: dict[str, str] = {}
     for src in sources:
-        text = _chunk_text(vault_path, src.chunk_id) or ""
+        text = _chunk_text(vault_path, src.chunk_id, cache) or ""
         previews[src.rel_path] = text[:CHUNK_PREVIEW_CHARS].replace("\n", " ")
     return previews
 
 
-def _chunk_text(vault_path: Path, chunk_id: str) -> str | None:
+def _chunk_text(vault_path: Path, chunk_id: str, cache: ChunkCache | None = None) -> str | None:
     if "::" not in chunk_id:
         return None
     rel_path, chunk_part = chunk_id.rsplit("::", 1)
@@ -87,8 +103,13 @@ def _chunk_text(vault_path: Path, chunk_id: str) -> str | None:
     if not full.exists():
         return None
     try:
-        record = parse_file(vault_path, rel_path)
-        chunks = chunk_record(record)
+        if cache is not None and rel_path in cache:
+            chunks = cache[rel_path]
+        else:
+            record = parse_file(vault_path, rel_path)
+            chunks = chunk_record(record)
+            if cache is not None:
+                cache[rel_path] = chunks
         return chunks[idx][1] if idx < len(chunks) else None
     except Exception as e:
         log.debug("context.chunk_resolve_failed", rel_path=str(rel_path), error=str(e))
