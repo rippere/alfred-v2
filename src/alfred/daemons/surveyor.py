@@ -72,24 +72,73 @@ def cluster_labels(vectors, min_cluster_size: int, min_samples: int):
     return labels
 
 
-def cluster_labels_isolated(vectors, min_cluster_size: int, min_samples: int):
-    """``cluster_labels`` in a short-lived spawned subprocess.
+def _cluster_child(conn, vectors, min_cluster_size: int, min_samples: int) -> None:
+    """Subprocess entry point: send ``("ok", labels)`` or ``("err", message)``."""
+    try:
+        conn.send(("ok", cluster_labels(vectors, min_cluster_size, min_samples)))
+    except BaseException as e:  # report everything; the parent decides
+        conn.send(("err", f"{type(e).__name__}: {e}"))
+    finally:
+        conn.close()
+
+
+def cluster_labels_isolated(
+    vectors, min_cluster_size: int, min_samples: int, timeout_s: float = 900.0,
+):
+    """``cluster_labels`` in a short-lived spawned subprocess, with a deadline.
 
     The tree path's MST step (sklearn ``mst_from_data_matrix``) holds the GIL
     for its whole O(n^2) run — measured 140 s at 21k files — so running it
     via ``asyncio.to_thread`` froze every other daemon's event loop for that
-    long.  A child process keeps the GIL free, returns its heap to the OS when
-    it exits, and turns an OOM kill into a failed recluster (BrokenProcessPool,
-    logged by the caller) instead of a dead daemon.  ``spawn`` rather than
-    ``fork``: the daemon is multi-threaded.  Blocking — call it from a worker
-    thread.
+    long.  A child process keeps the GIL free (measured max loop lag 2 ms),
+    and its heap goes back to the OS when it exits instead of staying in the
+    daemon's glibc arenas.
+
+    It is NOT an OOM firewall: the child shares alfred.service's cgroup, and
+    the unit runs with ``OOMPolicy=stop``, so a child OOM kill still stops the
+    whole service.
+
+    Raises ``TimeoutError`` if no result arrives within *timeout_s* (the child
+    is terminated first), or ``RuntimeError`` if the child fails or dies.
+    ``spawn`` rather than ``fork``: the daemon is multi-threaded.  Blocking —
+    call it from a worker thread.
     """
     import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor
 
     ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
-        return pool.submit(cluster_labels, vectors, min_cluster_size, min_samples).result()
+    recv, send = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_cluster_child,
+        args=(send, vectors, min_cluster_size, min_samples),
+        name="alfred-hdbscan",
+        daemon=True,  # never outlive the daemon
+    )
+    proc.start()
+    send.close()  # parent keeps only the read end, so child death reads as EOF
+    try:
+        # poll() also returns True on EOF (child died), so recv() decides.
+        if not recv.poll(timeout_s):
+            raise TimeoutError(
+                f"HDBSCAN subprocess gave no result within {timeout_s:.0f}s; killed"
+            )
+        try:
+            status, payload = recv.recv()
+        except EOFError:
+            proc.join(5)
+            raise RuntimeError(
+                f"HDBSCAN subprocess died without a result (exitcode {proc.exitcode})"
+            ) from None
+        if status != "ok":
+            raise RuntimeError(f"HDBSCAN subprocess failed: {payload}")
+        return payload
+    finally:
+        recv.close()
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+            if proc.is_alive():
+                proc.kill()
+        proc.join()
 
 
 class SurveyorDaemon(BaseDaemon):
@@ -372,6 +421,7 @@ class SurveyorDaemon(BaseDaemon):
 
         min_cluster_size = self.cfg.hdbscan_min_cluster_size
         min_samples = self.cfg.hdbscan_min_samples
+        timeout_s = self.cfg.recluster_timeout_s
         store = self.store
 
         def _compute() -> tuple[dict[int, list[str]], list[tuple[str, int]]] | None:
@@ -379,7 +429,9 @@ class SurveyorDaemon(BaseDaemon):
             if len(paths) < min_cluster_size:
                 return None
 
-            labels = cluster_labels_isolated(vectors, min_cluster_size, min_samples)
+            labels = cluster_labels_isolated(
+                vectors, min_cluster_size, min_samples, timeout_s=timeout_s
+            )
 
             cluster_members: dict[int, list[str]] = {}
             path_labels: list[tuple[str, int]] = []

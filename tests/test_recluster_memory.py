@@ -222,3 +222,64 @@ def test_recluster_empty_store(tmp_path, n):
     d = _daemon(tmp_path, _VectorStore([], np.empty((n, DIMS), np.float32)))
     asyncio.run(d._recluster())
     assert d.state.state.clusters == {}
+
+
+# ── subprocess deadline / failure handling ────────────────────────────────────
+
+def test_cluster_labels_isolated_times_out_and_kills_the_child():
+    """No result within the deadline -> TimeoutError, and no child left behind.
+
+    0.01 s is far below spawn + import time, so the deadline always fires
+    while the child is still alive.
+    """
+    import multiprocessing
+
+    from alfred.daemons.surveyor import cluster_labels_isolated
+
+    with pytest.raises(TimeoutError):
+        cluster_labels_isolated(_two_directions(), 3, 2, timeout_s=0.01)
+    assert [p for p in multiprocessing.active_children() if p.name == "alfred-hdbscan"] == []
+
+
+def test_cluster_labels_isolated_surfaces_child_errors():
+    from alfred.daemons.surveyor import cluster_labels_isolated
+
+    with pytest.raises(RuntimeError, match="ValueError"):
+        cluster_labels_isolated(np.array([["a", "b"]]), 3, 2, timeout_s=120)
+
+
+def test_recluster_timeout_is_config_backed_and_logged_as_cluster_failed(tmp_path, monkeypatch):
+    from structlog.testing import capture_logs
+
+    import alfred.daemons.surveyor as surveyor_mod
+
+    seen: dict = {}
+
+    def _hang(vectors, mcs, ms, timeout_s):
+        seen["timeout_s"] = timeout_s
+        raise TimeoutError("HDBSCAN subprocess gave no result within 12s; killed")
+
+    monkeypatch.setattr(surveyor_mod, "cluster_labels_isolated", _hang)
+    x = _two_directions()
+    d = _daemon(tmp_path, _VectorStore([f"f{i}.md" for i in range(len(x))], x))
+    d.cfg.recluster_timeout_s = 12.5
+
+    with capture_logs() as logs:
+        asyncio.run(d._recluster())
+
+    assert seen["timeout_s"] == 12.5
+    assert any(e["event"] == "surveyor.cluster_failed" and "12s" in e["error"] for e in logs)
+    assert d.state.state.clusters == {}
+
+
+def test_recluster_timeout_loads_from_yaml(tmp_path):
+    import yaml
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({
+        "vault": {"path": str(tmp_path / "vault")},
+        "surveyor": {"recluster_timeout_s": 42},
+    }))
+    assert AlfredConfig.load(cfg_path).recluster_timeout_s == 42.0
+    cfg_path.write_text(yaml.safe_dump({"vault": {"path": str(tmp_path / "vault")}}))
+    assert AlfredConfig.load(cfg_path).recluster_timeout_s == 900.0
