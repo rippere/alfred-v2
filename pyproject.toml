@@ -20,6 +20,7 @@ dependencies = [
     "leidenalg>=0.10",
     "networkx>=3.6.1",
     "openai>=1.30",
+    "pylance==10.0.0",
     "python-frontmatter>=1.1",
     "pyyaml>=6.0",
     "rank-bm25>=0.2.2",

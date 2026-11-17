@@ -118,13 +118,15 @@ def test_state_is_persisted_during_a_long_diff(tmp_path, monkeypatch):
     rels = [f"note/f{i:03d}.md" for i in range(n_files)]
 
     saves: list[int] = []
-    real_save = st.save
+    real_write = st._write_merged
 
-    def counting_save():
-        saves.append(len(st.state.files))
-        real_save()
+    # Spy on the write step both save() and async_save() share, and count
+    # the files in the snapshot actually written.
+    def counting_write(snap, base, deadline=None):
+        saves.append(len(snap["files"]))
+        return real_write(snap, base, deadline)
 
-    monkeypatch.setattr(st, "save", counting_save)
+    monkeypatch.setattr(st, "_write_merged", counting_write)
 
     async def run():
         since = 0

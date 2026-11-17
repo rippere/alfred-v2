@@ -149,8 +149,8 @@ def test_concurrent_fresh_create_no_crash_single_creator(tmp_path, monkeypatch):
                 create_calls.append(1)
             return tbl
 
-    def fake_connect(u):
-        return _CountingDB(real_connect(u))
+    def fake_connect(u, **kwargs):
+        return _CountingDB(real_connect(u, **kwargs))
 
     monkeypatch.setattr(lancedb, "connect", fake_connect)
 
