@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from alfred.config import AlfredConfig
+from alfred.core.failures import record_failure
 from alfred.query.context import SourceRef, assemble, chunk_preview
 from alfred.query.wiki import WikiFastPath, WikiHit
 from alfred.store.types import SearchHit
@@ -118,6 +119,18 @@ class QueryEngine:
             opts = QueryOptions(top_k=self.cfg.default_top_k)
 
         if self.cfg.bm25_only:
+            log.warning(
+                "query.bm25_only_deprecated",
+                message=(
+                    "bm25_only is a deprecated/unsupported path: the BM25 corpus at "
+                    "cfg.bm25_path is static and is NOT updated by the live surveyor "
+                    "pipeline. It was last populated by the archived one-off script "
+                    "scripts/_archive/phase4_rebuild_milvus.py and will silently drift "
+                    "stale as the vault changes. Do not rely on this path for "
+                    "production retrieval quality."
+                ),
+                bm25_path=str(self.cfg.bm25_path),
+            )
             return self._query_bm25_only(text, opts)
 
         t = {}
@@ -204,8 +217,6 @@ class QueryEngine:
             answer, backend, model = synthesize(
                 query=text,
                 context=context,
-                anthropic_model=self.cfg.anthropic_model,
-                openrouter_model=self.cfg.openrouter_model,
                 ollama_base_url=self.cfg.ollama_base_url,
                 ollama_model=self.cfg.ollama_llm_model,
             )
@@ -244,8 +255,10 @@ class QueryEngine:
             }
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
-        except Exception:
-            pass
+        except Exception as e:
+            # Query telemetry is best-effort, but silently losing it makes the
+            # query log read as "nobody queried" rather than "couldn't write".
+            record_failure("query.telemetry_write_failed", error=e)
 
     def _query_bm25_only(self, text: str, opts: QueryOptions) -> QueryResult:
         """Lightweight query path: BM25 corpus search only, no Milvus or Ollama.
@@ -313,8 +326,6 @@ class QueryEngine:
             answer, backend, model = synthesize(
                 query=text,
                 context=context,
-                anthropic_model=self.cfg.anthropic_model,
-                openrouter_model=self.cfg.openrouter_model,
                 ollama_base_url=self.cfg.ollama_base_url,
                 ollama_model=self.cfg.ollama_llm_model,
             )

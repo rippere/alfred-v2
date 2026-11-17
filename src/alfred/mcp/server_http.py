@@ -1,7 +1,17 @@
-"""Alfred MCP HTTP/SSE server — localhost-only transport for Claude Code clients.
+"""Alfred MCP HTTP server — streamable-http transport for Claude Code clients.
 
-This module exposes the same vault tools as server.py but over HTTP/SSE on
-127.0.0.1:8765.  Binding to loopback prevents accidental LAN exposure.
+This module exposes the same vault tools as server.py but over HTTP, by default
+on 127.0.0.1:8765.  ALFRED_HTTP_HOST/ALFRED_HTTP_PORT override that; the default
+stays loopback so widening the bind is always a deliberate act, and a
+non-loopback host without ALFRED_HTTP_TOKEN is refused outright.
+
+The deployed unit binds the Tailscale interface address specifically (never
+0.0.0.0) so the vault is reachable from the tailnet but not from the LAN.
+
+The app is mounted at /mcp (fastmcp's streamable-http default). There is no
+/query route and none is planned: the two callers that used to expect one
+(RUNBOOK.md, scripts/content-brief.sh) now use the `alfred query --json` CLI,
+which runs on the same host as the vault and needs no HTTP, auth or network.
 
 Optional auth: set ALFRED_HTTP_TOKEN in the environment to require a Bearer
 token in the Authorization header.  When the variable is unset the server
@@ -124,4 +134,15 @@ def run_server(config_path: Path, host: str = "127.0.0.1", port: int = 8765) -> 
 
 if __name__ == "__main__":
     _config = os.environ.get("ALFRED_CONFIG") or str(Path(__file__).parents[3] / "config.yaml")
-    run_server(Path(_config))
+    # Host/port are overridable so the unit can bind the tailnet interface for
+    # laptop access. Defaults stay loopback: widening the bind has to be a
+    # deliberate act, and it must be paired with ALFRED_HTTP_TOKEN — otherwise
+    # the vault's whole query surface is served to the network unauthenticated.
+    _host = os.environ.get("ALFRED_HTTP_HOST", "127.0.0.1")
+    _port = int(os.environ.get("ALFRED_HTTP_PORT", "8765"))
+    if _host != "127.0.0.1" and not os.environ.get("ALFRED_HTTP_TOKEN"):
+        raise SystemExit(
+            f"ALFRED_HTTP_HOST={_host} is non-loopback but ALFRED_HTTP_TOKEN is unset. "
+            "Refusing to serve the vault to the network without auth."
+        )
+    run_server(Path(_config), host=_host, port=_port)

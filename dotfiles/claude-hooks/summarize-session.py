@@ -12,8 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-OLLAMA_MODEL = "mistral:latest"
-OLLAMA_TIMEOUT = 120  # seconds (mistral is larger, needs more time)
+OLLAMA_MODEL = "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M"
+OLLAMA_TIMEOUT = 300  # seconds (27B on Turing ~27 tok/s + up to 23s cold load)
 MAX_CONTEXT_CHARS = 16000  # truncate conversation fed to LLM
 MAX_RAW_CHARS = 4000  # fallback raw dump limit
 

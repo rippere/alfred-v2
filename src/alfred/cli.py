@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import json
+
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -67,8 +69,53 @@ def status(
     state_table.add_row("curator processed", str(len(store.state.curator_processed)))
     state_table.add_row("distiller runs", str(len(store.state.distiller_runs)))
     state_table.add_row("last run", store.state.last_run or "never")
+    # Orphan vectors: store rows minus state-tracked chunk_ids. Deliberately
+    # computed from count_rows() (a manifest read, no scan) rather than the
+    # real reap diff, which needs a full id scan plus a vault walk — status
+    # must stay instant. That makes this an UPPER BOUND, not the reapable
+    # count: most of the delta is files embedded but not yet state-saved
+    # (measured 2026-08-07: 33,922 delta, of which 5 rows were genuinely
+    # reapable). Labelled as such so nobody reads it as "rows to delete".
+    try:
+        # Deliberately NOT LanceDBStore(...): its constructor mkdirs, takes a
+        # quarantine lock, create_table(mode="create")s when the table is
+        # absent, and on a corruption-shaped open error quarantines and
+        # RECREATES the table — then status would discard was_recreated, so the
+        # runner's re-embed invalidation never fires. An operator running
+        # `alfred status` to diagnose a broken store could empty it. A status
+        # command must only read.
+        import lancedb as _lancedb
+        _db = _lancedb.connect(getattr(cfg, "lancedb_uri", str(cfg.data_dir / "lancedb")))
+        if cfg.milvus_collection not in _db.table_names():
+            raise FileNotFoundError(f"table {cfg.milvus_collection!r} not present")
+        _delta = _db.open_table(cfg.milvus_collection).count_rows() - store.chunk_count()
+        state_table.add_row(
+            "orphan vectors",
+            f"{max(0, _delta)} [dim]upper bound — `alfred reap` for the real count[/dim]",
+        )
+    except Exception as e:  # vector store absent or unopenable — not fatal for status
+        from alfred.core.failures import record_failure
+        record_failure("cli.status_orphan_count_failed", error=e)
+        state_table.add_row("orphan vectors", "[yellow]unavailable[/yellow]")
+    # Swallowed failures — the whole point of error_counts is that this row
+    # reads a real number instead of nothing at all when handlers have been
+    # quietly eating errors. Red when non-zero so it can't be skimmed past.
+    _errors = store.state.error_counts
+    _total_errors = sum(_errors.values())
+    state_table.add_row(
+        "swallowed errors",
+        "0" if not _total_errors else f"[red]{_total_errors}[/red]",
+    )
     console.print("[bold]State[/bold]")
     console.print(state_table)
+    if _errors:
+        err_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        err_table.add_column(style="dim")
+        err_table.add_column(justify="right")
+        for _key, _count in sorted(_errors.items(), key=lambda kv: -kv[1]):
+            err_table.add_row(_key, str(_count))
+        console.print("[bold]Swallowed errors[/bold] [dim](cumulative)[/dim]")
+        console.print(err_table)
 
     # Vault check
     vault_ok = cfg.vault_path.exists()
@@ -184,10 +231,25 @@ def up(
 @app.command()
 def down(
     config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
+    timeout: float = typer.Option(120.0, "--timeout", help="Seconds to wait for exit"),
 ):
-    """Stop all running daemons."""
+    """Stop the daemons for this config and WAIT for the process to exit.
+
+    Exits non-zero if the process is still alive at the deadline, so a caller
+    doing surgery on the store can branch on it. The old implementation sent
+    one SIGTERM, printed success and returned immediately — callers read that
+    as "quiesced" while the surveyor kept committing vectors. It also unlinked
+    the pidfile before the process died, defeating `up`'s duplicate-start
+    guard for the whole (minutes-long) shutdown.
+
+    SIGKILL is deliberately NOT sent on timeout: killing mid-commit is what
+    leaves the zero-byte manifests that crash-loop the next open (see the
+    comments in store/lancedb_store.py and store/graph.py). Escalating is the
+    operator's call, made knowingly.
+    """
     import os
     import signal
+    import time
 
     cfg = _load(config)
     pid_path = cfg.data_dir / "alfred.pid"
@@ -199,15 +261,85 @@ def down(
     pid_str = pid_path.read_text().strip()
     try:
         pid = int(pid_str.split(":")[0])
-        os.kill(pid, signal.SIGTERM)
-        console.print(f"[green]Sent SIGTERM to Alfred (PID {pid})[/green]")
-        pid_path.unlink(missing_ok=True)
-    except ProcessLookupError:
-        console.print(f"[yellow]Process {pid_str} not found. Removing stale PID file.[/yellow]")
-        pid_path.unlink(missing_ok=True)
     except ValueError:
-        console.print(f"[red]Invalid PID in {pid_path}[/red]")
+        console.print(f"[red]Invalid PID in {pid_path}[/red] — content: {pid_str!r}")
+        pid_path.unlink(missing_ok=True)
         raise typer.Exit(1)
+
+    def _alive() -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True      # exists, owned by someone else
+        return True
+
+    if not _alive():
+        console.print(f"[yellow]Process {pid} not running. Removing stale PID file.[/yellow]")
+        pid_path.unlink(missing_ok=True)
+        return
+
+    os.kill(pid, signal.SIGTERM)
+    console.print(f"Sent SIGTERM to Alfred (PID {pid}) — waiting up to {timeout:g}s for exit…")
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _alive():
+            # Only now is the pidfile meaningless. Unlinking earlier would let a
+            # concurrent `alfred up` start a second instance against the same store.
+            pid_path.unlink(missing_ok=True)
+            console.print(f"[green]Alfred (PID {pid}) stopped[/green]")
+            return
+        time.sleep(0.5)
+
+    console.print(
+        f"[red]PID {pid} still alive after {timeout:g}s — NOT quiesced.[/red]\n"
+        "[dim]The surveyor only checks for shutdown between files, so a large embed\n"
+        "backlog delays exit. Do NOT assume the store is idle. Re-run with a longer\n"
+        "--timeout, and escalate manually only once the log shows no recent\n"
+        "'surveyor.embedded' lines — a mid-commit SIGKILL can corrupt the table.[/dim]"
+    )
+    raise typer.Exit(1)
+
+
+def _query_result_as_dict(cfg, result) -> dict:
+    """Shape a QueryResult for --json.
+
+    `preview` is read back off disk rather than sliced out of result.context,
+    because context is a single assembled blob with wiki blocks and separators
+    mixed in — attributing a slice of it to a specific hit would be guesswork.
+    """
+    hits = []
+    for h in result.hits:
+        preview = ""
+        try:
+            raw = (cfg.vault_path / h.rel_path).read_text(encoding="utf-8", errors="replace")
+            if raw.startswith("---"):
+                end = raw.find("\n---", 3)
+                if end != -1:
+                    raw = raw[end + 4:]
+            preview = raw.strip()[:400]
+        except OSError as e:
+            # A hit whose file moved still deserves its path in the output —
+            # but a run of these means the index has drifted from the vault,
+            # which is worth being able to count.
+            from alfred.core.failures import record_failure
+            record_failure("cli.preview_read_failed", error=e, path=h.rel_path)
+        hits.append({
+            "rel_path": h.rel_path,
+            "name": h.name,
+            "record_type": h.record_type,
+            "score": h.score,
+            "preview": preview,
+        })
+    return {
+        "query": result.query,
+        "hits": hits,
+        "answer": result.answer,
+        "synthesis_backend": result.synthesis_backend,
+        "synthesis_model": result.synthesis_model,
+    }
 
 
 @app.command()
@@ -220,6 +352,7 @@ def query(
     no_graph: bool = typer.Option(False, "--no-graph", help="Skip graph spreading activation"),
     include_inbox: bool = typer.Option(False, "--include-inbox", help="Include inbox/ in results"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show per-step timing"),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON on stdout"),
 ):
     """Query the vault with hybrid retrieval + FlashRank reranking."""
     from rich import box
@@ -238,15 +371,26 @@ def query(
         include_inbox=include_inbox,
     )
 
-    console.print()
-    console.print(Rule(f'[bold]alfred query[/bold]', style="dim"))
-    console.print(f'  [italic]"{text}"[/italic]\n')
+    # --json must keep stdout parseable, so none of the rich chrome below runs.
+    if not json_out:
+        console.print()
+        console.print(Rule('[bold]alfred query[/bold]', style="dim"))
+        console.print(f'  [italic]"{text}"[/italic]\n')
 
     try:
         result = engine.query(text, opts)
     except Exception as e:
+        if json_out:
+            # Structured failure, so a caller can tell "query broke" from
+            # "no hits" instead of parsing an empty result as an answer.
+            print(json.dumps({"query": text, "error": str(e), "hits": []}))
+            raise typer.Exit(1)
         console.print(f"[red]Query failed:[/red] {e}")
         raise typer.Exit(1)
+
+    if json_out:
+        print(json.dumps(_query_result_as_dict(cfg, result), indent=2))
+        return
 
     # ── Wiki hit ───────────────────────────────────────────────────────────────
     if result.wiki_hit:
@@ -440,6 +584,308 @@ def create_vault(
 
 
 @app.command()
+def forget(
+    config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually evict. Without this, nothing is changed."
+    ),
+    limit: int = typer.Option(25, "--limit", "-n", help="Rows to show in the preview"),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Show (or apply) the Ebbinghaus retention sweep — evict vectors for files
+    whose memory has decayed.
+
+    Dry run by default. The source notes are never touched: only the vector
+    embeddings are evicted, and editing a file re-embeds it normally, so this
+    is reclaimable storage rather than lost content.
+    """
+    import asyncio
+    import json as _json
+    from datetime import datetime, timezone
+    from rich import box
+    from rich.table import Table
+
+    from alfred.daemons.janitor import JanitorDaemon
+    from alfred.store.state import StateStore
+
+    cfg = _load(config)
+    store = StateStore(cfg.state_path, cfg=cfg)
+    store.load()
+
+    from alfred.store.lancedb_store import LanceDBStore
+    vector_store = LanceDBStore(
+        uri=getattr(cfg, "lancedb_uri", str(cfg.data_dir / "lancedb")),
+        collection=cfg.milvus_collection,
+        dims=cfg.embed_dims,
+    )
+    janitor = JanitorDaemon(cfg, store, asyncio.Queue(), store=vector_store)
+
+    candidates = janitor.forget_candidates()
+    total_chunks = sum(c["chunks"] for c in candidates)
+
+    if json_out:
+        console.print_json(_json.dumps({
+            "candidates": len(candidates),
+            "chunks": total_chunks,
+            "applied": False,
+            "rows": candidates[:limit],
+        }))
+        if not apply:
+            return
+
+    if not json_out:
+        console.print(
+            f"[bold]{len(candidates)}[/bold] file(s) below the retention threshold "
+            f"([dim]R < {cfg.janitor_forget_retrievability}, embedded ≥ "
+            f"{cfg.janitor_forget_min_age_days}d ago[/dim]) — "
+            f"[bold]{total_chunks}[/bold] chunk(s) of vectors"
+        )
+        if candidates:
+            t = Table(box=box.SIMPLE, padding=(0, 2))
+            t.add_column("file", style="dim", overflow="fold")
+            t.add_column("R", justify="right")
+            t.add_column("age (d)", justify="right")
+            t.add_column("reads", justify="right")
+            t.add_column("chunks", justify="right")
+            for c in candidates[:limit]:
+                t.add_row(
+                    c["rel_path"], f"{c['retrievability']:.4f}", str(c["age_days"]),
+                    str(c["access_count"]), str(c["chunks"]),
+                )
+            console.print(t)
+            if len(candidates) > limit:
+                console.print(f"[dim]… and {len(candidates) - limit} more[/dim]")
+
+    if not apply:
+        if not json_out:
+            console.print("\n[dim]Dry run — nothing changed. Re-run with --apply to evict.[/dim]")
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cap = int(getattr(cfg, "janitor_forget_max_per_sweep", 500))
+    selected = candidates[:cap]
+    evicted = sum(1 for c in selected if janitor._forget_file(c["rel_path"], now_iso))
+    store.save()
+    console.print(
+        f"[green]evicted[/green] {evicted} file(s), "
+        f"{sum(c['chunks'] for c in selected)} chunk(s)"
+        + (f" — {len(candidates) - len(selected)} deferred past the per-sweep cap"
+           if len(candidates) > len(selected) else "")
+    )
+
+
+@app.command()
+def reap(
+    config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually delete. Without this, nothing is changed."
+    ),
+    limit: int = typer.Option(25, "--limit", "-n", help="Rows to show in the preview"),
+    max_rows: Optional[int] = typer.Option(
+        None, "--max-rows", help="Per-sweep row cap (default: janitor.reap_max_rows_per_sweep)"
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Show (or apply) the orphan reap — delete vector rows whose note is gone.
+
+    A row is reaped only if its rel_path is absent from state.json AND its
+    .md is absent from the vault. Both, never either: state.json lags the
+    vault by up to 25 files (the surveyor's save interval), and on 2026-08-07
+    that lag covered 2,892 files / 45,352 rows whose notes were all still
+    present. A state-only reaper would have deleted 29% of the index.
+
+    Dry run by default.
+    """
+    import asyncio
+    import json as _json
+    from rich import box
+    from rich.table import Table
+
+    from alfred.daemons.janitor import JanitorDaemon
+    from alfred.store.state import StateStore
+
+    cfg = _load(config)
+    store = StateStore(cfg.state_path, cfg=cfg)
+    store.load()
+
+    from alfred.store.lancedb_store import LanceDBStore
+    vector_store = LanceDBStore(
+        uri=getattr(cfg, "lancedb_uri", str(cfg.data_dir / "lancedb")),
+        collection=cfg.milvus_collection,
+        dims=cfg.embed_dims,
+    )
+    janitor = JanitorDaemon(cfg, store, asyncio.Queue(), store=vector_store)
+
+    plan = janitor.reap_plan(max_rows=max_rows)
+
+    if plan.aborted:
+        if json_out:
+            console.print_json(_json.dumps({"aborted": plan.aborted, "applied": False}))
+        else:
+            console.print(f"[red]aborted:[/red] {plan.aborted}")
+        raise typer.Exit(1)
+
+    if json_out:
+        console.print_json(_json.dumps({
+            "store_rows": plan.store_rows,
+            "store_paths": plan.store_paths,
+            "reapable_paths": plan.reapable_paths,
+            "reapable_rows": plan.reapable_rows,
+            "deferred": len(plan.deferred),
+            "malformed": plan.malformed_count,
+            "untracked_but_present": plan.untracked_but_present,
+            "untracked_but_present_rows": plan.untracked_but_present_rows,
+            "applied": False,
+            "rows": [{"rel_path": p, "chunks": n} for p, n in plan.orphans[:limit]],
+        }))
+        if not apply:
+            return
+
+    if not json_out:
+        console.print(
+            f"[bold]{plan.reapable_paths}[/bold] orphaned file(s) — "
+            f"[bold]{plan.reapable_rows}[/bold] row(s) of "
+            f"{plan.store_rows} in the store"
+        )
+        if plan.orphans:
+            t = Table(box=box.SIMPLE, padding=(0, 2))
+            t.add_column("file", style="dim", overflow="fold")
+            t.add_column("chunks", justify="right")
+            for p, n in plan.orphans[:limit]:
+                t.add_row(p, str(n))
+            console.print(t)
+            if len(plan.orphans) > limit:
+                console.print(f"[dim]… and {len(plan.orphans) - limit} more[/dim]")
+        # Never hide this: it is the number the safe definition is protecting.
+        console.print(
+            f"[dim]retained: {plan.untracked_but_present} file(s) / "
+            f"{plan.untracked_but_present_rows} row(s) absent from state.json but "
+            f"still present in the vault (state lags by up to 25 files)[/dim]"
+        )
+        if plan.deferred:
+            console.print(
+                f"[yellow]deferred:[/yellow] {len(plan.deferred)} file(s) / "
+                f"{sum(n for _, n in plan.deferred)} row(s) past the per-sweep cap "
+                f"— re-run, or raise --max-rows"
+            )
+        if plan.malformed_count:
+            console.print(
+                f"[yellow]{plan.malformed_count}[/yellow] id(s) did not parse as "
+                f"'<rel_path>::chunk_NN' and were left alone, e.g. "
+                f"{plan.malformed[:3]}"
+            )
+
+    if not apply:
+        if not json_out:
+            console.print("\n[dim]Dry run — nothing changed. Re-run with --apply to delete.[/dim]")
+        return
+
+    from alfred.store.reaper import execute_plan
+    deleted = execute_plan(
+        vector_store,
+        store.state,
+        cfg.vault_path,
+        plan,
+        batch_size=int(getattr(cfg, "janitor_reap_scan_batch_size", 4096)),
+        delete_batch=int(getattr(cfg, "janitor_reap_delete_batch", 500)),
+    )
+    # record_failure() only reaches state.error_counts via StateStore.save() ->
+    # drain_failures(). Without this save, reap.vector_delete_failed,
+    # reap.malformed_chunk_id and lancedb.delete_ids_quote_in_id are logged and
+    # then lost, and `alfred status` keeps reporting "swallowed errors 0" while
+    # deletes are silently failing. `alfred forget` already saves here.
+    store.save()
+    console.print(f"[green]reaped[/green] {deleted} row(s)")
+
+
+@app.command("graph-repair")
+def graph_repair(
+    config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually rewrite graph.pkl. Without this, nothing is changed."
+    ),
+    limit: int = typer.Option(15, "--limit", "-n", help="Sample rows to show in the preview"),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Merge legacy raw-link-text nodes in graph.pkl into their rel_path node.
+
+    A graph built before wikilink targets were normalized holds each linked
+    file twice — once as `note/foo.md` (the source side) and once as
+    `note/foo` (the link-text side). The link-text half collects every inbound
+    edge but has no outbound edges, so it is a dead end that halves graph-hop
+    recall. This merges the two halves, carrying edges across and summing
+    weights.
+
+    Dry run by default. Idempotent — a second run reports 0 to merge.
+    """
+    import json as _json
+    import shutil
+
+    from alfred.store.graph import GraphStore, normalize_node
+
+    cfg = _load(config)
+    graph = GraphStore(cfg.graph_path)
+    if not graph.load():
+        console.print(f"[yellow]no graph at[/yellow] {cfg.graph_path} — nothing to repair")
+        raise typer.Exit(0)
+
+    g = graph._graph()
+    before_nodes, before_edges = g.number_of_nodes(), g.number_of_edges()
+    candidates = [
+        n for n in g.nodes()
+        if isinstance(n, str) and normalize_node(n) not in ("", n)
+    ]
+    # A candidate that already has a normalized twin is a genuine split file;
+    # one without is a link to a note that does not exist (yet).
+    split = [n for n in candidates if g.has_node(normalize_node(n))]
+
+    if json_out:
+        console.print_json(_json.dumps({
+            "nodes": before_nodes, "edges": before_edges,
+            "unnormalized": len(candidates), "split_files": len(split),
+            "applied": False, "sample": candidates[:limit],
+        }))
+    else:
+        console.print(
+            f"graph [bold]{before_nodes}[/bold] nodes / [bold]{before_edges}[/bold] edges — "
+            f"[bold]{len(candidates)}[/bold] un-normalized node(s), of which "
+            f"[bold]{len(split)}[/bold] duplicate a file that already exists as a .md node"
+        )
+        for n in candidates[:limit]:
+            marker = "[red]split[/red]" if g.has_node(normalize_node(n)) else "[dim]dangling[/dim]"
+            console.print(f"  {marker}  {n}  ->  {normalize_node(n)}")
+        if len(candidates) > limit:
+            console.print(f"[dim]  … and {len(candidates) - limit} more[/dim]")
+
+    if not apply:
+        if not json_out:
+            console.print("\n[dim]Dry run — nothing changed. Re-run with --apply to merge.[/dim]")
+        return
+
+    if not candidates:
+        console.print("[green]nothing to merge[/green]")
+        return
+
+    # graph.pkl is the only copy of the wikilink topology and a full rebuild
+    # costs a vault-wide re-read, so keep a restorable copy before rewriting.
+    backup = cfg.graph_path.with_name(cfg.graph_path.name + ".pre-repair")
+    shutil.copy2(cfg.graph_path, backup)
+
+    with graph.transaction():
+        graph.load()                      # re-read under the lock, not the preview copy
+        merged = graph.merge_link_text_nodes()
+        graph.save()
+
+    g = graph._graph()
+    console.print(
+        f"[green]merged[/green] {merged} node(s) — "
+        f"{before_nodes} -> {g.number_of_nodes()} nodes, "
+        f"{before_edges} -> {g.number_of_edges()} edges\n"
+        f"[dim]backup: {backup}[/dim]"
+    )
+
+
+@app.command()
 def mcp(
     config: Path = typer.Option(_DEFAULT_CONFIG, "--config", "-c"),
 ):
@@ -451,3 +897,7 @@ def mcp(
 # Daily life-ledger KPI snapshots: `alfred ledger collect|backfill|show`.
 from alfred.ledger.cli import ledger_app  # noqa: E402
 app.add_typer(ledger_app, name="ledger")
+
+# Deal/contact brief enrichment: `alfred bridge enrich [--push]`.
+from alfred.bridge.cli import bridge_app  # noqa: E402
+app.add_typer(bridge_app, name="bridge")

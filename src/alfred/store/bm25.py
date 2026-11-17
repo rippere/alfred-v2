@@ -5,12 +5,17 @@ deployments. Use fit_and_store() during rebuild to enable search().
 """
 from __future__ import annotations
 
+import os
 import pickle
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import structlog
+
 if TYPE_CHECKING:
     from sklearn.feature_extraction.text import TfidfVectorizer
+
+log = structlog.get_logger()
 
 
 class BM25Store:
@@ -99,6 +104,8 @@ class BM25Store:
         return result
 
     def save(self) -> None:
+        # Temp file + os.replace() so a mid-write kill (OOM, SIGKILL) can never
+        # leave a truncated pickle behind — matches StateStore.save()/GraphStore.save().
         if self._vec is None:
             raise RuntimeError("Nothing to save — BM25Store not fitted")
         payload = {
@@ -106,12 +113,18 @@ class BM25Store:
             "corpus": self._corpus_matrix,
             "chunk_ids": self._chunk_ids,
         }
-        self.path.write_bytes(pickle.dumps(payload))
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_bytes(pickle.dumps(payload))
+        os.replace(tmp, self.path)
 
     def load(self) -> bool:
         if not self.path.exists():
             return False
-        data = pickle.loads(self.path.read_bytes())
+        try:
+            data = pickle.loads(self.path.read_bytes())
+        except (pickle.UnpicklingError, EOFError, ValueError, AttributeError) as e:
+            log.warning("bm25.load_failed", error=str(e))
+            return False
         # Handle old format (bare vectorizer) and new format (dict)
         if isinstance(data, dict):
             self._vec = data["vec"]

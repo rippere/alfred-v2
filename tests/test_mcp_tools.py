@@ -13,7 +13,8 @@ import importlib
 import fastmcp
 import pytest
 
-from alfred.mcp.tools import ToolDeps, register_tools
+from alfred.mcp.defaults import build_query_options, validate_result_count
+from alfred.mcp.tools import ToolDeps, register_tools, vault_query_impl, vault_search_impl
 
 EXPECTED_TOOLS = {
     "vault_query",
@@ -122,3 +123,111 @@ def test_vault_feedback_rejects_invalid_signal():
 )
 def test_server_registration_paths_import_cleanly(module):
     importlib.import_module(module)
+
+
+# ---------------------------------------------------------------------------
+# Numeric bounds validation (top_k / limit) — P1-05
+# ---------------------------------------------------------------------------
+
+
+class _StubQueryResult:
+    def __init__(self):
+        self.hits = []
+        self.answer = "stub answer"
+        self.wiki_hit = None
+
+
+class _StubEngine:
+    """Enough surface for vault_query_impl once validation has passed."""
+
+    def query(self, query, opts):
+        assert opts.top_k == 5  # the in-range value should reach the engine unchanged
+        return _StubQueryResult()
+
+
+class _StubCfg:
+    def __init__(self, vault_path):
+        self.vault_path = vault_path
+        self.ignore_dirs = []
+
+
+def test_validate_result_count_rejects_negative():
+    with pytest.raises(ValueError, match="top_k"):
+        validate_result_count(-5, param_name="top_k")
+
+
+def test_validate_result_count_rejects_excessively_large():
+    with pytest.raises(ValueError, match="top_k"):
+        validate_result_count(100_000, param_name="top_k")
+
+
+def test_validate_result_count_passes_through_in_range_value():
+    assert validate_result_count(5, param_name="top_k") == 5
+
+
+def test_build_query_options_rejects_negative_top_k():
+    with pytest.raises(ValueError):
+        build_query_options(top_k=-1)
+
+
+def test_build_query_options_rejects_excessive_top_k():
+    with pytest.raises(ValueError):
+        build_query_options(top_k=999)
+
+
+def test_build_query_options_normal_top_k_passes_through():
+    opts = build_query_options(top_k=5)
+    assert opts.top_k == 5
+
+
+def test_vault_query_impl_rejects_negative_top_k():
+    """A negative top_k must raise, not silently mis-slice downstream."""
+    with pytest.raises(ValueError, match="top_k"):
+        vault_query_impl(_StubEngine(), "hello", top_k=-5)
+
+
+def test_vault_query_impl_rejects_excessive_top_k():
+    with pytest.raises(ValueError, match="top_k"):
+        vault_query_impl(_StubEngine(), "hello", top_k=10_000)
+
+
+def test_vault_query_impl_normal_top_k_passes_through():
+    result = vault_query_impl(_StubEngine(), "hello", top_k=5)
+    assert result["answer"] == "stub answer"
+    assert result["sources"] == []
+
+
+def test_registered_vault_query_rejects_negative_top_k():
+    """Same guard, exercised through the FastMCP-registered wrapper."""
+    mcp, _ = _mcp_with_tools()
+    tool = asyncio.run(mcp.get_tool("vault_query"))
+    with pytest.raises(ValueError, match="top_k"):
+        tool.fn(query="hello", top_k=-5)
+
+
+def test_vault_search_impl_rejects_negative_limit(tmp_path):
+    """A negative limit must raise, not silently truncate from the wrong end."""
+    cfg = _StubCfg(tmp_path)
+    with pytest.raises(ValueError, match="limit"):
+        vault_search_impl(cfg, query=None, limit=-5)
+
+
+def test_vault_search_impl_rejects_excessive_limit(tmp_path):
+    cfg = _StubCfg(tmp_path)
+    with pytest.raises(ValueError, match="limit"):
+        vault_search_impl(cfg, query=None, limit=100_000)
+
+
+def test_vault_search_impl_normal_limit_passes_through(tmp_path):
+    (tmp_path / "note.md").write_text("hello world", encoding="utf-8")
+    cfg = _StubCfg(tmp_path)
+    results = vault_search_impl(cfg, query=None, limit=10)
+    assert isinstance(results, list)
+    assert len(results) <= 10
+
+
+def test_registered_vault_search_rejects_negative_limit():
+    mcp, _ = _mcp_with_tools()
+    tool = asyncio.run(mcp.get_tool("vault_search"))
+    with pytest.raises(ValueError, match="limit"):
+        tool.fn(limit=-1)

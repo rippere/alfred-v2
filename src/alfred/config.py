@@ -34,11 +34,17 @@ _CONSUMED_KEYS: frozenset[tuple[str, ...]] = frozenset({
     ("janitor", "deep_interval_h"),
     ("janitor", "max_bytes_per_call"),
     ("janitor", "dedup_enabled"),
+    ("janitor", "forget_enabled"),
+    ("janitor", "forget_retrievability"),
+    ("janitor", "forget_min_age_days"),
+    ("janitor", "forget_max_per_sweep"),
+    ("janitor", "reap_enabled"),
+    ("janitor", "reap_max_rows_per_sweep"),
+    ("janitor", "reap_scan_batch_size"),
+    ("janitor", "reap_delete_batch"),
     ("distiller", "mode"),
     ("api_budget", "max_calls_per_day"),
     ("api_budget", "warn_at_calls"),
-    ("synthesis", "anthropic_model"),
-    ("synthesis", "openrouter_model"),
 })
 
 
@@ -100,7 +106,7 @@ class AlfredConfig:
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
     ollama_embed_model: str = "nomic-embed-text"
-    ollama_llm_model: str = "mistral:latest"
+    ollama_llm_model: str = "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M"
     embed_dims: int = 768
 
     # Milvus
@@ -111,6 +117,39 @@ class AlfredConfig:
     janitor_deep_interval_h: int = 24
     janitor_max_bytes_per_call: int = 8000
     janitor_dedup_enabled: bool = False
+    # Retention (forgetting) sweep. OFF by default: it evicts vectors, and an
+    # eviction policy that turns itself on unannounced against 28 GB of
+    # embeddings is not something a config default should decide for you.
+    # `alfred forget` (dry-run by default) is the way to see what it would do.
+    janitor_forget_enabled: bool = False
+    # Evict below this Ebbinghaus retrievability. 0.02 ≈ untouched for ~1 year
+    # at stability 1.0 — deliberately deep in the tail.
+    janitor_forget_retrievability: float = 0.02
+    # Never evict a file embedded more recently than this, regardless of
+    # retrievability. Guards the cold-start case where nothing has been
+    # queried yet and every file therefore looks unaccessed.
+    janitor_forget_min_age_days: int = 180
+    # Cap per sweep so a first run can't evict the entire store in one pass.
+    janitor_forget_max_per_sweep: int = 500
+    # Orphan reap sweep. OFF by default for the same reason as forget: it
+    # deletes vectors, and unlike forget it deletes rows state.json does not
+    # even know about, so a bug here is invisible to every other consistency
+    # check. `alfred reap` (dry-run by default) is how you look first.
+    janitor_reap_enabled: bool = False
+    # Rows per sweep. The cap is blast radius, not memory — delete batching
+    # bounds memory independently. Deliberately small: on the live store the
+    # true reapable count measured 5 rows, so a sweep wanting thousands is
+    # itself the signal that something changed.
+    janitor_reap_max_rows_per_sweep: int = 5000
+    # Enumeration batch ceiling. Lance will not merge a batch across
+    # fragments, so on a fragmented store the effective batch is far smaller
+    # and this knob barely moves peak memory (measured flat 183-184 MB from
+    # 1024 to 200000). Left configurable only for a future compacted store.
+    janitor_reap_scan_batch_size: int = 4096
+    # Predicate terms per delete call. Peak scales as fragments x terms
+    # (~3.6e-4 MB/pair); 500 x the live 10,274 fragments is ~1.9 GB, which
+    # fits the 4G cap the daemons run under. Do not raise without measuring.
+    janitor_reap_delete_batch: int = 500
 
     # Distiller
     distiller_mode: str = "on_demand"   # "scheduled" | "on_demand"
@@ -133,6 +172,20 @@ class AlfredConfig:
     hopfield_beta: float = 2.0
     graph_hops: int = 2
     graph_decay: float = 0.5
+    # DEPRECATED / UNSUPPORTED: bm25_only enables a lightweight query mode that
+    # skips Milvus/Ollama entirely and searches only the stored BM25 corpus at
+    # bm25_path. That corpus is a frozen, point-in-time snapshot — it is built
+    # solely by the archived one-off script scripts/_archive/phase4_rebuild_milvus.py
+    # and is never refreshed by the live surveyor pipeline, so any vault content
+    # added or changed after that snapshot is invisible to this path and it will
+    # silently drift stale over time. LanceDBStore (the live vector_store backend)
+    # also documents that it accepts-but-ignores sparse/BM25 vectors — LanceDB
+    # retrieval is dense-only. Wiring BM25 into the live pipeline so this flag
+    # reflects current vault state is a real feature (tracked separately, out of
+    # scope for this fix) and requires a deliberate product decision; until then,
+    # treat bm25_only as unsupported/deprecated rather than a viable production
+    # retrieval mode. QueryEngine.query() logs a runtime warning whenever this is
+    # enabled.
     bm25_only: bool = False   # lightweight mode: skip Milvus/Ollama, use stored BM25 corpus
 
     # Wiki
@@ -142,9 +195,8 @@ class AlfredConfig:
     # Consolidator
     consolidator_min_interval_s: int = 1800
 
-    # Synthesis
-    anthropic_model: str = "claude-sonnet-4-6"
-    openrouter_model: str = "x-ai/grok-4.1-fast"
+    # Synthesis runs on the local model (ollama_llm_model above). The former
+    # anthropic_model / openrouter_model keys were removed with the cloud chain.
 
     @property
     def milvus_uri(self) -> str:
@@ -227,6 +279,26 @@ class AlfredConfig:
             cfg.janitor_deep_interval_h = j.get("deep_interval_h", cfg.janitor_deep_interval_h)
             cfg.janitor_max_bytes_per_call = j.get("max_bytes_per_call", cfg.janitor_max_bytes_per_call)
             cfg.janitor_dedup_enabled = j.get("dedup_enabled", cfg.janitor_dedup_enabled)
+            cfg.janitor_forget_enabled = j.get("forget_enabled", cfg.janitor_forget_enabled)
+            cfg.janitor_forget_retrievability = j.get(
+                "forget_retrievability", cfg.janitor_forget_retrievability
+            )
+            cfg.janitor_forget_min_age_days = j.get(
+                "forget_min_age_days", cfg.janitor_forget_min_age_days
+            )
+            cfg.janitor_forget_max_per_sweep = j.get(
+                "forget_max_per_sweep", cfg.janitor_forget_max_per_sweep
+            )
+            cfg.janitor_reap_enabled = j.get("reap_enabled", cfg.janitor_reap_enabled)
+            cfg.janitor_reap_max_rows_per_sweep = j.get(
+                "reap_max_rows_per_sweep", cfg.janitor_reap_max_rows_per_sweep
+            )
+            cfg.janitor_reap_scan_batch_size = j.get(
+                "reap_scan_batch_size", cfg.janitor_reap_scan_batch_size
+            )
+            cfg.janitor_reap_delete_batch = j.get(
+                "reap_delete_batch", cfg.janitor_reap_delete_batch
+            )
 
         # Distiller mode
         if d := raw.get("distiller"):
@@ -236,10 +308,5 @@ class AlfredConfig:
         if b := raw.get("api_budget"):
             cfg.api_max_calls_per_day = b.get("max_calls_per_day", cfg.api_max_calls_per_day)
             cfg.api_warn_at_calls = b.get("warn_at_calls", cfg.api_warn_at_calls)
-
-        # Synthesis models
-        if syn := raw.get("synthesis"):
-            cfg.anthropic_model = syn.get("anthropic_model", cfg.anthropic_model)
-            cfg.openrouter_model = syn.get("openrouter_model", cfg.openrouter_model)
 
         return cfg

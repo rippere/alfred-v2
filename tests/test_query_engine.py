@@ -8,6 +8,7 @@ removed that call — these tests pin the resolution so it cannot regress.
 from __future__ import annotations
 
 import pytest
+from structlog.testing import capture_logs
 
 from alfred.config import AlfredConfig
 from alfred.query.engine import QueryEngine, QueryOptions
@@ -106,3 +107,26 @@ def test_bm25_timing_absent_from_dense_query_elapsed(engine):
         "elapsed timings show a bm25 stage on the dense hot path"
     )
     assert "search" in result.elapsed and "embed" in result.elapsed
+
+
+def test_bm25_only_mode_logs_deprecation_warning(cfg):
+    """bm25_only is a deprecated/unsupported path (frozen corpus, never refreshed
+    by the live surveyor pipeline) — enabling it must log a loud runtime warning
+    rather than silently serving stale results."""
+    cfg.bm25_only = True
+    eng = QueryEngine(cfg)
+
+    with capture_logs() as logs:
+        # No BM25 corpus exists in this fixture's data_dir, so the bm25-only
+        # path itself raises after the warning fires — that's fine, we only
+        # care that the deprecation warning was logged before it blew up.
+        with pytest.raises(RuntimeError):
+            eng.query("What is Alfred")
+
+    warnings = [e for e in logs if e.get("log_level") == "warning"
+                and e.get("event") == "query.bm25_only_deprecated"]
+    assert len(warnings) == 1, "enabling bm25_only must log exactly one deprecation warning"
+    assert "phase4_rebuild_milvus.py" in warnings[0]["message"], (
+        "warning must point at the archived populate script"
+    )
+    assert str(eng.cfg.bm25_path) == warnings[0]["bm25_path"]

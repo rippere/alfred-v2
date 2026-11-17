@@ -72,6 +72,12 @@ def collect(
         _print_push_result(status, detail)
     conn.close()
 
+    if push and status == "error":
+        # "dry" (no creds configured) is intentional and non-fatal; "error" is a
+        # real push failure and must exit non-zero so ledger-collect.service's
+        # OnFailure= alert can fire.
+        raise typer.Exit(1)
+
 
 @ledger_app.command()
 def backfill(
@@ -100,6 +106,7 @@ def backfill(
 
     total_rows = 0
     days_with_data = 0
+    push_errors = 0
     cur = d0
     while cur <= d1:
         ds = cur.isoformat()
@@ -111,6 +118,8 @@ def backfill(
         if push:
             status, detail = L_push.push_snapshot(ds, rows)
             L_db.record_push(conn, ds, status, detail)
+            if status == "error":
+                push_errors += 1
         cur += timedelta(days=1)
 
     console.print(
@@ -125,6 +134,13 @@ def backfill(
         dt.add_row(dom, str(c))
     console.print(dt)
     conn.close()
+
+    if push_errors:
+        # Report-and-continue across the whole range (a single bad day
+        # shouldn't abort collection for the rest), but still fail the run
+        # overall so ledger-collect.service's OnFailure= alert can fire.
+        console.print(f"[red]{push_errors} push(es) failed during backfill[/red]")
+        raise typer.Exit(1)
 
 
 @ledger_app.command()

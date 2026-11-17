@@ -12,8 +12,11 @@ from pathlib import Path
 
 import frontmatter
 import structlog
+
+from alfred.core.failures import record_failure
 import yaml
 
+from alfred.core.vault import is_sync_conflict
 from alfred.core.schema import (
     KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
     REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
@@ -37,7 +40,7 @@ _write_lock = threading.RLock()
 
 def _resolve(vault_path: Path, rel_path: str) -> Path:
     full = (vault_path / rel_path).resolve()
-    if not str(full).startswith(str(vault_path.resolve())):
+    if not full.is_relative_to(vault_path.resolve()):
         raise VaultError(f"Path traversal denied: {rel_path}")
     return full
 
@@ -201,52 +204,62 @@ def vault_append_to_topic(
     rel_path = f"topic/{topic_slug}.md"
     fp = _resolve(vault_path, rel_path)
 
-    # If the canonical slug file does not exist, look for an existing topic that
-    # already covers one of these tags — prefer appending there over creating new.
-    if not fp.exists():
-        existing_rel = _find_richest_topic_by_tag(vault_path, tags + [topic_slug])
-        if existing_rel and existing_rel != rel_path:
-            rel_path = existing_rel
-            fp = _resolve(vault_path, rel_path)
-
     source_link = (source[:-3] if source and source.endswith(".md") else source) or ""
     section = f"## {insight_title}\n\n{insight_body.strip()}"
     if source_link:
         section += f"\n\nSource: [[{source_link}]]"
 
-    if fp.exists():
-        fm, body = _parse(fp)
-        existing_tags: list = fm.get("tags", [])
-        if not isinstance(existing_tags, list):
-            existing_tags = [existing_tags] if existing_tags else []
-        for t in tags:
-            if t not in existing_tags:
-                existing_tags.append(t)
-        fm["tags"] = existing_tags
-        existing_sources: list = fm.get("sources", [])
-        if not isinstance(existing_sources, list):
-            existing_sources = [existing_sources] if existing_sources else []
-        if source and source not in existing_sources:
-            existing_sources.append(source)
-        fm["sources"] = existing_sources
-        fm["generated_by"] = "llm"
-        body = body.rstrip() + "\n\n---\n\n" + section + "\n"
-        fp.write_text(_serialize(fm, body), encoding="utf-8")
-    else:
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fm = {
-            "type": "topic",
-            "name": topic_slug,
-            "tags": tags,
-            "sources": [source] if source else [],
-            "created": date.today().isoformat(),
-            "status": "active",
-            "generated_by": "llm",
-        }
-        body = f"# {topic_slug}\n\n{section}\n"
-        fp.write_text(_serialize(fm, body), encoding="utf-8")
+    with _write_lock:  # existence-check + optional redirect-scan + read-modify-write must be atomic
+        # If the canonical slug file does not exist, look for an existing topic that
+        # already covers one of these tags — prefer appending there over creating new.
+        if not fp.exists():
+            existing_rel = _find_richest_topic_by_tag(vault_path, tags + [topic_slug])
+            if existing_rel and existing_rel != rel_path:
+                rel_path = existing_rel
+                fp = _resolve(vault_path, rel_path)
+
+        if fp.exists():
+            fm, body = _parse(fp)
+            existing_tags: list = fm.get("tags", [])
+            if not isinstance(existing_tags, list):
+                existing_tags = [existing_tags] if existing_tags else []
+            for t in tags:
+                if t not in existing_tags:
+                    existing_tags.append(t)
+            fm["tags"] = existing_tags
+            existing_sources: list = fm.get("sources", [])
+            if not isinstance(existing_sources, list):
+                existing_sources = [existing_sources] if existing_sources else []
+            if source and source not in existing_sources:
+                existing_sources.append(source)
+            fm["sources"] = existing_sources
+            fm["generated_by"] = "llm"
+            body = body.rstrip() + "\n\n---\n\n" + section + "\n"
+            fp.write_text(_serialize(fm, body), encoding="utf-8")
+        else:
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fm = {
+                "type": "topic",
+                "name": topic_slug,
+                "tags": tags,
+                "sources": [source] if source else [],
+                "created": date.today().isoformat(),
+                "status": "active",
+                "generated_by": "llm",
+            }
+            body = f"# {topic_slug}\n\n{section}\n"
+            fp.write_text(_serialize(fm, body), encoding="utf-8")
 
     return {"path": rel_path}
+
+
+def vault_delete(vault_path: Path, rel_path: str) -> dict:
+    fp = _resolve(vault_path, rel_path)
+    with _write_lock:  # exists-check + unlink must be one atomic window
+        if not fp.exists():
+            raise VaultError(f"File not found: {rel_path}")
+        fp.unlink()
+    return {"path": rel_path, "deleted": True}
 
 
 def vault_move(vault_path: Path, from_path: str, to_path: str) -> dict:
@@ -276,11 +289,16 @@ def vault_search(
         rel = md_file.relative_to(vault_path)
         if any(part in ignore for part in rel.parts):
             continue
+        if is_sync_conflict(md_file):
+            continue
         if grep_pattern:
             try:
                 if not re.search(re.escape(grep_pattern), md_file.read_text(encoding="utf-8"), re.IGNORECASE):
                     continue
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError) as e:
+                # File is silently excluded from the grep result set — the
+                # caller sees a shorter match list, not an error.
+                record_failure("vault.grep_read_failed", error=e, path=str(rel))
                 continue
         try:
             post = frontmatter.load(str(md_file))
@@ -305,6 +323,8 @@ def vault_context(vault_path: Path, ignore_dirs: list[str] | None = None) -> dic
     for md_file in vault_path.rglob("*.md"):
         rel = md_file.relative_to(vault_path)
         if any(p in ignore for p in rel.parts):
+            continue
+        if is_sync_conflict(md_file):
             continue
         try:
             post = frontmatter.load(str(md_file))

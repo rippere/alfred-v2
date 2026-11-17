@@ -16,19 +16,24 @@ import os
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import frontmatter
 import structlog
 
-from alfred.core.anthropic_client import get_client
+from alfred.core.failures import record_failure
+from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.schema import (
-    KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
-    REQUIRED_FIELDS, STATUS_BY_TYPE, TYPE_DIRECTORY,
+    DIRECTORY_TO_TYPE, KNOWN_TYPES, LIST_FIELDS, NAME_FIELD_BY_TYPE,
+    REQUIRED_FIELDS, STATUS_BY_TYPE,
     correct_status, correct_type,
 )
-from alfred.core.vault import extract_wikilinks
+from alfred.core.vault import extract_wikilinks, is_sync_conflict
 from alfred.core.vault_ops import VaultError, vault_edit, vault_read
 from alfred.daemons.base import BaseDaemon
+
+if TYPE_CHECKING:
+    from alfred.store.lancedb_store import LanceDBStore
 
 log = structlog.get_logger()
 
@@ -36,6 +41,8 @@ SWEEP_INTERVAL = 3600.0     # structural scan every hour
 DEEP_INTERVAL = 86400.0     # LLM enrichment once per day
 DEDUP_INTERVAL = 604800.0   # dedup sweep once per week (7 days)
 ARCHIVE_INTERVAL = 86400.0  # session archival once per day
+FORGET_INTERVAL = 86400.0   # Ebbinghaus retention sweep once per day
+REAP_INTERVAL = 86400.0     # orphan-vector reap once per day
 
 
 class IssueCode(str, Enum):
@@ -52,12 +59,15 @@ class IssueCode(str, Enum):
 class JanitorDaemon(BaseDaemon):
     name = "janitor"
 
-    def __init__(self, cfg, state, events) -> None:
+    def __init__(self, cfg, state, events, store: LanceDBStore) -> None:
         super().__init__(cfg, state, events)
+        self.store = store
         self._last_sweep = float("-inf")
         self._last_deep = float("-inf")
         self._last_dedup = float("-inf")
         self._last_archive = float("-inf")
+        self._last_forget = float("-inf")
+        self._last_reap = float("-inf")
         self._stem_index: dict[str, set[str]] = {}
 
     async def run(self) -> None:
@@ -80,6 +90,14 @@ class JanitorDaemon(BaseDaemon):
                 if now - self._last_archive > ARCHIVE_INTERVAL:
                     await self.session_archive_tick()
                     self._last_archive = now
+                forget_enabled = getattr(self.cfg, "janitor_forget_enabled", False)
+                if forget_enabled and now - self._last_forget > FORGET_INTERVAL:
+                    await self.forget_tick()
+                    self._last_forget = now
+                reap_enabled = getattr(self.cfg, "janitor_reap_enabled", False)
+                if reap_enabled and now - self._last_reap > REAP_INTERVAL:
+                    await self.reap_tick()
+                    self._last_reap = now
                 await asyncio.sleep(60.0)
         finally:
             await self.save_state()
@@ -136,6 +154,8 @@ class JanitorDaemon(BaseDaemon):
             rel = md_file.relative_to(vault_path)
             if any(part in ignore for part in rel.parts):
                 continue
+            if is_sync_conflict(md_file):
+                continue
             rel_str = str(rel).replace("\\", "/")
             try:
                 file_issues = self._check_file(vault_path, rel_str)
@@ -148,14 +168,19 @@ class JanitorDaemon(BaseDaemon):
         state = self.state.state
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # Prune ghost state entries (files deleted from vault but still in state.files)
+        # Prune ghost state entries (files deleted from vault but still in state.files).
+        # Conflict copies are excluded from live_paths deliberately: any that were
+        # indexed before the filter existed now read as ghosts and get their state
+        # entry and embeddings dropped here, which is exactly the cleanup wanted.
+        # The files themselves are never touched — only the index.
         live_paths = {
             str(md_file.relative_to(vault_path)).replace("\\", "/")
             for md_file in vault_path.rglob("*.md")
+            if not is_sync_conflict(md_file)
         }
         ghost_keys = [k for k in state.files if k not in live_paths]
         for k in ghost_keys:
-            del state.files[k]
+            self._delete_embeddings(state, k)
         if ghost_keys:
             self.log.info("janitor.pruned_ghosts", count=len(ghost_keys))
 
@@ -194,6 +219,10 @@ class JanitorDaemon(BaseDaemon):
         """
         index: dict[str, set[str]] = {}
         for md_file in vault_path.rglob("*.md"):
+            # A conflict copy is not a legitimate wikilink target — registering
+            # one lets a broken link resolve to a stale duplicate and read as fixed.
+            if is_sync_conflict(md_file):
+                continue
             rel = md_file.relative_to(vault_path)
             rel_str = str(rel).replace("\\", "/")
             stem = md_file.stem
@@ -322,30 +351,42 @@ class JanitorDaemon(BaseDaemon):
         return fixed
 
     def _infer_type(self, rel_path: str) -> str:
+        """Infer a record type from the directory a file sits in.
+
+        Walks the containing directories deepest-first so nested layouts
+        resolve to the nearest meaningful directory: `_archived/session/x.md`
+        is a session, and `session/2026/x.md` is still a session.
+
+        Two lookups per directory part, in order:
+
+        1. The directory name *is* a record type — this is the case for
+           directories TYPE_DIRECTORY does not point at because they
+           consolidate elsewhere on write (`decision/`, `assumption/`,
+           `constraint/`, `contradiction/`, `input/` all sit on disk but
+           TYPE_DIRECTORY routes them to topic/). Inverting TYPE_DIRECTORY
+           inferred nothing at all for those.
+        2. DIRECTORY_TO_TYPE, the collision-resolved inverse, for directories
+           whose name differs from the type (`ideas/` -> idea, `drafts/` ->
+           script, `hooks/` -> hook).
+
+        Returns "" when nothing resolves, which leaves `type` unset rather
+        than stamping a guess.
+        """
         parts = rel_path.replace("\\", "/").split("/")
         if len(parts) < 2:
             return ""
-        # Several types share a directory (e.g. decision/assumption/constraint/
-        # contradiction/learn all live under topic/). A naive {v: k for k, v}
-        # reversal lets whichever type is declared LAST in TYPE_DIRECTORY win
-        # for every shared directory, silently mis-inferring type for the
-        # others. setdefault() with first-wins instead prefers the type whose
-        # name matches the directory itself (declared first, e.g. topic/topic,
-        # session/session) as the canonical inferred type for that directory.
-        dir_to_type: dict[str, str] = {}
-        for type_name, directory in TYPE_DIRECTORY.items():
-            dir_to_type.setdefault(directory, type_name)
-        return dir_to_type.get(parts[0], "")
+        for part in reversed(parts[:-1]):     # directories only, nearest first
+            if part in KNOWN_TYPES:
+                return part
+            resolved = DIRECTORY_TO_TYPE.get(part)
+            if resolved:
+                return resolved
+        return ""
 
     # ── Stage 3: LLM enrichment (stub records, per-file, per-type prompt) ────
 
     async def _deep_sweep(self) -> None:
         """LLM enrichment for stub records. One call per file, one template per call."""
-        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not anthropic_key:
-            self.log.info("janitor.deep_skip", reason="no ANTHROPIC_API_KEY")
-            return
-
         vault_path = self.cfg.vault_path
         ignore = set(self.cfg.ignore_dirs)
         state = self.state.state
@@ -363,6 +404,17 @@ class JanitorDaemon(BaseDaemon):
                 fs.open_issues = [c for c in fs.open_issues if c != IssueCode.STUB_RECORD.value]
                 enriched += 1
                 await asyncio.sleep(1.0)   # gentle rate limiting
+            except LocalLLMUnavailable as e:
+                # Stop rather than retry a dead backend per stub. The STUB_RECORD
+                # issue is only cleared on a successful enrichment, so everything
+                # unreached stays queued for the next sweep.
+                self.log.warning(
+                    "janitor.backend_unavailable",
+                    error=str(e),
+                    deferred_from=rel_path,
+                    enriched_before_stop=enriched,
+                )
+                break
             except Exception as e:
                 self.log.warning("janitor.enrich_error", path=rel_path, error=str(e))
 
@@ -399,21 +451,250 @@ class JanitorDaemon(BaseDaemon):
         if len(prompt_bytes) > self.cfg.janitor_max_bytes_per_call:
             prompt = prompt[:self.cfg.janitor_max_bytes_per_call].decode("utf-8", errors="replace")
 
-        client = get_client()
-
-        def _call():
-            resp = client.messages.create(
-                model=self.cfg.anthropic_model,
+        def _call() -> str:
+            return complete(
+                "You are a careful editor enriching a knowledge-vault record.",
+                prompt,
+                base_url=self.cfg.ollama_base_url,
+                model=self.cfg.ollama_llm_model,
                 max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
             )
-            return resp
 
-        resp = await asyncio.to_thread(_call)
-        new_body = resp.content[0].text.strip()
+        new_body = (await asyncio.to_thread(_call)).strip()
         if new_body and len(new_body) > 20:
             vault_edit(vault_path, rel_path, body_replace=new_body)
             self.log.info("janitor.enriched_file", path=rel_path, chars=len(new_body))
+
+    def _delete_embeddings(self, state, rel_path: str) -> None:
+        """Delete a file's vectors from the vector store and prune its state entry.
+
+        Mirrors ``SurveyorDaemon._process_diff``'s deletion path: look up the
+        known chunk_ids (if any) before popping state, so ``store.delete_file``
+        can use the fast explicit-id delete instead of falling back to a
+        prefix scan. Used by ``_archive_sessions`` and ``_dedup_sweep`` so
+        moved/removed files never leave orphaned LanceDB embeddings behind.
+        """
+        fs = state.files.get(rel_path)
+        chunk_ids = fs.chunk_ids if fs else None
+        try:
+            self.store.delete_file(rel_path, chunk_ids)
+        except Exception as e:
+            self.log.warning("janitor.vector_delete_failed", path=rel_path, error=str(e))
+        state.files.pop(rel_path, None)
+
+    # ── Forget sweep: Ebbinghaus retention ────────────────────────────────────
+
+    def forget_candidates(self, now: datetime | None = None) -> list[dict]:
+        """Files whose memory has decayed past the retention threshold.
+
+        Pure and side-effect free so `alfred forget --dry-run` and the sweep
+        itself can never disagree about what would be evicted — the dry run
+        calls exactly the function the sweep does.
+
+        A file qualifies only if ALL of:
+          * it currently has vectors (chunk_ids non-empty) and isn't already
+            forgotten — otherwise there is nothing to reclaim;
+          * it was embedded at least forget_min_age_days ago. This is the
+            cold-start guard: with no query history every file looks
+            unaccessed, and without an age floor the first sweep would evict
+            the entire store;
+          * its Ebbinghaus retrievability is below the threshold. Never-
+            accessed files score 0.0 and so pass on age alone — which is the
+            intent, since "embedded 6 months ago and never once retrieved"
+            is the exact profile of dead weight.
+
+        Returned newest-decay-last (weakest memory first) so the per-sweep cap
+        evicts the coldest files rather than an arbitrary slice.
+        """
+        now = now or datetime.now(timezone.utc)
+        min_age_days = float(getattr(self.cfg, "janitor_forget_min_age_days", 180))
+        threshold = float(getattr(self.cfg, "janitor_forget_retrievability", 0.02))
+        state = self.state.state
+
+        candidates: list[dict] = []
+        for rel_path, fs in state.files.items():
+            if fs.forgotten or not fs.chunk_ids:
+                continue
+            if not fs.last_embedded:
+                continue
+            try:
+                embedded_at = datetime.fromisoformat(fs.last_embedded)
+            except ValueError as e:
+                record_failure(
+                    "janitor.forget_timestamp_unparsable", error=e, path=rel_path
+                )
+                continue
+            if embedded_at.tzinfo is None:
+                embedded_at = embedded_at.replace(tzinfo=timezone.utc)
+            age_days = (now - embedded_at).total_seconds() / 86400
+            if age_days < min_age_days:
+                continue
+
+            strength = state.memory.get(rel_path)
+            r = strength.retrievability(now) if strength else 0.0
+            if r >= threshold:
+                continue
+            candidates.append({
+                "rel_path": rel_path,
+                "retrievability": r,
+                "age_days": round(age_days, 1),
+                "chunks": len(fs.chunk_ids),
+                "access_count": strength.access_count if strength else 0,
+            })
+
+        candidates.sort(key=lambda c: (c["retrievability"], -c["age_days"]))
+        return candidates
+
+    def _forget_file(self, rel_path: str, now_iso: str) -> bool:
+        """Evict one file's vectors, keeping its FileState entry.
+
+        Deliberately NOT _delete_embeddings(), which pops the state entry.
+        Popping is right for a file that is genuinely gone; here the file
+        still exists in the vault, and an entry popped from state comes back
+        as "new" on the surveyor's next diff and is immediately re-embedded.
+        That round trip is precisely how the vector store regrew. Keeping the
+        entry (md5 intact, chunk_ids cleared, forgotten stamped) makes the
+        eviction stick until the file is actually edited.
+        """
+        state = self.state.state
+        fs = state.files.get(rel_path)
+        if fs is None:
+            return False
+        try:
+            self.store.delete_file(rel_path, fs.chunk_ids)
+        except Exception as e:
+            record_failure("janitor.forget_vector_delete_failed", error=e, path=rel_path)
+            return False
+        fs.chunk_ids = []
+        fs.last_embedded = ""
+        fs.forgotten = now_iso
+        return True
+
+    async def _forget_sweep(self) -> None:
+        if not getattr(self.cfg, "janitor_forget_enabled", False):
+            return
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        cap = int(getattr(self.cfg, "janitor_forget_max_per_sweep", 500))
+
+        candidates = self.forget_candidates(now)
+        if not candidates:
+            self.log.info("janitor.forget_sweep_done", evicted=0, candidates=0)
+            return
+
+        selected = candidates[:cap]
+        evicted = 0
+        chunks_freed = 0
+        for i, c in enumerate(selected):
+            if i % 20 == 0:
+                await asyncio.sleep(0)  # yield; this can be a long list
+            if self._forget_file(c["rel_path"], now_iso):
+                evicted += 1
+                chunks_freed += c["chunks"]
+
+        # A cap that silently truncates reads as "that's all there was", so
+        # say plainly how many were left for the next sweep.
+        self.log.info(
+            "janitor.forget_sweep_done",
+            evicted=evicted,
+            chunks_freed=chunks_freed,
+            candidates=len(candidates),
+            deferred=max(0, len(candidates) - len(selected)),
+        )
+        await self.save_state()
+
+    async def forget_tick(self) -> None:
+        """One-shot retention sweep — called by APScheduler daily if enabled."""
+        if not getattr(self.cfg, "janitor_forget_enabled", False):
+            return
+        try:
+            await self._forget_sweep()
+        except Exception as e:
+            self.log.error("janitor.forget_tick_error", error=str(e))
+
+    # ── Reap sweep: orphaned vector rows ──────────────────────────────────────
+
+    def reap_plan(self, max_rows: int | None = None):
+        """What the reap sweep would delete.  Side-effect free.
+
+        Same contract as ``forget_candidates``: `alfred reap` and the sweep
+        call exactly this, so a dry run and the real thing can never disagree
+        about what would go.
+        """
+        from alfred.store.reaper import build_plan
+
+        cap = int(
+            max_rows
+            if max_rows is not None
+            else getattr(self.cfg, "janitor_reap_max_rows_per_sweep", 5000)
+        )
+        return build_plan(
+            self.store,
+            self.state.state,
+            self.cfg.vault_path,
+            max_rows=cap,
+            batch_size=int(getattr(self.cfg, "janitor_reap_scan_batch_size", 4096)),
+        )
+
+    async def _reap_sweep(self) -> None:
+        if not getattr(self.cfg, "janitor_reap_enabled", False):
+            return
+        from alfred.store.reaper import execute_plan
+
+        plan = await asyncio.to_thread(self.reap_plan)
+        if plan.aborted:
+            # Not an error the sweep can fix — an unmounted vault or a state
+            # file that disagrees with the disk.  Loud, and nothing deleted.
+            self.log.warning("janitor.reap_sweep_aborted", reason=plan.aborted)
+            return
+        if not plan.orphans:
+            self.log.info(
+                "janitor.reap_sweep_done",
+                deleted=0,
+                store_rows=plan.store_rows,
+                untracked_but_present=plan.untracked_but_present,
+            )
+            return
+
+        deleted = await asyncio.to_thread(
+            execute_plan,
+            self.store,
+            self.state.state,
+            self.cfg.vault_path,
+            plan,
+            int(getattr(self.cfg, "janitor_reap_scan_batch_size", 4096)),
+            int(getattr(self.cfg, "janitor_reap_delete_batch", 500)),
+        )
+        # untracked_but_present is reported every sweep on purpose: it is the
+        # count of rows a naive "not in state.json" reaper would have deleted
+        # (2,892 files / 45,352 rows on the live store as of 2026-08-07), and
+        # keeping it in the log is how a regression in the vault check shows
+        # up as a number instead of as missing data.
+        self.log.info(
+            "janitor.reap_sweep_done",
+            deleted=deleted,
+            paths=len(plan.orphans),
+            deferred=len(plan.deferred),
+            malformed=plan.malformed_count,
+            store_rows=plan.store_rows,
+            untracked_but_present=plan.untracked_but_present,
+        )
+        # Flush record_failure() counters into state.error_counts — they only
+        # arrive there via StateStore.save() -> drain_failures(). Relying on
+        # another daemon to save first works in a full run and silently loses
+        # every reap failure when the janitor runs alone (`alfred up --only
+        # janitor`).
+        await self.save_state()
+
+    async def reap_tick(self) -> None:
+        """One-shot orphan reap — called by APScheduler daily if enabled."""
+        if not getattr(self.cfg, "janitor_reap_enabled", False):
+            return
+        try:
+            await self._reap_sweep()
+        except Exception as e:
+            self.log.error("janitor.reap_tick_error", error=str(e))
+            record_failure("janitor.reap_tick_error", error=e)
 
     # ── Dedup sweep: weekly similarity-based deduplication ────────────────────
 
@@ -439,18 +720,34 @@ class JanitorDaemon(BaseDaemon):
                 if elapsed < DEDUP_INTERVAL:
                     self.log.debug("janitor.dedup_skip", reason="ran recently", elapsed_h=round(elapsed/3600, 1))
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                # A malformed last_dedup makes the interval guard fall through,
+                # so dedup runs every tick instead of daily — expensive, and
+                # invisible without a count.
+                record_failure("janitor.dedup_timestamp_unparsable", error=e, value=last_run_iso)
 
         self.log.info("janitor.dedup_sweep.start")
         merged_count = 0
         merge_log: list[str] = []
 
-        # Group all markdown files by their parent directory
+        # Group all markdown files by their parent directory.
+        #
+        # Conflict copies are excluded, and this exclusion is load-bearing, not
+        # tidiness. A conflict lives in the same directory as its original and
+        # is near-identical to it: measured against the live vault, all 129
+        # conflict/original pairs scored above this sweep's 0.85 threshold, with
+        # a median similarity of 1.000. Keeper selection below is "longer body
+        # wins", which has no notion of which file is the live one — in 9 of
+        # those pairs the conflict was longer, so enabling this sweep would have
+        # deleted the real note and promoted a June-22 copy in its place.
+        # Conflict resolution belongs to scripts/reconcile_conflicts.py, which
+        # is dry-run by default and shows its work.
         dir_files: dict[str, list[Path]] = {}
         for md_file in vault_path.rglob("*.md"):
             rel = md_file.relative_to(vault_path)
             if any(part in ignore for part in rel.parts):
+                continue
+            if is_sync_conflict(md_file):
                 continue
             dir_key = str(rel.parent)
             dir_files.setdefault(dir_key, []).append(md_file)
@@ -472,7 +769,9 @@ class JanitorDaemon(BaseDaemon):
                 try:
                     post_a = frontmatter.load(str(fa))
                     body_a = post_a.content.strip()
-                except Exception:
+                except Exception as e:
+                    # Unparsable file is silently exempt from dedup forever.
+                    record_failure("janitor.frontmatter_parse_failed", error=e, path=str(fa))
                     continue
                 if len(body_a) < 30:
                     continue
@@ -483,7 +782,8 @@ class JanitorDaemon(BaseDaemon):
                     try:
                         post_b = frontmatter.load(str(fb))
                         body_b = post_b.content.strip()
-                    except Exception:
+                    except Exception as e:
+                        record_failure("janitor.frontmatter_parse_failed", error=e, path=str(fb))
                         continue
                     if len(body_b) < 30:
                         continue
@@ -526,8 +826,10 @@ class JanitorDaemon(BaseDaemon):
                     try:
                         dupe_rel = str(dupe.relative_to(vault_path)).replace("\\", "/")
                         dupe.unlink()
-                        # Prune from state
-                        state.files.pop(dupe_rel, None)
+                        # Prune from state and vector store — mirrors surveyor's
+                        # deletion path so a deduped file doesn't leave orphaned
+                        # LanceDB embeddings behind.
+                        self._delete_embeddings(state, dupe_rel)
                         checked.add(str(dupe))
                         merged_count += 1
                         msg = f"merged {dupe.name} → {keeper.name} (ratio={ratio:.2f})"
@@ -592,7 +894,10 @@ class JanitorDaemon(BaseDaemon):
             try:
                 post = frontmatter.load(str(md_file))
                 status = str(post.metadata.get("status", "")).lower()
-            except Exception:
+            except Exception as e:
+                # Session file never gets archived — it accumulates forever
+                # with nothing reporting that it was skipped.
+                record_failure("janitor.session_parse_failed", error=e, path=str(md_file))
                 continue
 
             if status not in {"absorbed", "completed"}:
@@ -600,25 +905,25 @@ class JanitorDaemon(BaseDaemon):
 
             try:
                 age_days = (now_ts - md_file.stat().st_mtime) / 86400
-            except OSError:
+            except OSError as e:
+                record_failure("janitor.session_stat_failed", error=e, path=str(md_file))
                 continue
 
             if age_days < SESSION_ARCHIVE_DAYS:
                 continue
 
             dest = archive_dir / md_file.name
+            rel_path = f"session/{md_file.name}"
             # If destination already exists, skip (idempotent)
             if dest.exists():
                 md_file.unlink(missing_ok=True)
-                rel_path = f"session/{md_file.name}"
-                state.files.pop(rel_path, None)
+                self._delete_embeddings(state, rel_path)
                 archived += 1
                 continue
 
             try:
                 md_file.rename(dest)
-                rel_path = f"session/{md_file.name}"
-                state.files.pop(rel_path, None)
+                self._delete_embeddings(state, rel_path)
                 archived += 1
                 self.log.debug(
                     "janitor.session_archived",

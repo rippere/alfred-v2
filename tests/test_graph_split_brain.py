@@ -19,8 +19,8 @@ def test_build_wikilink_index_maps_stem_and_bare_path_to_rel_path():
     assert index["bar"] == "note/bar.md"
 
 
-def test_add_edges_from_wikilinks_resolves_target_to_canonical_node():
-    store = GraphStore(None)
+def test_add_edges_from_wikilinks_resolves_target_to_canonical_node(tmp_path):
+    store = GraphStore(tmp_path / "graph.pkl")
     index = build_wikilink_index(["topic/foo.md", "note/bar.md"])
 
     store.add_edges_from_wikilinks("note/bar.md", ["foo"], link_index=index)
@@ -30,10 +30,10 @@ def test_add_edges_from_wikilinks_resolves_target_to_canonical_node():
     assert not g.has_node("foo")  # no phantom node split from the real file
 
 
-def test_add_edges_from_wikilinks_without_index_keeps_legacy_behavior():
+def test_add_edges_from_wikilinks_without_index_keeps_legacy_behavior(tmp_path):
     """Backward compat: callers that don't pass link_index (e.g. tests that
     already pass full rel_paths as targets) are unaffected."""
-    store = GraphStore(None)
+    store = GraphStore(tmp_path / "graph.pkl")
     store.add_edges_from_wikilinks("a.md", ["b.md"])
     g = store._graph()
     assert g.has_edge("a.md", "b.md")

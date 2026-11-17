@@ -33,6 +33,8 @@ import json
 import re
 import subprocess
 from collections import Counter
+
+from alfred.core.failures import record_failure
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -245,7 +247,10 @@ def _iter_briefs(prefix: str):
     for day in sorted(seen):
         try:
             text = seen[day].read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except OSError as e:
+            # That day silently contributes nothing to the ledger — the
+            # totals just come out low, with no gap anywhere to notice.
+            record_failure("ledger.session_read_failed", error=e, day=day)
             continue
         yield day, text
 

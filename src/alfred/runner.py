@@ -20,7 +20,12 @@ import signal
 from datetime import datetime, timedelta, timezone
 
 import anyio
+import anyio.to_thread
 import structlog
+
+# Must stay comfortably under alfred.service's TimeoutStopSec=30, so the final
+# state save gets a turn before systemd escalates to SIGKILL.
+SHUTDOWN_GRACE_S = 15.0
 
 log = structlog.get_logger()
 
@@ -77,7 +82,7 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
 
     # ── Daemon instances ───────────────────────────────────────────────────────
     surveyor = SurveyorDaemon(cfg, state_store, events, store=vector_store)
-    janitor = JanitorDaemon(cfg, state_store, events)
+    janitor = JanitorDaemon(cfg, state_store, events, store=vector_store)
     curator = CuratorDaemon(cfg, state_store, events)
     distiller = DistillerDaemon(cfg, state_store, events)
     consolidator = ConsolidatorDaemon(cfg, state_store, events)
@@ -147,6 +152,16 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
     if getattr(cfg, "janitor_dedup_enabled", False):
         _add("janitor", janitor.dedup_tick, "interval",
              misfire_grace_time=GRACE_WEEKLY, weeks=1)
+    # Retention sweep only when explicitly enabled — it evicts vectors, so it
+    # stays opt-in and is not registered at all when off.
+    if getattr(cfg, "janitor_forget_enabled", False):
+        _add("janitor", janitor.forget_tick, "interval",
+             misfire_grace_time=GRACE_DAILY, days=1)
+    # Orphan reap, same rule: it deletes vector rows, so it is not registered
+    # at all unless explicitly enabled.
+    if getattr(cfg, "janitor_reap_enabled", False):
+        _add("janitor", janitor.reap_tick, "interval",
+             misfire_grace_time=GRACE_DAILY, days=1)
 
     # ── Distiller: nightly at 2am, with startup catch-up ─────────────────────────
     # cron, not interval: interval-24h restarts its countdown on every daemon
@@ -303,7 +318,29 @@ async def run_daemons(cfg, only: set[str] | None = None) -> None:
         tg.cancel_scope.cancel()
 
     # ── Graceful shutdown ──────────────────────────────────────────────────────
-    scheduler.shutdown(wait=True)
+    #
+    # This used to be a bare scheduler.shutdown(wait=True), which is why every
+    # ollama-game-guard pause ended in a SIGKILL: wait=True blocks until every
+    # in-flight job finishes, and a surveyor pass over 17k files or a janitor
+    # structural sweep runs for minutes. systemd's TimeoutStopSec=30 expired
+    # first, so the process was killed mid-write against state.json /
+    # graph.pkl / lancedb. Observed on 2026-07-24, -25 and -26.
+    #
+    # Bounded instead. A job that overruns the grace loses its partial pass,
+    # which the next tick redoes; a SIGKILL during the final state save is not
+    # recoverable. Getting to the save is what matters.
+    with anyio.move_on_after(SHUTDOWN_GRACE_S) as scope:
+        await anyio.to_thread.run_sync(lambda: scheduler.shutdown(wait=True))
+    if scope.cancelled_caught:
+        log.warning(
+            "alfred.shutdown_grace_expired",
+            grace_s=SHUTDOWN_GRACE_S,
+            detail="in-flight jobs abandoned so the final state save can run",
+        )
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception as e:      # already stopping — never block the save
+            log.debug("alfred.scheduler_force_shutdown_noop", error=str(e))
     log.info("alfred.scheduler_stopped")
 
     # Final state save

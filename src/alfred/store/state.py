@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import fcntl
 import json
 import os
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from alfred.core.failures import drain_failures, restore_failures
 from alfred.core.models import (
     ClusterState,
     FileState,
@@ -50,6 +53,7 @@ def _decode_state(raw: dict) -> PipelineState:
         api_calls_date=raw.get("api_calls_date", ""),
         api_cost_usd_today=raw.get("api_cost_usd_today", 0.0),
         api_paused_until=raw.get("api_paused_until", ""),
+        error_counts=raw.get("error_counts", {}),
     )
     for rel_path, f in raw.get("files", {}).items():
         state.files[rel_path] = FileState(**{
@@ -74,6 +78,130 @@ def _decode_state(raw: dict) -> PipelineState:
     return state
 
 
+# --- Cross-process merge-on-save --------------------------------------------
+#
+# state.json is constructed independently by up to six call sites (runner,
+# query engine, cli, meta_server, server, server_http) — the daemon and any
+# long-lived MCP/CLI query process each hold their own in-memory StateStore
+# built from whatever state.json looked like at their own load() time. With a
+# plain "serialize the raw dict and os.replace()" save(), a query process that
+# loaded hours ago and merely bumps an API-budget counter would, on its next
+# save, blow away every embed/cluster/wiki-page write the daemon made in the
+# meantime — the file lock alone only prevents torn/interleaved writes, it
+# does nothing to stop this last-writer-wins data loss.
+#
+# save() below does a real three-way merge (base = what this instance loaded,
+# theirs = freshest on-disk content re-read under the lock, mine = this
+# instance's current in-memory state) so independent additions from both
+# sides survive, not just whichever process happened to save last.
+def _merge_dict_field(key: str, base: dict, theirs: dict, mine: dict) -> dict:
+    """Union-merge a dict-valued field: keys unknown to `mine` are kept from
+    `theirs` (another writer's addition, e.g. a newly embedded file or
+    cluster); keys `mine` changed relative to `base` override theirs.
+
+    Keys `mine` *removed* relative to `base` (e.g. janitor ghost-file pruning
+    or dedup deletion) are removed from the merged result too — unless
+    `theirs` independently changed that same key relative to `base` since
+    this instance loaded, i.e. a genuine concurrent edit-vs-delete conflict.
+    We resolve that conflict by keeping theirs's value: a live concurrent
+    edit wins over a stale delete, on the judgment that silently discarding
+    another writer's fresh update is worse than a deleted entry occasionally
+    reappearing (it will simply be deleted again on the next sweep)."""
+    theirs_d = theirs.get(key, {}) or {}
+    mine_d = mine.get(key, {}) or {}
+    base_d = base.get(key, {}) or {}
+    merged = dict(theirs_d)
+    for k, v in mine_d.items():
+        if v != base_d.get(k):
+            merged[k] = v
+    for k in base_d:
+        if k in mine_d or k not in merged:
+            continue
+        if theirs_d.get(k) == base_d.get(k):
+            del merged[k]
+    return merged
+
+
+def _merge_list_field(key: str, base: dict, theirs: dict, mine: dict) -> list:
+    """Append-merge a log-like list field: entries `mine` added since `base`
+    (and not already present in `theirs`) are appended, so two writers
+    recording distiller/janitor runs concurrently both survive."""
+    theirs_l = list(theirs.get(key, []) or [])
+    mine_l = mine.get(key, []) or []
+    base_l = base.get(key, []) or []
+    for entry in mine_l:
+        if entry not in base_l and entry not in theirs_l:
+            theirs_l.append(entry)
+    return theirs_l
+
+
+def _merge_scalar(key: str, base: dict, theirs: dict, mine: dict):
+    """Changed-since-base wins; otherwise keep the freshest on-disk value."""
+    mine_v = mine.get(key)
+    if mine_v != base.get(key):
+        return mine_v
+    return theirs.get(key)
+
+
+def _merge_counters(base: dict, theirs: dict, mine: dict) -> tuple[int, float]:
+    """Merge api_calls_today / api_cost_usd_today additively (CRDT-style
+    counter) when both sides agree on api_calls_date, so concurrent
+    record_api_call() bumps from two processes both land instead of one
+    clobbering the other. Falls back to changed-wins across a day rollover,
+    where a delta merge could double count."""
+    b_date = base.get("api_calls_date", "")
+    t_date = theirs.get("api_calls_date", "")
+    m_date = mine.get("api_calls_date", "")
+    if b_date == t_date == m_date:
+        calls = theirs.get("api_calls_today", 0) + (
+            mine.get("api_calls_today", 0) - base.get("api_calls_today", 0)
+        )
+        cost = theirs.get("api_cost_usd_today", 0.0) + (
+            mine.get("api_cost_usd_today", 0.0) - base.get("api_cost_usd_today", 0.0)
+        )
+        return calls, cost
+    calls = _merge_scalar("api_calls_today", base, theirs, mine)
+    cost = _merge_scalar("api_cost_usd_today", base, theirs, mine)
+    return calls, cost
+
+
+def _merge_error_counts(base: dict, theirs: dict, mine: dict) -> dict[str, int]:
+    """Additively merge the swallowed-failure counters, CRDT-style, for the
+    same reason as _merge_counters: two processes each swallowing an error
+    must produce a total of two, not one. A plain dict-field merge would take
+    whichever side changed the key and discard the other's increment.
+
+    Unlike the API counters there is no date rollover to guard — error_counts
+    is monotonic for the life of the state file."""
+    theirs_d = theirs.get("error_counts", {}) or {}
+    mine_d = mine.get("error_counts", {}) or {}
+    base_d = base.get("error_counts", {}) or {}
+    merged = dict(theirs_d)
+    for key, mine_v in mine_d.items():
+        delta = mine_v - base_d.get(key, 0)
+        if delta:
+            merged[key] = merged.get(key, 0) + delta
+    return merged
+
+
+def _merge_pipeline_state(base: dict, theirs: dict, mine: dict) -> dict:
+    """Three-way merge of the on-disk PipelineState dict shape. `base` is the
+    snapshot this StateStore instance last loaded, `theirs` is the freshest
+    on-disk content (re-read under the file lock, may include another
+    process's writes since `base`), `mine` is this instance's current
+    in-memory state."""
+    merged = dict(theirs)
+    for f in ("version", "last_run", "last_dedup", "api_paused_until", "api_calls_date"):
+        merged[f] = _merge_scalar(f, base, theirs, mine)
+    for f in ("files", "clusters", "memory", "wiki_pages", "curator_processed"):
+        merged[f] = _merge_dict_field(f, base, theirs, mine)
+    for f in ("distiller_runs", "janitor_sweeps"):
+        merged[f] = _merge_list_field(f, base, theirs, mine)
+    merged["api_calls_today"], merged["api_cost_usd_today"] = _merge_counters(base, theirs, mine)
+    merged["error_counts"] = _merge_error_counts(base, theirs, mine)
+    return merged
+
+
 class StateStore:
     def __init__(self, path: Path, cfg=None) -> None:
         self.path = path
@@ -83,13 +211,28 @@ class StateStore:
         # same event loop.  Acquire before any bulk mutation of state.files or
         # state.clusters, and before every save().
         self._lock: asyncio.Lock = asyncio.Lock()
+        # Cross-process exclusive lock, held around the read-modify-write in
+        # save(). A sidecar ".lock" file (not state.json itself) so the lock
+        # is independent of state.json's own atomic tmp+replace lifecycle.
+        # flock() serializes both separate processes AND separate instances
+        # within one process (each open() call gets its own file description,
+        # which flock arbitrates between) — see test_state_lock.py.
+        self._lock_path = path.with_name(path.name + ".lock")
+        # Snapshot of what this instance last loaded/saved, in PipelineState's
+        # asdict() shape — the merge "base" for the next save(). Starts as an
+        # empty-state baseline so a save() before any load() still merges
+        # correctly against a freshly-read disk file rather than clobbering it.
+        self._base_raw: dict = asdict(_decode_state({}))
+
+    def _read_raw(self) -> dict:
+        if self.path.exists():
+            return json.loads(self.path.read_text())
+        return {}
 
     def load(self) -> PipelineState:
-        if self.path.exists():
-            raw = json.loads(self.path.read_text())
-            self._state = _decode_state(raw)
-        else:
-            self._state = PipelineState()
+        raw = self._read_raw()
+        self._state = _decode_state(raw)
+        self._base_raw = asdict(self._state)
         # Reset daily API counters if date rolled over since last save
         today = date.today().isoformat()
         if self._state.api_calls_date != today:
@@ -101,13 +244,62 @@ class StateStore:
     def save(self) -> None:
         """Synchronous save — caller must hold self._lock when called from async context.
 
-        Writes to a temp file in the same directory then os.replace()s it into
-        place, so a mid-write kill (OOM, SIGKILL) can never leave a truncated
-        state.json behind — the old file stays intact until the rename.
+        Acquires a cross-process flock on a sidecar lock file, re-reads the
+        freshest on-disk state under that lock, three-way merges it against
+        what this instance loaded and what it now holds in memory (see
+        _merge_pipeline_state), and writes the merged result. Writing itself
+        still goes to a temp file in the same directory then os.replace()s it
+        into place, so a mid-write kill (OOM, SIGKILL) can never leave a
+        truncated state.json behind — the old file stays intact until the
+        rename.
+
+        This means a save from one process (e.g. a long-lived query server
+        merely bumping an API-budget counter) can no longer silently clobber
+        concurrent writes from another (e.g. the daemon recording new embeds
+        or cluster state) — both survive the merge.
         """
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(asdict(self._state), indent=2))
-        os.replace(tmp, self.path)
+        # Fold any failures swallowed since the last save into the state we're
+        # about to write, so a handler whose body is `pass` still leaves a
+        # durable count. Drained (read-and-zero) so repeated saves can't double
+        # count; restored below if the write fails, so a disk error doesn't
+        # also erase the record of the earlier errors.
+        drained = drain_failures()
+        for _key, _n in drained.items():
+            self._state.error_counts[_key] = self._state.error_counts.get(_key, 0) + _n
+
+        lock_fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                theirs_raw = self._read_raw()
+                theirs = asdict(_decode_state(theirs_raw))
+                mine = asdict(self._state)
+                merged = _merge_pipeline_state(self._base_raw, theirs, mine)
+
+                tmp = self.path.with_name(self.path.name + ".tmp")
+                tmp.write_text(json.dumps(merged, indent=2))
+                os.replace(tmp, self.path)
+
+                # Fold the merge result back into memory so this instance
+                # reflects the other writer's changes too, and so the next
+                # save() diffs against this save rather than a stale base.
+                #
+                # The base MUST be a deep copy: _decode_state passes the
+                # dict/list-valued fields (curator_processed, distiller_runs,
+                # janitor_sweeps) through by reference, so sharing `merged`
+                # between _state and _base_raw made every later mutation
+                # retroactively rewrite the base it was about to be diffed
+                # against — the merge then saw "unchanged" and dropped the
+                # write entirely. Only bites a long-lived instance that saves
+                # more than once, i.e. the daemon. See test_state_lock.py.
+                self._state = _decode_state(merged)
+                self._base_raw = copy.deepcopy(merged)
+                drained = {}  # committed to disk; nothing to put back
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+            restore_failures(drained)
 
     async def async_save(self) -> None:
         """Async-safe save — acquires the state lock before writing."""

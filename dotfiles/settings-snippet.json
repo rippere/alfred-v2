@@ -1,9 +1,14 @@
 {
-  "_comment": "Merge this into ~/.claude/settings.json on the laptop. The alfred-vault MCP points to the desktop server over LAN (SSE). Adjust the IP if the desktop IP changes.",
+  "_comment": "Prefer registering with the CLI over hand-merging, so the token never lands in a synced config file: claude mcp add --transport http alfred-vault http://benderman.<tailnet>.ts.net:8765/mcp --header \"Authorization: Bearer $ALFRED_HTTP_TOKEN\" -s user",
+  "_transport": "streamable-http mounted at /mcp — NOT sse at /sse. This file used to say sse, which silently fails to connect.",
+  "_host": "Use the MagicDNS name, never a literal 100.x/192.168.x address. This file previously hardcoded 192.168.254.182, an address the desktop no longer has — that stale IP is why laptop access quietly stopped working.",
+  "_auth": "The desktop requires a Bearer token (~/.config/alfred/http-token.env, 0600). Copy it out-of-band; never commit it.",
+  "_meta_server": "The cross-vault 'alfred' meta server is stdio-only. Reach it by wrapping stdio over SSH: claude mcp add alfred -s user -- ssh benderman.<tailnet>.ts.net /home/rippere/alfred-v2/.venv/bin/python -m alfred.mcp.meta_server --config /home/rippere/alfred-v2/config-meta.yaml",
+
   "mcpServers": {
     "alfred-vault": {
-      "type": "sse",
-      "url": "http://192.168.254.182:8765/sse"
+      "type": "http",
+      "url": "http://benderman.<tailnet>.ts.net:8765/mcp"
     }
   },
   "hooks": {

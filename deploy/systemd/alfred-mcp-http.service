@@ -1,5 +1,5 @@
 [Unit]
-Description=Alfred MCP HTTP server (LAN access)
+Description=Alfred MCP HTTP server (localhost only)
 After=alfred.service
 Wants=alfred.service
 

@@ -11,7 +11,7 @@ from pathlib import Path
 import frontmatter
 import structlog
 
-from alfred.core.anthropic_client import get_client
+from alfred.core.local_llm import LocalLLMUnavailable, complete
 from alfred.core.provenance import is_daemon_generated
 from alfred.core.vault_ops import VaultError, vault_append_to_topic, vault_read
 from alfred.daemons.base import BaseDaemon
@@ -115,6 +115,11 @@ class DistillerDaemon(BaseDaemon):
     def __init__(self, cfg, state, events) -> None:
         super().__init__(cfg, state, events)
         self._last_run = 0.0  # epoch 0 ensures first run fires immediately
+        # Failed topic-append count for the current/most-recent sweep. Reset at
+        # the start of each _distill_sweep() call so it reflects just that tick.
+        # Not persisted — surfaced via the distiller.sweep_done log line so a
+        # human/monitor can notice non-zero failures (audit: dropped writes).
+        self.failed_appends_this_tick = 0
 
     async def run(self) -> None:
         self.log.info("distiller.start", mode=getattr(self.cfg, "distiller_mode", "scheduled"))
@@ -146,16 +151,12 @@ class DistillerDaemon(BaseDaemon):
             self.log.error("distiller.tick_error", error=str(e))
 
     async def _distill_sweep(self) -> None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            self.log.info("distiller.skip", reason="no ANTHROPIC_API_KEY")
-            return
-
         vault_path = self.cfg.vault_path
         state = self.state.state
         now_iso = datetime.now(timezone.utc).isoformat()
         distilled_count = 0
         learn_count = 0
+        self.failed_appends_this_tick = 0
 
         for rel_path, fs in list(state.files.items()):
             if is_daemon_generated(rel_path, generated_by=fs.__dict__.get("generated_by")):
@@ -170,6 +171,18 @@ class DistillerDaemon(BaseDaemon):
                         await self.save_state()
                         self.log.debug("distiller.incremental_save", files=distilled_count)
                     await asyncio.sleep(1.5)
+                except LocalLLMUnavailable as e:
+                    # Stop the sweep instead of retrying a dead backend once per
+                    # file. last_distilled is only stamped on success (line
+                    # above), so everything not yet reached stays stale and the
+                    # next sweep resumes from here.
+                    self.log.warning(
+                        "distiller.backend_unavailable",
+                        error=str(e),
+                        deferred_from=rel_path,
+                        distilled_before_stop=distilled_count,
+                    )
+                    break
                 except Exception as e:
                     self.log.warning("distiller.file_error", path=rel_path, error=str(e))
 
@@ -181,7 +194,12 @@ class DistillerDaemon(BaseDaemon):
             })
             if len(state.distiller_runs) > 30:
                 state.distiller_runs = state.distiller_runs[-30:]
-            self.log.info("distiller.sweep_done", files=distilled_count, learned=learn_count)
+            self.log.info(
+                "distiller.sweep_done",
+                files=distilled_count,
+                learned=learn_count,
+                failed_appends=self.failed_appends_this_tick,
+            )
             await self.save_state()
 
     async def _distill_file(self, vault_path: Path, rel_path: str) -> int:
@@ -220,32 +238,19 @@ class DistillerDaemon(BaseDaemon):
             body=body[:2000],
         )
 
-        if not self.state.can_make_api_call(daemon="distiller"):
-            return 0
-
-        client = get_client()
-
-        def _call():
-            resp = client.messages.create(
-                model=self.cfg.anthropic_model,
+        def _call() -> str:
+            return complete(
+                _EXTRACT_SYSTEM,
+                user_text,
+                base_url=self.cfg.ollama_base_url,
+                model=self.cfg.ollama_llm_model,
+                json_mode=True,
                 max_tokens=512,
-                system=[{
-                    "type": "text",
-                    "text": _EXTRACT_SYSTEM,
-                    "cache_control": {"type": "ephemeral"},
-                }],
-                messages=[{"role": "user", "content": user_text}],
             )
-            return resp
 
-        resp = await asyncio.to_thread(_call)
-        usage = resp.usage
-        self.state.record_api_call(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cached_tokens=getattr(usage, "cache_read_input_tokens", 0),
-        )
-        raw = resp.content[0].text.strip()
+        # LocalLLMUnavailable propagates to the sweep, which defers the rest of
+        # the batch rather than recording every record as "nothing to distill".
+        raw = (await asyncio.to_thread(_call)).strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
@@ -279,8 +284,17 @@ class DistillerDaemon(BaseDaemon):
                     state.files[rel_path].learn_records_created.append(result["path"])
                 created += 1
                 self.log.debug("distiller.appended_topic", path=result["path"], title=title)
-            except VaultError:
-                pass
+            except VaultError as e:
+                # This runs after a successful, already-billed Anthropic API call —
+                # losing the write here silently would burn spend for nothing and
+                # leave zero trace. Log it and count it so it's observable instead.
+                self.failed_appends_this_tick += 1
+                self.log.warning(
+                    "distiller.topic_append_failed",
+                    path=rel_path,
+                    title=title,
+                    error=str(e),
+                )
 
         return created
 

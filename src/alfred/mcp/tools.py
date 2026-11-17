@@ -29,7 +29,8 @@ from typing import Any
 
 import structlog
 
-from alfred.mcp.defaults import DEFAULT_TOP_K, build_query_options
+from alfred.core.failures import record_failure
+from alfred.mcp.defaults import DEFAULT_TOP_K, build_query_options, validate_result_count
 
 log = structlog.get_logger()
 
@@ -77,6 +78,8 @@ def vault_search_impl(
 ) -> list[dict[str, Any]]:
     """Text search one vault, with optional type/status filters."""
     from alfred.core.vault_ops import vault_search as _vault_search
+
+    validate_result_count(limit, param_name="limit")
 
     results = _vault_search(
         cfg.vault_path,
@@ -206,8 +209,10 @@ def vault_feedback_impl(
         }
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
+    except Exception as e:
+        # Feedback telemetry is best-effort, but a permanently unwritable log
+        # means the memory-signal record is empty for reasons nobody can see.
+        record_failure("mcp.feedback_log_write_failed", error=e)
 
     return {
         "path": path,

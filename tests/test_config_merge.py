@@ -198,7 +198,9 @@ def test_real_config_loads_with_expected_effective_values(config_name):
     assert cfg.janitor_dedup_enabled is False         # gated until dry-run tested
     assert cfg.ollama_llm_model == "mistral:latest"
     assert cfg.ollama_embed_model == "nomic-embed-text"
-    assert cfg.anthropic_model == "claude-sonnet-4-6"
+    # No cloud model fields: synthesis and every daemon call use ollama_llm_model.
+    assert not hasattr(cfg, "anthropic_model")
+    assert not hasattr(cfg, "openrouter_model")
     assert cfg.hopfield_beta == 2.0
     # Dataclass default backstop: no file sets consolidator cadence
     assert cfg.consolidator_min_interval_s == 1800

@@ -1,15 +1,109 @@
 """NetworkX knowledge graph: wikilink edges + spreading activation."""
 from __future__ import annotations
 
+import fcntl
 import os
 import pickle
+import tempfile
 import threading
-from collections.abc import Iterable
-from pathlib import Path
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath
 
 import structlog
 
+from alfred.core.failures import record_failure
+
 log = structlog.get_logger()
+
+# Module-level registry of per-path RLocks, keyed by resolved graph file path.
+# surveyor.py and consolidator.py each construct their own GraphStore(...) for
+# the same on-disk graph file rather than sharing one long-lived instance —
+# without this registry each instance would get its own independent RLock,
+# so a concurrent load/mutate/save sequence across instances is not mutually
+# exclusive and silently last-writer-wins, losing edges. Keying by resolved
+# path (instead of one global lock) still lets stores over distinct graph
+# files run concurrently.
+_locks_guard = threading.Lock()
+_path_locks: dict[str, threading.RLock] = {}
+
+
+def _lock_for_path(path: Path) -> threading.RLock:
+    key = str(Path(path).resolve())
+    with _locks_guard:
+        lock = _path_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _path_locks[key] = lock
+        return lock
+
+
+# Module-level registry tracking which thread currently holds the sidecar
+# flock for a given resolved path, and how many nested transaction() calls
+# deep that thread is. flock(2) locks are scoped to the open-file-description
+# that took them, not to the process or thread — so re-entering transaction()
+# on the same thread (nested `with store.transaction():`, same or a
+# different GraphStore instance pointed at the same path) would open a
+# *second*, distinct fd and call flock() on it, which blocks forever on the
+# lock this exact thread already holds via the first fd (self-deadlock).
+# This registry lets a reentrant call detect "this thread already holds the
+# flock for this path" and skip opening/locking a second fd, incrementing a
+# depth counter instead — mirroring how threading.RLock treats reentry as a
+# no-op. Access is only ever mutated while the caller already holds the
+# path's shared RLock (see transaction() below), so the dict itself only
+# needs _locks_guard to protect first-creation of an entry, same as
+# _path_locks.
+_flock_state: dict[str, dict] = {}
+
+
+# Wikilink targets are raw link text. Obsidian omits the .md extension for
+# notes ([[note/foo]]) and keeps the real extension for everything else
+# ([[diagram.png]]), so "has a suffix" alone cannot tell a note from an
+# attachment — a note legitimately named "alfred-v2.0-plan" parses as suffix
+# ".0-plan". Only these suffixes are treated as real, non-note files; anything
+# else gets .md appended.
+_ATTACHMENT_SUFFIXES: frozenset[str] = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif",
+    ".pdf", ".canvas", ".base", ".txt", ".csv", ".json", ".yaml", ".yml",
+    ".mp3", ".wav", ".m4a", ".ogg", ".flac",
+    ".mp4", ".mov", ".webm", ".mkv",
+    ".zip", ".tar", ".gz", ".docx", ".xlsx", ".pptx", ".html",
+})
+
+
+def normalize_node(name: str) -> str:
+    """Normalize a wikilink target into the same key space as a vault rel_path.
+
+    add_edges_from_wikilinks used to add sources as `note/foo.md` (a rel_path)
+    but targets as the raw link text `note/foo`, so 6,897 files existed in
+    graph.pkl as two unconnected nodes. The link-text half held every inbound
+    edge and had out-degree 0, which made it a dead end: spreading activation
+    (engine.py) died at hop 2, and the chunk_id synthesized from it
+    (f"{rel_path}::chunk_00") matched nothing in LanceDB. Normalizing both
+    ends into rel_path space collapses the two halves back into one node.
+
+    Returns "" for a target that normalizes to nothing; callers skip those.
+    """
+    n = name.replace("\\", "/").strip()
+    # Defensive: WIKILINK_RE already strips #headings and |aliases, but the
+    # graph is also fed by callers that do not go through it.
+    n = n.split("#", 1)[0].split("|", 1)[0].strip()
+    n = n.lstrip("/")
+    if not n:
+        return ""
+    if PurePosixPath(n).suffix.lower() in _ATTACHMENT_SUFFIXES:
+        return n
+    return n if n.lower().endswith(".md") else n + ".md"
+
+
+def _flock_state_for_path(path: Path) -> dict:
+    key = str(Path(path).resolve())
+    with _locks_guard:
+        state = _flock_state.get(key)
+        if state is None:
+            state = {"thread_id": None, "depth": 0}
+            _flock_state[key] = state
+        return state
 
 
 def build_wikilink_index(rel_paths: Iterable[str]) -> dict[str, str]:
@@ -30,6 +124,16 @@ def build_wikilink_index(rel_paths: Iterable[str]) -> dict[str, str]:
     return index
 
 
+def _resolve_link(raw: str, link_index: dict[str, str]) -> str:
+    """Resolve raw wikilink text through build_wikilink_index; "" if unknown."""
+    key = " ".join(raw.split())
+    hit = link_index.get(key)
+    if hit:
+        return hit
+    norm = normalize_node(key)
+    return link_index.get(norm) or link_index.get(norm.removesuffix(".md"), "")
+
+
 class GraphStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -39,7 +143,93 @@ class GraphStore:
         # embedding/HDBSCAN work), so an asyncio.Lock alone can't cover it.
         # Reentrant because build_from_vault -> add_edges_from_wikilinks and
         # spreading_activation -> get_neighbors re-acquire under the same lock.
-        self._lock: threading.RLock = threading.RLock()
+        # Shared across all GraphStore instances pointed at the same path (see
+        # _lock_for_path) so independently-constructed instances in different
+        # daemons still serialize against each other.
+        self._lock: threading.RLock = _lock_for_path(path)
+        # Cross-process exclusive lock, held for the duration of transaction().
+        # threading.RLock (above) is process-local — it does nothing for
+        # surveyor.py and consolidator.py when `alfred up --only <daemon>`
+        # runs them as genuinely separate OS processes against the same
+        # graph file, which is a real, currently-supported deployment mode.
+        # A sidecar ".lock" file (not the graph file itself) mirrors the
+        # pattern in StateStore.save() / lancedb_store's quarantine lock:
+        # flock() arbitrates across both separate processes and separate
+        # file descriptions within one process.
+        self._lock_path = path.with_name(path.name + ".lock")
+
+    @contextmanager
+    def transaction(self) -> Iterator["GraphStore"]:
+        """Hold the path-shared lock across a multi-step load/mutate/save
+        sequence so the whole sequence is atomic relative to any other
+        GraphStore instance — including independently-constructed ones, in
+        this process or another — pointed at the same path.
+
+        Without the in-process RLock, sharing the lock alone is not enough:
+        load(), a mutation, and save() each acquire-and-release the lock
+        separately, so another instance's full load/mutate/save cycle can
+        still interleave between them and clobber this one's save (lost
+        writes). Reentrant, so nested load()/save()/mutate() calls inside
+        the `with` block re-acquire the same RLock without deadlocking.
+
+        Without the flock, the RLock alone does nothing across real OS
+        processes (e.g. `alfred up --only surveyor` and `--only
+        consolidator` each running as their own process against the same
+        graph file) — each process gets its own independent RLock object,
+        so concurrent processes' load/mutate/save sequences interleave and
+        lose writes just as badly as if there were no lock at all. The
+        flock is acquired for the whole transaction, matching the RLock's
+        scope.
+
+        Reentrancy is thread/process-aware, NOT a free byproduct of flock:
+        flock(2) locks are scoped to the open-file-description that took
+        them, not the process or thread that opened it. Opening a fresh fd
+        and calling flock(LOCK_EX) on it blocks until the lock is free —
+        even if the very same thread already holds LOCK_EX via a different
+        fd. So naively re-entering transaction() on the same thread (nested
+        `with store.transaction():`, same or a different GraphStore
+        instance pointed at the same path) would self-deadlock: the outer
+        call's fd holds the lock, and the inner call's new fd blocks on it
+        forever. The module-level `_flock_state` registry (keyed by
+        resolved path) tracks which thread currently holds the flock for
+        this path and how many transaction() calls deep it is; a call
+        detected as reentrant on the same thread skips opening/locking a
+        second fd and just bumps the depth counter, exactly mirroring how
+        threading.RLock treats same-thread re-entry as a no-op. The flock
+        fd is only actually opened/acquired at depth 0->1 and only
+        released/closed at depth 1->0, so cross-process exclusion (the
+        reason this lock exists at all) is untouched — a genuinely
+        different process still blocks on flock() until this one's
+        outermost transaction() exits.
+        """
+        with self._lock:
+            state = _flock_state_for_path(self.path)
+            current_thread = threading.get_ident()
+            if state["depth"] > 0 and state["thread_id"] == current_thread:
+                # Reentrant on the same thread — this thread already holds
+                # the flock for this path via an fd opened by an outer
+                # transaction() call. Track depth only; do not touch the fd.
+                state["depth"] += 1
+                try:
+                    yield self
+                finally:
+                    state["depth"] -= 1
+                return
+
+            lock_fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                state["thread_id"] = current_thread
+                state["depth"] = 1
+                try:
+                    yield self
+                finally:
+                    state["depth"] -= 1
+                    if state["depth"] == 0:
+                        state["thread_id"] = None
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
 
     def _graph(self):
         if self._g is None:
@@ -66,11 +256,31 @@ class GraphStore:
     def save(self) -> None:
         # Temp file + os.replace() so a mid-write kill (OOM, SIGKILL) can never
         # leave a truncated pickle behind — matches StateStore.save().
+        #
+        # The temp file uses a unique per-call name (tempfile.mkstemp in the
+        # same directory, so os.replace() stays an atomic same-filesystem
+        # rename) rather than a fixed "<path>.tmp". A fixed name is a second,
+        # independent collision hazard on top of the missing cross-process
+        # lock: two concurrent processes/instances writing "<path>.tmp" at
+        # the same time can interleave their writes into the same inode, or
+        # have one process's os.replace() race the other's — this showed up
+        # as FileNotFoundError from os.replace() when a fixed-name temp file
+        # was already renamed away by a sibling process by the time this one
+        # tried to replace from it. A unique name means even a lock-
+        # acquisition edge case (or a caller that saves outside of
+        # transaction()) can't collide on the temp file itself.
         with self._lock:
             if self._g is not None:
-                tmp = self.path.with_name(self.path.name + ".tmp")
-                tmp.write_bytes(pickle.dumps(self._g))
-                os.replace(tmp, self.path)
+                fd, tmp_name = tempfile.mkstemp(
+                    dir=str(self.path.parent), prefix=f".{self.path.name}.", suffix=".tmp"
+                )
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(pickle.dumps(self._g))
+                    os.replace(tmp_name, self.path)
+                except BaseException:
+                    Path(tmp_name).unlink(missing_ok=True)
+                    raise
 
     def node_count(self) -> int:
         with self._lock:
@@ -86,28 +296,96 @@ class GraphStore:
         targets: list[str],
         link_index: dict[str, str] | None = None,
     ) -> None:
-        """Add edges from source_rel_path to each of targets.
+        """Add wikilink edges from a file to its link targets.
 
-        targets are raw wikilink text (bare stems) by default. Pass
-        link_index (from build_wikilink_index) to resolve them to the
-        canonical rel_path of the file they point to — otherwise the same
-        file can end up keyed as two disconnected nodes (see
-        build_wikilink_index docstring). Unresolvable links are dropped
-        rather than added as phantom nodes.
+        Both ends are normalized into rel_path space (see normalize_node), so
+        a target written as `note/foo` lands on the same node as the source
+        `note/foo.md` instead of forking the file into two.
+
+        Wikilinks are usually bare stems (`[[foo]]`), which normalization alone
+        cannot place under their directory. Pass link_index (from
+        build_wikilink_index) to resolve them to the canonical rel_path of the
+        file they point to; with an index, links that resolve to no file are
+        dropped rather than added as phantom nodes.
         """
         with self._lock:
             g = self._graph()
-            g.add_node(source_rel_path)
-            if link_index is not None:
-                resolved = [link_index[" ".join(t.split())] for t in targets if " ".join(t.split()) in link_index]
-            else:
-                resolved = targets
-            for t in resolved:
-                g.add_node(t)
-                if not g.has_edge(source_rel_path, t):
-                    g.add_edge(source_rel_path, t, weight=1.0, edge_type="wikilink")
+            source = normalize_node(source_rel_path)
+            if not source:
+                return
+            g.add_node(source)
+            for raw in targets:
+                if link_index is not None:
+                    t = _resolve_link(raw, link_index)
                 else:
-                    g[source_rel_path][t]["weight"] += 0.1   # reinforce repeated links
+                    t = normalize_node(raw)
+                if not t or t == source:      # a self-link adds no traversable edge
+                    continue
+                g.add_node(t)
+                if not g.has_edge(source, t):
+                    g.add_edge(source, t, weight=1.0, edge_type="wikilink")
+                else:
+                    g[source][t]["weight"] += 0.1   # reinforce repeated links
+
+    def merge_link_text_nodes(self) -> int:
+        """Collapse legacy raw-link-text nodes into their rel_path node.
+
+        One-shot migration for a graph.pkl built before add_edges_from_wikilinks
+        normalized its targets. Every node whose name is not already normalized
+        (`note/foo`) is merged into its normalized form (`note/foo.md`),
+        carrying its in- and out-edges across and summing weights where an edge
+        already exists. Returns the number of nodes merged away.
+
+        Idempotent: a second run finds nothing left to merge.
+        """
+        with self._lock:
+            g = self._graph()
+            mapping = {
+                node: normalize_node(node)
+                for node in list(g.nodes())
+                if isinstance(node, str) and normalize_node(node) not in ("", node)
+            }
+            for old, new in mapping.items():
+                if not g.has_node(old):
+                    continue
+                g.add_node(new)
+                for _, target, data in list(g.out_edges(old, data=True)):
+                    dest = mapping.get(target, target)
+                    if dest == new:
+                        continue          # self-loop once both ends normalize
+                    self._merge_edge(g, new, dest, data)
+                for source, _, data in list(g.in_edges(old, data=True)):
+                    src = mapping.get(source, source)
+                    if src == new:
+                        continue
+                    self._merge_edge(g, src, new, data)
+                g.remove_node(old)
+            if mapping:
+                log.info("graph.link_text_nodes_merged", merged=len(mapping),
+                         nodes=g.number_of_nodes(), edges=g.number_of_edges())
+            return len(mapping)
+
+    @staticmethod
+    def _merge_edge(g, u: str, v: str, data: dict) -> None:
+        """Add edge u->v, summing weight into an existing edge rather than
+        overwriting it — merging two halves of a split node must not silently
+        discard the link strength one of them accumulated.
+
+        edge_type must widen to "wikilink" whenever either side is one. Summing
+        a wikilink's weight into a pre-existing *cluster* edge and leaving
+        edge_type="cluster" hands the merged edge to clear_cluster_edges(),
+        which surveyor._recluster() calls on every clustering pass — so the
+        wikilink is deleted at the next recluster, and only a source re-embed
+        could restore it. That is md5-gated, so in practice: never. This
+        mislabelled 241 live edges before it was caught.
+        """
+        if not g.has_edge(u, v):
+            g.add_edge(u, v, **data)
+            return
+        existing = g[u][v]
+        existing["weight"] = existing.get("weight", 1.0) + data.get("weight", 1.0)
+        if "wikilink" in (data.get("edge_type"), existing.get("edge_type")):
+            existing["edge_type"] = "wikilink"
 
     def clear_cluster_edges(self) -> int:
         """Remove all cluster-type edges. Returns count removed."""
@@ -227,7 +505,10 @@ class GraphStore:
                         self.add_edges_from_wikilinks(rel_str, links, link_index=link_index)
                     else:
                         self._g.add_node(rel_str)
-                except (OSError, UnicodeDecodeError):
+                except (OSError, UnicodeDecodeError) as e:
+                    # File is missing from the rebuilt graph entirely — its
+                    # links vanish and nothing says the rebuild was partial.
+                    record_failure("graph.rebuild_read_failed", error=e, path=rel_str)
                     continue
 
             log.info("graph.built", nodes=self._g.number_of_nodes(), edges=self._g.number_of_edges())
