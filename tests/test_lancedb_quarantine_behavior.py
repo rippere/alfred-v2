@@ -105,8 +105,8 @@ def test_transient_exception_does_not_trigger_quarantine(tmp_path, monkeypatch):
 
     real_connect = lancedb.connect
 
-    def fake_connect(u):
-        return _FlakyDB(real_connect(u), transient_exc)
+    def fake_connect(u, **kwargs):
+        return _FlakyDB(real_connect(u, **kwargs), transient_exc)
 
     monkeypatch.setattr(lancedb, "connect", fake_connect)
 
